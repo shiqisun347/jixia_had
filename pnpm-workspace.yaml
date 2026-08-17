@@ -1,0 +1,11 @@
+packages:
+  - apps/web
+  - packages/*
+
+# pnpm 11 denies lifecycle scripts by default. These are the only packages
+# whose install scripts are required by the approved 001/002 toolchain.
+allowBuilds:
+  esbuild: true
+  msw: true
+  sharp: true
+  unrs-resolver: true

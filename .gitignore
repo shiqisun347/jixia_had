@@ -1,0 +1,39 @@
+# Local credentials
+api.md
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Node.js
+node_modules/
+.pnpm-store/
+.next/
+.next-dev/
+coverage/
+playwright-report/
+test-results/
+storybook-static/
+.turbo/
+output/
+tmp/
+.codex-tmp/
+--full-page
+
+# Local runtime data
+data/
+logs/
+artifacts/
+*.pcm
+*.tsbuildinfo
+*.db
+*.sqlite
+*.sqlite3
+*.ogg
+*.opus
+*.wav
+*.flac

@@ -1,0 +1,19 @@
+{
+  "name": "@jx/contracts",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "types": "src/index.ts",
+  "exports": {
+    ".": {
+      "types": "./src/index.ts",
+      "default": "./src/index.ts"
+    }
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "typescript": "6.0.3"
+  }
+}

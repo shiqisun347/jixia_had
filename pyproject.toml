@@ -1,0 +1,45 @@
+[project]
+name = "jx-debate-workspace"
+version = "1.0.0"
+description = "Jixia debate platform Python workspace"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[tool.uv]
+package = false
+
+[tool.uv.workspace]
+members = ["apps/core", "apps/jobs"]
+
+[dependency-groups]
+dev = [
+  "pyright==1.1.411",
+  "pytest==9.1.1",
+  "pytest-asyncio==1.4.0",
+  "ruff==0.16.1",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["apps/core/src", "apps/core/tests", "apps/jobs/src", "apps/jobs/tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Existing migrations are immutable after release; preserve their reviewed source verbatim.
+"migrations/versions/0021_seat_swap_requests.py" = ["E501"]
+
+[tool.pyright]
+include = ["apps/core/src", "apps/jobs/src"]
+exclude = ["**/__pycache__"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["apps/core/tests", "apps/jobs/tests"]
+markers = [
+  "integration: requires a reachable real PostgreSQL instance",
+]

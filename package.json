@@ -1,0 +1,41 @@
+{
+  "name": "jx-debate-foundation",
+  "private": true,
+  "packageManager": "pnpm@11.18.0",
+  "engines": {
+    "node": ">=24.12.0 <25"
+  },
+  "scripts": {
+    "dev": "node scripts/dev.mjs",
+    "dev:web": "corepack pnpm --filter @jx/web dev",
+    "dev:core": "uv run --package jx-core jx-core",
+    "dev:jobs": "uv run --package jx-jobs jx-jobs",
+    "db:start": "bash scripts/dev/postgres.sh start",
+    "db:stop": "bash scripts/dev/postgres.sh stop",
+    "db:status": "bash scripts/dev/postgres.sh status",
+    "db:logs": "bash scripts/dev/postgres.sh logs",
+    "db:migrate": "uv run --package jx-core alembic upgrade head",
+    "db:revision:check": "uv run --package jx-core alembic check",
+    "format:check": "prettier --check \"apps/**/*.{ts,tsx,js,jsx,json,md}\" \"packages/**/*.{ts,tsx,js,jsx,json,md}\" \"scripts/**/*.mjs\" \".github/**/*.yml\" \"*.{json,md,yml,yaml}\"",
+    "format:write": "prettier --write \"apps/**/*.{ts,tsx,js,jsx,json,md}\" \"packages/**/*.{ts,tsx,js,jsx,json,md}\" \"scripts/**/*.mjs\" \".github/**/*.yml\" \"*.{json,md,yml,yaml}\"",
+    "lint": "corepack pnpm --filter @jx/web lint && uv run ruff check .",
+    "typecheck": "corepack pnpm --filter @jx/web typecheck && corepack pnpm --filter @jx/contracts typecheck && uv run pyright",
+    "test": "corepack pnpm test:tooling && corepack pnpm --filter @jx/web test && uv run --package jx-core pytest -m \"not integration\" apps/core/tests && uv run --package jx-jobs pytest -m \"not integration\" apps/jobs/tests",
+    "test:tooling": "node --test scripts/*.test.mjs && PYTHONPATH=. uv run pytest scripts/qa/tests",
+    "test:db": "TEST_DATABASE_URL=${TEST_DATABASE_URL:?TEST_DATABASE_URL is required} RUN_DATABASE_INTEGRATION=1 uv run --package jx-core pytest -m integration apps/core/tests && TEST_DATABASE_URL=${TEST_DATABASE_URL:?TEST_DATABASE_URL is required} RUN_DATABASE_INTEGRATION=1 uv run --package jx-jobs pytest -m integration apps/jobs/tests",
+    "test:browser": "corepack pnpm --filter @jx/web test:browser",
+    "test:auth:browser": "node scripts/run-auth-browser.mjs",
+    "storybook": "corepack pnpm --filter @jx/web storybook",
+    "build:storybook": "corepack pnpm --filter @jx/web build:storybook",
+    "test:storybook": "corepack pnpm --filter @jx/web test:storybook",
+    "ui:check": "corepack pnpm --filter @jx/web ui:check",
+    "contracts:generate": "node scripts/check-contracts.mjs --write",
+    "contracts:check": "node scripts/check-contracts.mjs",
+    "build": "corepack pnpm --filter @jx/web build",
+    "check": "corepack pnpm format:check && corepack pnpm lint && corepack pnpm typecheck && corepack pnpm test && corepack pnpm contracts:check && corepack pnpm build"
+  },
+  "devDependencies": {
+    "openapi-typescript": "7.13.0",
+    "prettier": "3.9.6"
+  }
+}

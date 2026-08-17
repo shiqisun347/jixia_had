@@ -1,0 +1,51 @@
+name: quality
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  quality:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16.14-alpine3.24@sha256:57c72fd2a128e416c7fcc499958864df5301e940bca0a56f58fddf30ffc07777
+        env:
+          POSTGRES_USER: jx
+          POSTGRES_PASSWORD: change-me
+          POSTGRES_DB: jx_debate
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U jx -d jx_debate"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 11.18.0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24.12.0
+          cache: pnpm
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: 0.11.2
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: pnpm install --frozen-lockfile
+      - run: uv sync --all-packages --frozen
+        env:
+          DATABASE_URL: postgresql+psycopg://jx:change-me@127.0.0.1:5432/jx_debate
+      - run: pnpm check
+        env:
+          DATABASE_URL: postgresql+psycopg://jx:change-me@127.0.0.1:5432/jx_debate
+      - run: pnpm test:db
+        env:
+          DATABASE_URL: postgresql+psycopg://jx:change-me@127.0.0.1:5432/jx_debate
+      - run: pnpm --filter @jx/web exec playwright install --with-deps chromium
+      - run: pnpm test:browser

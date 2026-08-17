@@ -1,0 +1,18 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <defs>
+    <linearGradient id="jixia-icon" x1="8" y1="6" x2="57" y2="59" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#2563eb" />
+      <stop offset=".52" stop-color="#7c3aed" />
+      <stop offset="1" stop-color="#bef200" />
+    </linearGradient>
+  </defs>
+  <rect width="64" height="64" rx="14" fill="#f7faff" />
+  <path d="M32 7 55 20v25L32 58 9 45V20L32 7Z" fill="url(#jixia-icon)" opacity=".15" />
+  <path d="M32 11 50 22v21L32 53 14 43V22L32 11Z" fill="none" stroke="url(#jixia-icon)" stroke-width="3" />
+  <path d="M22 32h20M32 22v20M24 24l16 16M40 24 24 40" stroke="#172554" stroke-linecap="round" stroke-width="3.2" />
+  <circle cx="32" cy="32" r="6" fill="#bef200" stroke="#172554" stroke-width="2.5" />
+  <circle cx="22" cy="22" r="2.7" fill="#2563eb" />
+  <circle cx="42" cy="22" r="2.7" fill="#7c3aed" />
+  <circle cx="22" cy="42" r="2.7" fill="#7c3aed" />
+  <circle cx="42" cy="42" r="2.7" fill="#2563eb" />
+</svg>
