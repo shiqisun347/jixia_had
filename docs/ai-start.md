@@ -1,5 +1,7 @@
 # 新会话快速启动
 
+GitHub：<https://github.com/shiqisun347/jixia_had>
+
 给新的 AI coding 工具使用本仓库时，按以下顺序读取：
 
 1. `AGENTS.md`：工程边界、修改流程和门禁。
@@ -10,6 +12,7 @@
 6. `agent_docs/`：简化后的产品、技术、代码和测试约定。
 7. `specs/README.md`：新增 v1.0 切片的唯一入口。
 8. `MEMORY.md`：只查看当前状态和已验证证据。
+9. `api.example.md`：只了解远程凭据文件结构，不读取真实 `api.md`。
 
 ## 开始任务
 

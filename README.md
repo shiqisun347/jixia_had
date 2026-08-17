@@ -1,5 +1,7 @@
 # 稷下人机交互平台 v1.0
 
+源码仓库：<https://github.com/shiqisun347/jixia_had>
+
 稷下是一个桌面优先的人机实时辩论实验平台：公开注册用户进入房间，选择真人席位或观战；Agent 通过 OpenAI 兼容 LLM、Fun-ASR 和 Qwen TTS 参与线性赛制辩论。单实例部署最多同时运行 5 场比赛。
 
 ## 事实来源
