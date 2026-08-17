@@ -721,11 +721,14 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
         )
     async with factory() as session:
         await _set_member_online(session, room_id=room.id, user_id=context.user_id, online=True)
-    resume_reasons = (
-        await _resume_reasons(session, room.id)
-        if view.state.status in {"PAUSED", "SYSTEM_RECOVERY", "ERROR"}
-        else []
-    )
+    # Do not reuse the session from the previous context.  A WebSocket can
+    # remain open for hours; querying a closed AsyncSession here reopens a
+    # transaction without a surrounding context and leaks a pool connection.
+    if view.state.status in {"PAUSED", "SYSTEM_RECOVERY", "ERROR"}:
+        async with factory() as resume_session:
+            resume_reasons = await _resume_reasons(resume_session, room.id)
+    else:
+        resume_reasons = []
     await websocket.accept()
     await websocket.send_json(
         {
