@@ -16,8 +16,11 @@ export const matchesApi = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
-  liveKitToken: (matchId: string) =>
-    requestJson<MatchLiveKitToken>(`/api/matches/${matchId}/livekit-token`, { method: 'POST' }),
+  liveKitToken: (matchId: string, connectionEpoch?: number | null) =>
+    requestJson<MatchLiveKitToken>(`/api/matches/${matchId}/livekit-token`, {
+      method: 'POST',
+      body: connectionEpoch ? JSON.stringify({ connection_epoch: connectionEpoch }) : undefined,
+    }),
   transcript: (matchId: string) =>
     requestJson<MatchTranscript>(`/api/matches/${matchId}/transcript`),
   updateDisplayText: (matchId: string, speechId: string, displayText: string) =>

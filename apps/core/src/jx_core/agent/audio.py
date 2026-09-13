@@ -29,6 +29,34 @@ def apply_pcm16_gain(pcm: bytes, gain: float, *, peak_headroom: float = 0.97) ->
     return (transformed * 32767.0).astype(np.int16).tobytes()
 
 
+def decode_ogg_opus_pcm(
+    encoded: bytes,
+    *,
+    sample_rate: int = 16_000,
+) -> bytes:
+    """Decode a complete in-memory Ogg/Opus stream to mono signed PCM."""
+    if not encoded:
+        return b""
+    output = bytearray()
+    with av.open(io.BytesIO(encoded), mode="r", format="ogg") as container:
+        resampler = cast(
+            _Resampler,
+            AudioResampler(format="s16", layout="mono", rate=sample_rate),
+        )
+        for decoded in container.decode(container.streams.audio[0]):
+            for converted in resampler.resample(decoded):
+                samples = converted.to_ndarray()
+                if samples.ndim == 2:
+                    samples = samples[0]
+                output.extend(np.asarray(samples, dtype=np.int16).tobytes())
+        for converted in resampler.resample(None):
+            samples = converted.to_ndarray()
+            if samples.ndim == 2:
+                samples = samples[0]
+            output.extend(np.asarray(samples, dtype=np.int16).tobytes())
+    return bytes(output)
+
+
 def apply_ogg_opus_gain(
     encoded: bytes,
     gain: float,

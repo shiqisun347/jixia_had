@@ -20,6 +20,7 @@ class MatchActionResponse(BaseModel):
     speaker_kind: str = "HUMAN"
     agent_profile_id: UUID | None = None
     host_audio_path: str | None = None
+    host_audio_duration_ms: int | None = None
 
 
 class AgentDecisionResponse(BaseModel):
@@ -39,6 +40,15 @@ class FreeDebateHandEntryResponse(BaseModel):
     rank: int
 
 
+class ExperimentTeamStateResponse(BaseModel):
+    opportunity_id: UUID | None
+    opportunity_generation: int
+    selection_phase: Literal["COMPETING", "HUMAN_ONLY_WAIT", "ALLOCATED"] | None
+    agent_status: Literal["WAITING", "DECIDING", "RAISE", "SKIP", "TECHNICAL_MISSING"] | None
+    selection_remaining_ms: int | None
+    human_wait_remaining_ms: int | None
+
+
 class MatchSnapshotResponse(BaseModel):
     match_id: UUID
     room_id: UUID
@@ -50,7 +60,9 @@ class MatchSnapshotResponse(BaseModel):
     current_speech_id: UUID | None
     current_speaker_user_id: UUID | None
     current_agent_profile_id: UUID | None
+    interim_text: str
     speech_remaining_ms: int | None
+    host_audio_remaining_ms: int | None
     countdown_remaining_ms: int | None
     current_speaker_side: str | None
     current_speaker_seat_no: int | None
@@ -59,7 +71,7 @@ class MatchSnapshotResponse(BaseModel):
     free_negative_remaining_ms: int | None
     hand_queue: list[UUID]
     agent_hand_queue: list[UUID]
-    agent_selection_mode: Literal["VOLUNTEER", "FALLBACK"] | None
+    agent_selection_mode: Literal["VOLUNTEER", "FALLBACK", "ALL_AGENT_SKIP_RANDOM"] | None
     agent_decisions: list[AgentDecisionResponse]
     team_hand_queue: list[FreeDebateHandEntryResponse]
     hand_window_open: bool
@@ -67,6 +79,9 @@ class MatchSnapshotResponse(BaseModel):
     offline_user_id: UUID | None
     pause_initiator_user_id: UUID | None
     resume_reasons: list[str] = Field(default_factory=list)
+    experiment_mode: bool = False
+    formal_4v4: bool = False
+    experiment_team_state: ExperimentTeamStateResponse | None = None
 
 
 class MatchCommandRequest(BaseModel):
@@ -103,6 +118,10 @@ class MatchLiveKitTokenResponse(BaseModel):
     expires_in_seconds: int
 
 
+class MatchLiveKitTokenRequest(BaseModel):
+    connection_epoch: int | None = Field(default=None, ge=1)
+
+
 class SpeechTranscriptResponse(BaseModel):
     id: UUID
     match_id: UUID
@@ -133,10 +152,12 @@ class SpeechTextUpdateRequest(BaseModel):
 
 
 __all__ = [
+    "ExperimentTeamStateResponse",
     "MatchActionResponse",
     "MatchCommandRequest",
     "MatchEventResponse",
     "MatchLiveKitTokenResponse",
+    "MatchLiveKitTokenRequest",
     "MatchSnapshotResponse",
     "SpeechTextUpdateRequest",
     "SpeechTranscriptResponse",

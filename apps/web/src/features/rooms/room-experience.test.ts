@@ -4,6 +4,7 @@ import {
   derivePreparationFlow,
   deriveRoomStartBlockers,
   selectDefaultRuleId,
+  supportedRoomRules,
 } from './room-experience';
 
 describe('selectDefaultRuleId', () => {
@@ -17,10 +18,14 @@ describe('selectDefaultRuleId', () => {
     expect(selectDefaultRuleId(rules)).toBe('four-formal');
   });
 
-  it('falls back to any 4v4 rule and then the first enabled rule', () => {
+  it('falls back to any 4v4 rule and never selects another size', () => {
     expect(selectDefaultRuleId(rules.slice(0, 2))).toBe('four-generic');
-    expect(selectDefaultRuleId(rules.slice(0, 1))).toBe('one');
+    expect(selectDefaultRuleId(rules.slice(0, 1))).toBe('');
     expect(selectDefaultRuleId([])).toBe('');
+  });
+
+  it('exposes only 4v4 rules to room creation', () => {
+    expect(supportedRoomRules(rules)).toEqual(rules.slice(1));
   });
 });
 

@@ -1,13 +1,15 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './fixtures';
 
 declare global {
   interface Window {
     __JX_MATCH_SNAPSHOT__: Record<string, unknown>;
     __JX_CLOSE_MATCH_SOCKET__?: () => void;
     __JX_MATCH_SOCKET_COUNT__?: number;
+    __JX_CONNECTION_EPOCH__?: number;
     __JX_EMIT_AGENT_SNAPSHOT__?: () => void;
     __JX_EMIT_COUNTDOWN_SNAPSHOT__?: () => void;
     __JX_EMIT_READY_SNAPSHOT__?: () => void;
+    __JX_EMIT_TIMEOUT_SNAPSHOT__?: () => void;
     __JX_EMIT_ERROR_SNAPSHOT__?: () => void;
     __JX_EMIT_HUMAN_FINISHED_SNAPSHOT__?: () => void;
     __JX_FAIL_NEXT_COMMAND__?: boolean;
@@ -15,6 +17,8 @@ declare global {
     __JX_MICROPHONE_STATES__?: boolean[];
     __JX_OUTPUT_MUTED_STATES__?: boolean[];
     __JX_COMMAND_SEQUENCES__?: number[];
+    __JX_EMIT_PRESENCE_SEQUENCE__?: (sequence: number) => void;
+    __JX_RELEASE_START_ACK__?: () => void;
   }
 }
 
@@ -135,6 +139,157 @@ function snapshot(actionState: string) {
   };
 }
 
+test('human start waits for the latest sequence and opens the microphone only after ACK', async ({
+  page,
+}) => {
+  let authoritativeSequence = 3;
+  let snapshotGate: Promise<void> | null = null;
+  let releaseSnapshot: () => void = () => {};
+  let markRefreshStarted: (() => void) | null = null;
+  const refreshStarted = new Promise<void>((resolve) => {
+    markRefreshStarted = resolve;
+  });
+
+  await page.addInitScript(() => {
+    class SequenceRaceSocket {
+      static OPEN = 1;
+      readyState = 1;
+      listeners = new Map<string, ((event: { data?: string }) => void)[]>();
+      connectionEpoch = 11;
+
+      constructor() {
+        window.__JX_EMIT_PRESENCE_SEQUENCE__ = (sequence) => {
+          this.emit('message', {
+            data: JSON.stringify({ type: 'match.online', sequence }),
+          });
+        };
+        queueMicrotask(() => {
+          this.emit('open', {});
+          this.emit('message', {
+            data: JSON.stringify({
+              type: 'match.snapshot',
+              connection_epoch: this.connectionEpoch,
+              payload: window.__JX_MATCH_SNAPSHOT__,
+            }),
+          });
+        });
+      }
+
+      addEventListener(type: string, listener: (event: { data?: string }) => void) {
+        this.listeners.set(type, [...(this.listeners.get(type) ?? []), listener]);
+      }
+
+      emit(type: string, event: { data?: string }) {
+        for (const listener of this.listeners.get(type) ?? []) listener(event);
+      }
+
+      send(raw: string) {
+        const command = JSON.parse(raw);
+        window.__JX_COMMAND_SEQUENCES__?.push(command.expected_sequence);
+        window.__JX_RELEASE_START_ACK__ = () => {
+          window.__JX_MATCH_SNAPSHOT__ = {
+            ...window.__JX_MATCH_SNAPSHOT__,
+            action_state: 'HUMAN_SPEAKING',
+            sequence: Number(command.expected_sequence) + 1,
+            current_speech_id: '80000000-0000-4000-8000-000000000001',
+          };
+          this.emit('message', {
+            data: JSON.stringify({
+              type: 'command.ack',
+              message_id: command.message_id,
+              sequence: window.__JX_MATCH_SNAPSHOT__.sequence,
+              snapshot: window.__JX_MATCH_SNAPSHOT__,
+            }),
+          });
+        };
+      }
+
+      close() {
+        this.readyState = 3;
+      }
+    }
+
+    window.__JX_MATCH_SNAPSHOT__ = {
+      match_id: '70000000-0000-4000-8000-000000000001',
+      room_id: '40000000-0000-4000-8000-000000000001',
+      status: 'RUNNING',
+      action_state: 'HUMAN_READY_TO_START',
+      sequence: 3,
+      current_action_index: 0,
+      current_action: {
+        stage_position: 1,
+        action_position: 1,
+        action_kind: 'HUMAN_SPEECH',
+        duration_seconds: 30,
+        side: 'AFFIRMATIVE',
+        seat_no: 1,
+        speaker_user_id: '10000000-0000-4000-8000-000000000001',
+        host_audio_path: null,
+      },
+      current_speech_id: null,
+      current_speaker_user_id: '10000000-0000-4000-8000-000000000001',
+      speech_remaining_ms: 30_000,
+    };
+    window.__JX_COMMAND_SEQUENCES__ = [];
+    window.__JX_MICROPHONE_STATES__ = [];
+    window.__JX_MATCH_AUDIO_OVERRIDE__ = async () => ({
+      canPlaybackAudio: true,
+      setMicrophoneEnabled: async (enabled) => {
+        window.__JX_MICROPHONE_STATES__?.push(enabled);
+      },
+      enableAudio: async () => undefined,
+      setOutputMuted: () => undefined,
+      disconnect: () => undefined,
+      getNetworkStats: async () => ({ rttMs: null, packetLossPercent: null }),
+    });
+    window.__JX_MATCH_SOCKET_FACTORY__ = () => new SequenceRaceSocket() as unknown as WebSocket;
+  });
+
+  await page.route('**/api/auth/me', (route) =>
+    route.fulfill({
+      json: { user: { id: userId, real_name: '实时测试用户', must_change_password: false } },
+    }),
+  );
+  await page.route(`**/api/matches/${matchId}/snapshot`, async (route) => {
+    if (snapshotGate) {
+      markRefreshStarted?.();
+      await snapshotGate;
+    }
+    await route.fulfill({
+      json: { ...snapshot('HUMAN_READY_TO_START'), sequence: authoritativeSequence },
+    });
+  });
+  await page.route(`**/api/rooms/${roomId}/snapshot`, (route) => route.fulfill({ json: room }));
+  await page.route(`**/api/matches/${matchId}/transcript`, (route) =>
+    route.fulfill({ json: { match_id: matchId, context_version: 0, speeches: [] } }),
+  );
+
+  await page.goto(`/debate?match_id=${matchId}`);
+  const startButton = page.getByRole('button', { name: '开始发言' });
+  await expect(startButton).toBeEnabled();
+
+  authoritativeSequence = 4;
+  snapshotGate = new Promise<void>((resolve) => {
+    releaseSnapshot = resolve;
+  });
+  await page.evaluate(() => window.__JX_EMIT_PRESENCE_SEQUENCE__?.(4));
+  await refreshStarted;
+  await expect(startButton).toBeDisabled();
+  expect(await page.evaluate(() => window.__JX_COMMAND_SEQUENCES__)).toEqual([]);
+
+  releaseSnapshot();
+  snapshotGate = null;
+  await expect(startButton).toBeEnabled();
+  await startButton.click();
+  await expect.poll(() => page.evaluate(() => window.__JX_COMMAND_SEQUENCES__)).toEqual([4]);
+  expect(await page.evaluate(() => window.__JX_MICROPHONE_STATES__?.at(-1))).not.toBe(true);
+  await expect(page.getByRole('heading', { name: '轮到你发言了！' })).toBeVisible();
+
+  await page.evaluate(() => window.__JX_RELEASE_START_ACK__?.());
+  await expect(page.getByRole('heading', { name: '麦克风已开启' })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.__JX_MICROPHONE_STATES__?.at(-1))).toBe(true);
+});
+
 test('real runtime page connects and starts human speech from server state', async ({ page }) => {
   test.setTimeout(60_000);
   const pageErrors: string[] = [];
@@ -150,45 +305,49 @@ test('real runtime page connects and starts human speech from server state', asy
       listeners = new Map<string, ((event: { data?: string }) => void)[]>();
       constructor() {
         window.__JX_MATCH_SOCKET_COUNT__ = (window.__JX_MATCH_SOCKET_COUNT__ ?? 0) + 1;
+        window.__JX_CONNECTION_EPOCH__ = (window.__JX_CONNECTION_EPOCH__ ?? 0) + 1;
+        const connectionEpoch = window.__JX_CONNECTION_EPOCH__;
         window.__JX_CLOSE_MATCH_SOCKET__ = () => {
           this.readyState = 3;
           this.emit('close', {});
         };
         window.__JX_EMIT_AGENT_SNAPSHOT__ = () => {
+          window.__JX_MATCH_SNAPSHOT__ = {
+            ...window.__JX_MATCH_SNAPSHOT__,
+            status: 'RUNNING',
+            action_state: 'AGENT_SPEAKING',
+            sequence: Number(window.__JX_MATCH_SNAPSHOT__.sequence) + 1,
+            current_speaker_user_id: null,
+            current_agent_profile_id: '60000000-0000-4000-8000-000000000012',
+            current_speaker_side: 'NEGATIVE',
+            current_speaker_seat_no: 2,
+            speech_remaining_ms: 12_000,
+            countdown_remaining_ms: null,
+          };
           this.emit('message', {
             data: JSON.stringify({
               type: 'match.snapshot',
-              payload: {
-                ...window.__JX_MATCH_SNAPSHOT__,
-                status: 'RUNNING',
-                action_state: 'AGENT_SPEAKING',
-                sequence: 5,
-                current_speaker_user_id: null,
-                current_agent_profile_id: '60000000-0000-4000-8000-000000000012',
-                current_speaker_side: 'NEGATIVE',
-                current_speaker_seat_no: 2,
-                speech_remaining_ms: 12_000,
-                countdown_remaining_ms: null,
-              },
+              payload: window.__JX_MATCH_SNAPSHOT__,
             }),
           });
         };
         window.__JX_EMIT_COUNTDOWN_SNAPSHOT__ = () => {
+          window.__JX_MATCH_SNAPSHOT__ = {
+            ...window.__JX_MATCH_SNAPSHOT__,
+            status: 'PAUSED',
+            action_state: 'RESUME_COUNTDOWN',
+            sequence: Number(window.__JX_MATCH_SNAPSHOT__.sequence) + 1,
+            current_speaker_user_id: null,
+            current_agent_profile_id: '60000000-0000-4000-8000-000000000012',
+            current_speaker_side: 'NEGATIVE',
+            current_speaker_seat_no: 2,
+            speech_remaining_ms: 12_000,
+            countdown_remaining_ms: 3_000,
+          };
           this.emit('message', {
             data: JSON.stringify({
               type: 'match.snapshot',
-              payload: {
-                ...window.__JX_MATCH_SNAPSHOT__,
-                status: 'PAUSED',
-                action_state: 'RESUME_COUNTDOWN',
-                sequence: 6,
-                current_speaker_user_id: null,
-                current_agent_profile_id: '60000000-0000-4000-8000-000000000012',
-                current_speaker_side: 'NEGATIVE',
-                current_speaker_seat_no: 2,
-                speech_remaining_ms: 12_000,
-                countdown_remaining_ms: 3_000,
-              },
+              payload: window.__JX_MATCH_SNAPSHOT__,
             }),
           });
         };
@@ -199,6 +358,23 @@ test('real runtime page connects and starts human speech from server state', asy
             action_state: 'HUMAN_READY_TO_START',
             sequence: Number(window.__JX_MATCH_SNAPSHOT__.sequence) + 1,
             error_code: null,
+            current_speech_id: null,
+            current_speaker_user_id: '10000000-0000-4000-8000-000000000001',
+          };
+          this.emit('message', {
+            data: JSON.stringify({
+              type: 'match.snapshot',
+              payload: window.__JX_MATCH_SNAPSHOT__,
+            }),
+          });
+        };
+        window.__JX_EMIT_TIMEOUT_SNAPSHOT__ = () => {
+          window.__JX_MATCH_SNAPSHOT__ = {
+            ...window.__JX_MATCH_SNAPSHOT__,
+            status: 'PAUSED',
+            action_state: 'RECOVERY_REQUIRED',
+            sequence: Number(window.__JX_MATCH_SNAPSHOT__.sequence) + 1,
+            error_code: 'HUMAN_START_TIMEOUT',
           };
           this.emit('message', {
             data: JSON.stringify({
@@ -212,6 +388,7 @@ test('real runtime page connects and starts human speech from server state', asy
             ...window.__JX_MATCH_SNAPSHOT__,
             status: 'SYSTEM_RECOVERY',
             action_state: 'RECOVERY_REQUIRED',
+            sequence: Number(window.__JX_MATCH_SNAPSHOT__.sequence) + 1,
             error_code: 'tts_stream_interrupted',
           };
           this.emit('message', {
@@ -222,16 +399,17 @@ test('real runtime page connects and starts human speech from server state', asy
           });
         };
         window.__JX_EMIT_HUMAN_FINISHED_SNAPSHOT__ = () => {
+          window.__JX_MATCH_SNAPSHOT__ = {
+            ...window.__JX_MATCH_SNAPSHOT__,
+            status: 'RUNNING',
+            action_state: 'SPEECH_FINALIZING',
+            sequence: Number(window.__JX_MATCH_SNAPSHOT__.sequence) + 1,
+            current_speaker_user_id: null,
+          };
           this.emit('message', {
             data: JSON.stringify({
               type: 'match.snapshot',
-              payload: {
-                ...window.__JX_MATCH_SNAPSHOT__,
-                status: 'RUNNING',
-                action_state: 'SPEECH_FINALIZING',
-                sequence: 7,
-                current_speaker_user_id: null,
-              },
+              payload: window.__JX_MATCH_SNAPSHOT__,
             }),
           });
         };
@@ -240,28 +418,8 @@ test('real runtime page connects and starts human speech from server state', asy
           this.emit('message', {
             data: JSON.stringify({
               type: 'match.snapshot',
-              connection_epoch: 1,
-              payload: {
-                match_id: '70000000-0000-4000-8000-000000000001',
-                room_id: '40000000-0000-4000-8000-000000000001',
-                status: 'RUNNING',
-                action_state: 'HUMAN_READY_TO_START',
-                sequence: 3,
-                current_action_index: 0,
-                current_action: {
-                  stage_position: 1,
-                  action_position: 1,
-                  action_kind: 'HUMAN_SPEECH',
-                  duration_seconds: 30,
-                  side: 'AFFIRMATIVE',
-                  seat_no: 1,
-                  speaker_user_id: '10000000-0000-4000-8000-000000000001',
-                  host_audio_path: null,
-                },
-                current_speech_id: null,
-                current_speaker_user_id: '10000000-0000-4000-8000-000000000001',
-                speech_remaining_ms: 30_000,
-              },
+              connection_epoch: connectionEpoch,
+              payload: window.__JX_MATCH_SNAPSHOT__,
             }),
           });
         });
@@ -284,44 +442,42 @@ test('real runtime page connects and starts human speech from server state', asy
           });
           return;
         }
+        window.__JX_MATCH_SNAPSHOT__ = {
+          ...window.__JX_MATCH_SNAPSHOT__,
+          sequence: Number(window.__JX_MATCH_SNAPSHOT__.sequence) + 1,
+          action_state:
+            command.type === 'match.pause'
+              ? 'RECOVERY_REQUIRED'
+              : command.type === 'match.resume'
+                ? 'RESUME_COUNTDOWN'
+                : command.type === 'speech.start'
+                  ? 'HUMAN_SPEAKING'
+                  : window.__JX_MATCH_SNAPSHOT__.action_state,
+          status:
+            command.type === 'match.pause' || command.type === 'match.resume'
+              ? 'PAUSED'
+              : window.__JX_MATCH_SNAPSHOT__.status,
+          error_code: command.type === 'match.pause' ? 'tts_stream_interrupted' : null,
+        };
         this.emit('message', {
           data: JSON.stringify({
             type: 'command.ack',
             message_id: command.message_id,
-            sequence: Number(window.__JX_MATCH_SNAPSHOT__.sequence) + 1,
-            snapshot: {
-              ...window.__JX_MATCH_SNAPSHOT__,
-              sequence: Number(window.__JX_MATCH_SNAPSHOT__.sequence) + 1,
-              action_state:
-                command.type === 'match.pause'
-                  ? 'RECOVERY_REQUIRED'
-                  : command.type === 'match.resume'
-                    ? 'RESUME_COUNTDOWN'
-                    : command.type === 'speech.start'
-                      ? 'HUMAN_SPEAKING'
-                      : window.__JX_MATCH_SNAPSHOT__.action_state,
-              status:
-                command.type === 'match.pause' || command.type === 'match.resume'
-                  ? 'PAUSED'
-                  : window.__JX_MATCH_SNAPSHOT__.status,
-              error_code: command.type === 'match.pause' ? 'tts_stream_interrupted' : null,
-            },
+            sequence: window.__JX_MATCH_SNAPSHOT__.sequence,
+            snapshot: window.__JX_MATCH_SNAPSHOT__,
           }),
         });
-        window.__JX_MATCH_SNAPSHOT__ = {
-          ...window.__JX_MATCH_SNAPSHOT__,
-          sequence: Number(window.__JX_MATCH_SNAPSHOT__.sequence) + 1,
-        };
         if (command.type === 'speech.start') {
+          window.__JX_MATCH_SNAPSHOT__ = {
+            ...window.__JX_MATCH_SNAPSHOT__,
+            action_state: 'HUMAN_SPEAKING',
+            sequence: Number(window.__JX_MATCH_SNAPSHOT__.sequence) + 1,
+            current_speech_id: '80000000-0000-4000-8000-000000000001',
+          };
           this.emit('message', {
             data: JSON.stringify({
               type: 'match.snapshot',
-              payload: {
-                ...window.__JX_MATCH_SNAPSHOT__,
-                action_state: 'HUMAN_SPEAKING',
-                sequence: 4,
-                current_speech_id: '80000000-0000-4000-8000-000000000001',
-              },
+              payload: window.__JX_MATCH_SNAPSHOT__,
             }),
           });
           this.emit('message', {
@@ -361,6 +517,7 @@ test('real runtime page connects and starts human speech from server state', asy
     window.__JX_OUTPUT_MUTED_STATES__ = [];
     window.__JX_COMMAND_SEQUENCES__ = [];
     window.__JX_MATCH_AUDIO_OVERRIDE__ = async () => ({
+      canPlaybackAudio: false,
       setMicrophoneEnabled: async (enabled) => {
         window.__JX_MICROPHONE_STATES__?.push(enabled);
       },
@@ -460,6 +617,8 @@ test('real runtime page connects and starts human speech from server state', asy
   );
   await page.goto(`/debate?match_id=${matchId}`);
   await expect(page.getByRole('heading', { name: '轮到你发言了！' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '开启比赛声音' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '开始发言' })).toBeEnabled();
   await expect.poll(() => roomSnapshotRequests).toBeGreaterThan(1);
   await expect(page.getByTestId('participant-presence').first()).toHaveAttribute(
     'aria-label',
@@ -527,25 +686,30 @@ test('real runtime page connects and starts human speech from server state', asy
   await expect(pauseDialog).toBeVisible();
   await pauseDialog.getByRole('button', { name: '确认暂停' }).click();
   await expect(page.getByRole('heading', { name: '比赛已安全暂停' })).toBeVisible();
-  await page.evaluate(() => window.__JX_EMIT_ERROR_SNAPSHOT__?.());
+  await page.evaluate(() => window.__JX_EMIT_TIMEOUT_SNAPSHOT__?.());
   await expect(
-    page.getByText('实时服务发生异常，比赛已暂停，请检查设备后申请恢复。'),
+    page.getByText('当前辩手 60 秒内未开始发言，比赛已暂停；确认设备后可申请恢复。'),
   ).toBeVisible();
+  await page.evaluate(() => window.__JX_EMIT_ERROR_SNAPSHOT__?.());
+  await expect(page.getByText('语音合成连续失败，比赛已暂停，请申请恢复。')).toBeVisible();
+  await expect(
+    page.getByText('当前辩手 60 秒内未开始发言，比赛已暂停；确认设备后可申请恢复。'),
+  ).toHaveCount(0);
   await page.getByRole('button', { name: '申请恢复' }).click();
   await expect(page.getByRole('heading', { name: '3 秒后恢复比赛' })).toBeVisible();
   await expect(page.getByText('恢复倒计时', { exact: true })).toBeVisible();
   await expect(page.getByText('恢复倒计时进行中')).toBeVisible();
   await expect(page.getByRole('button', { name: '申请恢复' })).toHaveCount(0);
-  await expect(page.getByText('实时服务发生异常，比赛已暂停，请检查设备后申请恢复。')).toHaveCount(
-    0,
-  );
-  await expect.poll(() => page.evaluate(() => window.__JX_COMMAND_SEQUENCES__)).toEqual([3, 4]);
+  await expect(page.getByText('语音合成连续失败，比赛已暂停，请申请恢复。')).toHaveCount(0);
+  await expect.poll(() => page.evaluate(() => window.__JX_COMMAND_SEQUENCES__)).toEqual([3, 6]);
   await page.evaluate(() => window.__JX_EMIT_READY_SNAPSHOT__?.());
   const startButton = page.getByRole('button', { name: '开始发言' });
   await expect(startButton).toBeEnabled();
+  await expect(page.getByRole('button', { name: '开启比赛声音' })).toBeVisible();
   await startButton.click();
   await expect(page.getByRole('heading', { name: '麦克风已开启' })).toBeVisible();
   await expect(page.getByRole('button', { name: '提前结束发言' })).toBeVisible();
+  await expect.poll(() => page.evaluate(() => window.__JX_MICROPHONE_STATES__?.at(-1))).toBe(true);
   const humanPresence = page.getByTestId('participant-presence').first();
   await expect(humanPresence).toHaveAttribute('aria-label', '在线');
   await expect(page.getByTestId('participant-presence')).toHaveCount(2);
@@ -604,9 +768,12 @@ test('real runtime page connects and starts human speech from server state', asy
   await expect(staleFinishDialog).toBeVisible();
   await page.evaluate(() => window.__JX_EMIT_HUMAN_FINISHED_SNAPSHOT__?.());
   await expect(staleFinishDialog).toHaveCount(0);
-  await expect(page.getByRole('region', { name: '操作提示' }).getByRole('status')).toContainText(
-    '比赛状态已变化，未执行该操作',
-  );
+  await expect(
+    page
+      .getByRole('region', { name: '操作提示' })
+      .getByRole('status')
+      .filter({ hasText: '比赛状态已变化，未执行该操作' }),
+  ).toBeVisible();
   await page.evaluate(() => window.__JX_EMIT_READY_SNAPSHOT__?.());
   await page.getByRole('button', { name: '开始发言' }).click();
   await expect(finishButton).toBeVisible();
@@ -636,7 +803,7 @@ test('real runtime page connects and starts human speech from server state', asy
   await expect.poll(() => page.evaluate(() => window.__JX_FAILED_COMMAND_COUNT__ ?? 0)).toBe(1);
   await expect
     .poll(() => page.evaluate(() => window.__JX_MICROPHONE_STATES__?.slice(-2)))
-    .toEqual([false, true]);
+    .toEqual([false, false]);
   await expect.poll(() => page.evaluate(() => window.__JX_MATCH_SOCKET_COUNT__ ?? 0)).toBe(3);
   await expect(page.getByRole('button', { name: '查看网络状态' })).toBeVisible();
 

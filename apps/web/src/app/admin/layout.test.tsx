@@ -1,4 +1,6 @@
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import type { ReactNode } from 'react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { ApiClientError } from '@/lib/auth-api';
@@ -20,6 +22,16 @@ vi.mock('next/navigation', () => ({
 
 import AdminLayout from './layout';
 
+function renderLayout(children: ReactNode) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(['experiments', 'capabilities'], {
+    creation_enabled: true,
+    history_readable: true,
+    target_version: '2.1.0',
+  });
+  return render(<QueryClientProvider client={client}>{children}</QueryClientProvider>);
+}
+
 describe('admin layout', () => {
   afterEach(cleanup);
 
@@ -35,13 +47,13 @@ describe('admin layout', () => {
   });
 
   it('renders admin content for administrators', () => {
-    render(<AdminLayout>管理内容</AdminLayout>);
+    renderLayout(<AdminLayout>管理内容</AdminLayout>);
     expect(screen.getByText('管理内容')).toBeVisible();
   });
 
   it('hides admin content from ordinary users', () => {
     authState.data = { user: { role: 'USER', must_change_password: false } };
-    render(<AdminLayout>管理内容</AdminLayout>);
+    renderLayout(<AdminLayout>管理内容</AdminLayout>);
     expect(screen.queryByText('管理内容')).not.toBeInTheDocument();
     expect(screen.getByRole('heading', { name: '需要管理员权限' })).toBeVisible();
   });
@@ -49,7 +61,7 @@ describe('admin layout', () => {
   it('redirects unauthenticated users to login with the original path', async () => {
     authState.data = undefined;
     authState.error = new ApiClientError(401, {});
-    render(<AdminLayout>管理内容</AdminLayout>);
+    renderLayout(<AdminLayout>管理内容</AdminLayout>);
     await waitFor(() =>
       expect(replace).toHaveBeenCalledWith('/login?return_to=%2Fadmin%2Fcatalog'),
     );
@@ -59,7 +71,7 @@ describe('admin layout', () => {
   it('explains a temporary auth service failure and allows retry', () => {
     authState.data = undefined;
     authState.error = new ApiClientError(503, {});
-    render(<AdminLayout>管理内容</AdminLayout>);
+    renderLayout(<AdminLayout>管理内容</AdminLayout>);
 
     expect(screen.getByRole('heading', { name: '无法确认管理权限' })).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: '重新检查' }));

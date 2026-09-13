@@ -7,7 +7,7 @@ from uuid import UUID
 
 from fastapi import APIRouter, Depends, File, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse
-from sqlalchemy import case, func, select
+from sqlalchemy import case, delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..legal.terms import get_current_platform_terms
@@ -18,6 +18,7 @@ from ..models import (
     Match,
     MatchParticipant,
     Room,
+    RoomConnectionLease,
     RoomMember,
     User,
 )
@@ -33,6 +34,8 @@ from .dependencies import (
 )
 from .errors import APIError, AuthError
 from .schemas import (
+    AdminSetPasswordRequest,
+    AdminSetPasswordResponse,
     AuthResponse,
     AvatarPresetUpdateRequest,
     ChangePasswordRequest,
@@ -265,8 +268,23 @@ async def logout(
     auth_service: Annotated[AuthService, Depends(get_auth_service)],
 ) -> LogoutResponse:
     policy = cookie_policy(request.app.state.runtime.settings.app_env)
-    await auth_service.sessions.revoke_current(database_session, request.cookies.get(policy.name))
+    token = request.cookies.get(policy.name)
+    validation = await auth_service.sessions.validate(database_session, token)
+    if validation.context is not None:
+        user_id = validation.context.user_id
+        await database_session.execute(
+            delete(RoomConnectionLease).where(RoomConnectionLease.user_id == user_id)
+        )
+        await database_session.execute(
+            update(RoomMember)
+            .where(RoomMember.user_id == user_id, RoomMember.left_at.is_(None))
+            .values(online=False)
+        )
+    await auth_service.sessions.revoke_current(database_session, token)
     await database_session.commit()
+    presence = getattr(request.app.state, "presence", None)
+    if presence is not None and validation.context is not None:
+        await presence.revoke_user(validation.context.user_id)
     response.delete_cookie(
         key=policy.name,
         path=policy.path,
@@ -301,6 +319,9 @@ async def change_password(
         )
     except AuthError as error:
         _raise_auth_error(error)
+    presence = getattr(request.app.state, "presence", None)
+    if presence is not None:
+        await presence.revoke_user(context.user_id)
     _set_session_cookie(response, request, result.session.token)
     response.headers["X-Other-Sessions-Revoked"] = "true"
     return AuthResponse(user=_user_response(result.user))
@@ -433,6 +454,7 @@ async def get_avatar(
 )
 async def reset_temporary_password(
     user_id: UUID,
+    request: Request,
     response: Response,
     context: Annotated[AuthContext, Depends(get_admin_auth)],
     database_session: Annotated[AsyncSession, Depends(get_database_session)],
@@ -447,8 +469,41 @@ async def reset_temporary_password(
         )
     except AuthError as error:
         _raise_auth_error(error)
+    presence = getattr(request.app.state, "presence", None)
+    if presence is not None:
+        await presence.revoke_user(user_id)
     response.headers["Cache-Control"] = "no-store"
     return TemporaryPasswordResponse(temporary_password=result.temporary_password)
+
+
+@router.post(
+    "/admin/users/{user_id}/password",
+    response_model=AdminSetPasswordResponse,
+    dependencies=[Depends(require_browser_origin)],
+    tags=["admin"],
+)
+async def set_user_password(
+    user_id: UUID,
+    payload: AdminSetPasswordRequest,
+    request: Request,
+    context: Annotated[AuthContext, Depends(get_admin_auth)],
+    database_session: Annotated[AsyncSession, Depends(get_database_session)],
+    auth_service: Annotated[AuthService, Depends(get_auth_service)],
+) -> AdminSetPasswordResponse:
+    try:
+        await auth_service.set_password_by_admin(
+            database_session,
+            actor_user_id=context.user_id,
+            target_user_id=user_id,
+            new_password=payload.new_password,
+            request_id=current_request_id(),
+        )
+    except AuthError as error:
+        _raise_auth_error(error)
+    presence = getattr(request.app.state, "presence", None)
+    if presence is not None:
+        await presence.revoke_user(user_id)
+    return AdminSetPasswordResponse()
 
 
 __all__ = ["router"]

@@ -1,18 +1,30 @@
 import { cleanup, render, screen, within } from '@testing-library/react';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it } from 'vitest';
 
 import { HomePrototype } from './home-prototype';
 import { getHomePrototypeFixture } from '../prototype-fixtures/home';
 
+function renderHome(element: ReactElement) {
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  client.setQueryData(['experiments', 'capabilities'], {
+    creation_enabled: true,
+    history_readable: true,
+    target_version: '2.1.0',
+  });
+  return render(<QueryClientProvider client={client}>{element}</QueryClientProvider>);
+}
+
 describe('HomePrototype', () => {
   afterEach(cleanup);
 
   it('renders the default home structure with typed room and ranking fixtures', () => {
-    render(<HomePrototype />);
+    renderHome(<HomePrototype />);
 
     expect(
       screen.getByRole('heading', {
-        name: /让人类与 Agent，\s*在声音中交锋与共创/,
+        name: /人机共辩，\s*百家之言各得鸣。/,
       }),
     ).toBeVisible();
     expect(screen.getByRole('heading', { name: '正在进行' })).toBeVisible();
@@ -26,14 +38,14 @@ describe('HomePrototype', () => {
   });
 
   it('renders a useful empty lobby state', () => {
-    render(<HomePrototype scenario="empty" />);
+    renderHome(<HomePrototype scenario="empty" />);
 
     expect(screen.getByRole('heading', { name: '目前没有进行中的比赛' })).toBeVisible();
     expect(screen.queryByRole('link', { name: /查看比赛：/ })).not.toBeInTheDocument();
   });
 
   it('explains when the global spectator capacity is full', () => {
-    render(<HomePrototype scenario="capacity-full" />);
+    renderHome(<HomePrototype scenario="capacity-full" />);
 
     expect(screen.getByRole('status')).toHaveTextContent(
       '观战席已满。 当前全平台观众已达上限，请稍后重试。',
@@ -42,14 +54,14 @@ describe('HomePrototype', () => {
   });
 
   it('surfaces the updated leaderboard timestamp', () => {
-    render(<HomePrototype scenario="leaderboard-updated" />);
+    renderHome(<HomePrototype scenario="leaderboard-updated" />);
 
     expect(screen.getAllByText(/刚刚更新/)).toHaveLength(2);
   });
 
   it('labels active room cards with their real server status', () => {
     const base = getHomePrototypeFixture('default');
-    render(
+    renderHome(
       <HomePrototype
         fixture={{
           ...base,
@@ -69,7 +81,7 @@ describe('HomePrototype', () => {
 
   it.each([0, 1, 2, 3])('keeps a stable podium for %i ranked entries', (entryCount) => {
     const base = getHomePrototypeFixture('empty');
-    render(
+    renderHome(
       <HomePrototype
         fixture={{
           ...base,
@@ -93,6 +105,7 @@ describe('HomePrototype', () => {
 
     const podium = within(screen.getByTestId('human-podium'));
     expect(podium.getByLabelText('第 1 名')).toBeVisible();
+    expect(podium.getByRole('img', { name: '第 1 名' })).toBeVisible();
     if (entryCount >= 2) expect(podium.getByLabelText('第 2 名')).toBeVisible();
     else expect(podium.queryByLabelText('第 2 名')).not.toBeInTheDocument();
     if (entryCount >= 3) expect(podium.getByLabelText('第 3 名')).toBeVisible();

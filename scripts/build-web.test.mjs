@@ -8,6 +8,8 @@ import {
   assertNoCssOptimizerWarnings,
   assertOwnedNextOutput,
   assertHomeBundleBoundary,
+  assertQuestionnaireSurface,
+  assertStaticArtifactIntegrity,
   assertStandaloneCoreOrigin,
   cleanNextOutput,
   copyStandalonePublic,
@@ -133,6 +135,70 @@ test('home bundle guard rejects debate runtime code in initial scripts', () => {
     assert.throws(() => assertHomeBundleBoundary(webRoot), /debate runtime marker/);
     writeFileSync(chunkPath, 'export const HomePage = true;');
     assert.doesNotThrow(() => assertHomeBundleBoundary(webRoot));
+  } finally {
+    rmSync(directory, { force: true, recursive: true });
+  }
+});
+
+test('production build contains both questionnaire routes and profile links', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'jx-web-questionnaire-surface-'));
+  const webRoot = join(directory, 'apps/web');
+  mkdirSync(join(webRoot, '.next/server/chunks'), { recursive: true });
+  writeFileSync(
+    join(webRoot, '.next/app-path-routes-manifest.json'),
+    JSON.stringify({
+      '/me/ai-experience/page': '/me/ai-experience',
+      '/me/postmatch-surveys/page': '/me/postmatch-surveys',
+    }),
+  );
+  writeFileSync(
+    join(webRoot, '.next/server/chunks/me.js'),
+    'apps_web_src_features_auth_me-page AI 辩论感受 赛后问卷',
+  );
+  try {
+    assert.doesNotThrow(() => assertQuestionnaireSurface(webRoot));
+    writeFileSync(
+      join(webRoot, '.next/server/chunks/me.js'),
+      'apps_web_src_features_auth_me-page AI 辩论感受',
+    );
+    assert.throws(() => assertQuestionnaireSurface(webRoot), /post-match survey link/);
+  } finally {
+    rmSync(directory, { force: true, recursive: true });
+  }
+});
+
+test('static artifact guard rejects HTML references to missing JS or CSS', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'jx-web-static-integrity-'));
+  const webRoot = join(directory, 'apps/web');
+  mkdirSync(join(webRoot, '.next/server/app'), { recursive: true });
+  mkdirSync(join(webRoot, '.next/static/chunks'), { recursive: true });
+  writeFileSync(
+    join(webRoot, '.next/server/app/debate.html'),
+    '<script src="/_next/static/chunks/present.js"></script><link href="/_next/static/missing.css">',
+  );
+  writeFileSync(join(webRoot, '.next/static/chunks/present.js'), 'ok');
+  try {
+    assert.throws(() => assertStaticArtifactIntegrity(webRoot), /missing\.css/);
+    writeFileSync(join(webRoot, '.next/static/missing.css'), 'ok');
+    assert.doesNotThrow(() => assertStaticArtifactIntegrity(webRoot));
+  } finally {
+    rmSync(directory, { force: true, recursive: true });
+  }
+});
+
+test('production origin guard rejects the development Core port', () => {
+  const directory = mkdtempSync(join(tmpdir(), 'jx-web-production-origin-'));
+  const webRoot = join(directory, 'apps/web');
+  mkdirSync(join(webRoot, '.next'), { recursive: true });
+  writeFileSync(
+    join(webRoot, '.next/routes-manifest.json'),
+    JSON.stringify({ rewrites: [{ destination: 'http://127.0.0.1:8000/api/:path*' }] }),
+  );
+  try {
+    assert.throws(
+      () => assertStandaloneCoreOrigin(webRoot, 'http://127.0.0.1:8100'),
+      /expected Core origin/,
+    );
   } finally {
     rmSync(directory, { force: true, recursive: true });
   }

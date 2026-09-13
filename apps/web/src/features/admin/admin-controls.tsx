@@ -14,6 +14,8 @@ import { Dialog, DropdownMenu } from 'radix-ui';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { useSingleFlight } from '@/hooks/use-single-flight';
 import { cn } from '@/lib/cn';
+import { useAppLocale, useAppTranslations } from '@/i18n';
+import { translateAdminNode, translateAdminText } from './admin-i18n';
 
 type ButtonTone = 'primary' | 'secondary' | 'ghost' | 'danger';
 
@@ -63,10 +65,12 @@ type AdminRefreshButtonProps = Omit<AdminButtonProps, 'loading' | 'onClick'> & {
 };
 
 export function AdminRefreshButton({
-  label = '刷新',
+  label,
   onRefresh,
   ...props
 }: AdminRefreshButtonProps) {
+  const t = useAppTranslations('Admin');
+  const resolvedLabel = label ?? t('common.refresh');
   const { isPending, run } = useSingleFlight();
 
   return (
@@ -80,28 +84,27 @@ export function AdminRefreshButton({
       type={props.type ?? 'button'}
     >
       {!isPending ? <RefreshCw className="size-4" aria-hidden="true" /> : null}
-      {label}
+      {resolvedLabel}
     </AdminButton>
   );
 }
 
 export function StatusBadge({ status }: { status: string }) {
+  const t = useAppTranslations('Admin');
+  const c = (key: string) => t(`common.${key}`);
   const map: Record<
     string,
     { label: string; tone: 'green' | 'amber' | 'red' | 'blue' | 'neutral' }
   > = {
-    ACTIVE: { label: '启用', tone: 'green' },
-    ENABLED: { label: '启用', tone: 'green' },
-    READY: { label: '就绪', tone: 'green' },
-    FINISHED: { label: '已结束', tone: 'blue' },
-    SUCCEEDED: { label: '成功', tone: 'green' },
-    RUNNING: { label: '进行中', tone: 'blue' },
-    PAUSED: { label: '已暂停', tone: 'amber' },
-    PENDING: { label: '等待中', tone: 'amber' },
-    GENERATING_AUDIO: { label: '生成中', tone: 'amber' },
-    DISABLED: { label: '停用', tone: 'neutral' },
-    TERMINATED: { label: '已终止', tone: 'red' },
-    FAILED: { label: '失败', tone: 'red' },
+    ACTIVE: { label: c('enabled'), tone: 'green' }, ENABLED: { label: c('enabled'), tone: 'green' },
+    READY: { label: c('ready'), tone: 'green' }, NOT_CALIBRATED: { label: c('needsCalibration'), tone: 'amber' },
+    STALE: { label: c('recalibrate'), tone: 'amber' }, FINISHED: { label: c('finished'), tone: 'blue' },
+    SUCCEEDED: { label: c('success'), tone: 'green' }, START_PENDING_RUNTIME: { label: c('waitingRuntime'), tone: 'amber' },
+    START_COUNTDOWN: { label: c('countdown'), tone: 'blue' }, RUNNING: { label: c('running'), tone: 'blue' },
+    PAUSED: { label: c('paused'), tone: 'amber' }, SYSTEM_RECOVERY: { label: c('systemRecovery'), tone: 'amber' },
+    ERROR: { label: c('error'), tone: 'red' }, PENDING: { label: c('pending'), tone: 'amber' },
+    GENERATING_AUDIO: { label: c('generating'), tone: 'amber' }, DISABLED: { label: c('disabled'), tone: 'neutral' },
+    TERMINATED: { label: c('terminated'), tone: 'red' }, FAILED: { label: c('failed'), tone: 'red' },
   };
   const item = map[status] ?? { label: status, tone: 'neutral' as const };
   return (
@@ -130,12 +133,13 @@ export function AdminSelect({
   className,
   ...props
 }: SelectHTMLAttributes<HTMLSelectElement> & { label: string }) {
+  const { locale } = useAppLocale();
   return (
     <label className="inline-flex min-h-9 items-center gap-2 text-xs font-bold text-slate-500">
-      <span className="sr-only">{label}</span>
+      <span className="sr-only">{translateAdminText(label, locale)}</span>
       <select
         {...props}
-        aria-label={label}
+        aria-label={translateAdminText(label, locale)}
         className={cn(
           'min-h-9 rounded-lg border border-slate-200 bg-white px-3 text-xs font-bold text-slate-700 outline-none transition focus:border-blue-500 focus:ring-4 focus:ring-blue-100',
           className,
@@ -146,15 +150,17 @@ export function AdminSelect({
 }
 
 export function AdminSearch({
-  label = '搜索',
+  label,
   ...props
 }: InputHTMLAttributes<HTMLInputElement> & { label?: string }) {
+  const t = useAppTranslations('Admin');
+  const resolvedLabel = label ?? t('common.search');
   return (
     <label className="relative min-w-52 flex-1">
-      <span className="sr-only">{label}</span>
+      <span className="sr-only">{resolvedLabel}</span>
       <input
         {...props}
-        aria-label={label}
+        aria-label={resolvedLabel}
         className="min-h-9 w-full rounded-lg border border-slate-200 bg-white px-3 text-xs font-semibold text-slate-800 outline-none placeholder:text-slate-400 focus:border-blue-500 focus:ring-4 focus:ring-blue-100"
         type="search"
       />
@@ -173,11 +179,12 @@ export function AdminPagination({
   total: number;
   onPageChange: (page: number) => void;
 }) {
+  const t = useAppTranslations('Admin');
   if (totalPages <= 1) return null;
   return (
     <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4 text-xs font-semibold text-slate-600">
       <span>
-        第 {page} / {totalPages} 页 · 共 {total} 条
+        {t('common.page', { page, totalPages, total })}
       </span>
       <div className="flex gap-2">
         <AdminButton
@@ -186,7 +193,7 @@ export function AdminPagination({
           size="sm"
           type="button"
         >
-          上一页
+          {t('common.previous')}
         </AdminButton>
         <AdminButton
           disabled={page >= totalPages}
@@ -194,7 +201,7 @@ export function AdminPagination({
           size="sm"
           type="button"
         >
-          下一页
+          {t('common.next')}
         </AdminButton>
       </div>
     </div>
@@ -202,21 +209,23 @@ export function AdminPagination({
 }
 
 export function AdminActionMenu({
-  label = '更多操作',
+  label,
   children,
 }: {
   label?: string;
   children: ReactNode;
 }) {
+  const t = useAppTranslations('Admin');
+  const resolvedLabel = label ?? t('common.moreActions');
   return (
     <DropdownMenu.Root modal={false}>
       <DropdownMenu.Trigger asChild>
         <button
-          aria-label={label}
+          aria-label={resolvedLabel}
           className="inline-flex min-h-9 items-center justify-center gap-1.5 rounded-lg border border-slate-200 bg-white px-3 text-xs font-bold text-slate-700 shadow-sm transition hover:border-blue-300 hover:bg-blue-50 hover:text-blue-800 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-blue-100 data-[state=open]:border-blue-300 data-[state=open]:bg-blue-50 data-[state=open]:text-blue-800"
           type="button"
         >
-          <span aria-hidden="true">操作</span>
+          <span aria-hidden="true">{t('common.actions')}</span>
           <ChevronDown className="size-4" aria-hidden="true" />
         </button>
       </DropdownMenu.Trigger>
@@ -241,6 +250,7 @@ export function AdminActionItem({
 }: ComponentPropsWithoutRef<typeof DropdownMenu.Item> & {
   tone?: 'default' | 'danger';
 }) {
+  const { locale } = useAppLocale();
   return (
     <DropdownMenu.Item
       {...props}
@@ -252,7 +262,7 @@ export function AdminActionItem({
         props.className,
       )}
     >
-      {children}
+      {translateAdminNode(children, locale)}
     </DropdownMenu.Item>
   );
 }
@@ -272,6 +282,7 @@ export function AdminDrawer({
   children: ReactNode;
   footer?: ReactNode;
 }) {
+  const { locale } = useAppLocale();
   const returnFocusRef = useRef<HTMLElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
 
@@ -310,11 +321,11 @@ export function AdminDrawer({
           <div className="flex items-start justify-between gap-4 border-b border-slate-100 px-6 py-5">
             <div>
               <Dialog.Title className="text-lg font-black tracking-[-0.02em] text-slate-950">
-                {title}
+                {translateAdminText(title, locale)}
               </Dialog.Title>
               {description ? (
                 <Dialog.Description className="mt-1 text-xs leading-5 text-slate-500">
-                  {description}
+                {translateAdminText(description, locale)}
                 </Dialog.Description>
               ) : null}
             </div>
@@ -330,10 +341,12 @@ export function AdminDrawer({
           </div>
           <div className="relative min-h-0 flex-1 overflow-y-auto px-6 py-5">
             <div data-toast-host="modal" />
-            {children}
+            {translateAdminNode(children, locale)}
           </div>
           {footer ? (
-            <div className="border-t border-slate-100 bg-slate-50/80 px-6 py-4">{footer}</div>
+            <div className="border-t border-slate-100 bg-slate-50/80 px-6 py-4">
+              {translateAdminNode(footer, locale)}
+            </div>
           ) : null}
         </Dialog.Content>
       </Dialog.Portal>
@@ -358,15 +371,16 @@ export function AdminConfirmDialog({
   onConfirm: () => void;
   loading?: boolean;
 }) {
+  const { locale } = useAppLocale();
   return (
     <ConfirmDialog
-      confirmLabel={confirmLabel}
-      description={description}
+      confirmLabel={confirmLabel ? translateAdminText(confirmLabel, locale) : undefined}
+      description={translateAdminText(description, locale)}
       loading={loading}
       onConfirm={onConfirm}
       onOpenChange={onOpenChange}
       open={open}
-      title={title}
+      title={translateAdminText(title, locale)}
     />
   );
 }

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -14,6 +15,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from .agent.llm import LlmCapacityLimiter, LlmProviderError, OpenAIStreamingClient
 from .config import Settings
 from .data_capture.content import CAPTURE_VERSION, store_content_blob
+from .data_capture.provider import PROVIDER_CAPTURE_VERSION, ProviderCallCapture
+from .data_capture.provider_persistence import persist_provider_capture
+from .experiments.prompts import render_history
 from .models import (
     ExternalCall,
     JudgeProfile,
@@ -25,6 +29,21 @@ from .models import (
     Speech,
 )
 from .security.crypto import decrypt_secret
+
+
+def _stage_name_for_action(action_key: str, snapshot: dict[str, Any] | None) -> str:
+    try:
+        position = int(action_key.split(":", 1)[0])
+    except (TypeError, ValueError):
+        return "辩论记录"
+    stages_value = (snapshot or {}).get("stages", [])
+    stages = cast(list[object], stages_value) if isinstance(stages_value, list) else []
+    for stage in stages:
+        if isinstance(stage, dict):
+            typed_stage = cast(dict[str, Any], stage)
+            if int(typed_stage.get("position", 0)) == position:
+                return str(typed_stage.get("name") or f"第 {position} 阶段")
+    return f"第 {position} 阶段"
 
 
 def _parse_result(
@@ -139,6 +158,29 @@ def _parse_result(
     return parsed
 
 
+def _snapshot_judge(format_snapshot: dict[str, Any] | None) -> dict[str, Any] | None:
+    """Return the published judge config only when the judge module is enabled."""
+    if not format_snapshot:
+        return None
+    modules = format_snapshot.get("modules")
+    typed_modules = cast(list[Any], modules) if isinstance(modules, list) else []
+    if isinstance(modules, list):
+        if not any(
+            isinstance(module_value, dict)
+            and (module := cast(dict[str, Any], module_value)).get("module_key") == "JUDGE"
+            and module.get("enabled") is True
+            for module_value in typed_modules
+        ):
+            return None
+    judge = format_snapshot.get("judge")
+    if not isinstance(judge, dict):
+        return None
+    typed_judge = cast(dict[str, Any], judge)
+    if not isinstance(modules, list) and typed_judge.get("enabled") is not True:
+        return None
+    return typed_judge
+
+
 class PostmatchService:
     def __init__(
         self,
@@ -172,32 +214,51 @@ class PostmatchService:
                 )
                 if latest is not None and latest.status in {"PENDING", "RUNNING"} and not force:
                     return latest.id
-                profile = await session.scalar(
-                    select(JudgeProfile)
-                    .where(JudgeProfile.status == "ENABLED")
-                    .order_by(JudgeProfile.updated_at.desc())
-                    .limit(1)
-                )
-                if profile is None:
-                    model = await session.scalar(
-                        select(ModelProfile)
-                        .where(ModelProfile.status == "ENABLED")
-                        .order_by(ModelProfile.updated_at.desc())
+                room = await session.get(Room, match.room_id)
+                frozen_judge = _snapshot_judge(room.format_snapshot if room else None)
+                profile: JudgeProfile | None = None
+                if room is not None and room.format_snapshot is not None:
+                    if frozen_judge is None:
+                        return None
+                    frozen_model_value = frozen_judge.get("model")
+                    if not isinstance(frozen_model_value, dict):
+                        return None
+                    frozen_model = cast(dict[str, Any], frozen_model_value)
+                    if not frozen_model.get("id"):
+                        return None
+                    try:
+                        model_id = UUID(str(frozen_model["id"]))
+                    except ValueError:
+                        return None
+                    if await session.get(ModelProfile, model_id) is None:
+                        return None
+                else:
+                    profile = await session.scalar(
+                        select(JudgeProfile)
+                        .where(JudgeProfile.status == "ENABLED")
+                        .order_by(JudgeProfile.updated_at.desc())
                         .limit(1)
                     )
-                    if model is None:
-                        return None
-                    profile = JudgeProfile(
-                        model_profile_id=model.id,
-                        system_prompt="你是客观、简洁的中文辩论裁判，只输出 JSON。",
-                        judge_prompt=(
-                            "按 argument/rebuttal/evidence/teamwork/expression 五项评分。"
-                            "每方总计 100；每名辩手 0-20。严格输出 winner、team_scores、"
-                            "participants、team_comments。"
-                        ),
-                    )
-                    session.add(profile)
-                    await session.flush()
+                    if profile is None:
+                        model = await session.scalar(
+                            select(ModelProfile)
+                            .where(ModelProfile.status == "ENABLED")
+                            .order_by(ModelProfile.updated_at.desc())
+                            .limit(1)
+                        )
+                        if model is None:
+                            return None
+                        profile = JudgeProfile(
+                            model_profile_id=model.id,
+                            system_prompt="你是客观、简洁的中文辩论裁判，只输出 JSON。",
+                            judge_prompt=(
+                                "按 argument/rebuttal/evidence/teamwork/expression 五项评分。"
+                                "每方总计 100；每名辩手 0-20。严格输出 winner、team_scores、"
+                                "participants、team_comments。"
+                            ),
+                        )
+                        session.add(profile)
+                        await session.flush()
                 participants = list(
                     (
                         await session.scalars(
@@ -216,7 +277,6 @@ class PostmatchService:
                         )
                     ).all()
                 )
-                room = await session.get(Room, match.room_id)
                 snapshot = {
                     "topic": (room.topic_snapshot if room else {}).get("title", ""),
                     "participants": [
@@ -229,17 +289,28 @@ class PostmatchService:
                         }
                         for item in participants
                     ],
-                    "history": [
-                        {
-                            "speaker": f"{speech.side}-{speech.seat_no}",
-                            "content": speech.display_text or "",
-                        }
-                        for speech in speeches
-                    ],
+                    "history": json.loads(
+                        render_history(
+                            [
+                                {
+                                    "stage": _stage_name_for_action(
+                                        speech.action_key, room.rule_snapshot if room else None
+                                    ),
+                                    "speaker": f"{speech.side}-{speech.seat_no}",
+                                    "side": speech.side,
+                                    "seat_no": speech.seat_no,
+                                    "content": speech.display_text or "",
+                                }
+                                for speech in speeches
+                            ]
+                        )
+                    ),
                 }
+                if frozen_judge is not None:
+                    snapshot["_judge_runtime"] = deepcopy(frozen_judge)
                 result = JudgeResult(
                     match_id=match_id,
-                    judge_profile_id=profile.id,
+                    judge_profile_id=profile.id if profile is not None else None,
                     context_version=match.context_version,
                     input_snapshot=snapshot,
                 )
@@ -254,7 +325,7 @@ class PostmatchService:
     async def _execute(self, result_id: UUID) -> None:
         for attempt in (1, 2):
             external_call_id: UUID | None = None
-            raw_response: str | None = None
+            provider_capture = ProviderCallCapture()
             try:
                 async with self._session_factory() as session:
                     async with session.begin():
@@ -263,17 +334,49 @@ class PostmatchService:
                             return
                         row.status = "RUNNING"
                         row.attempt_no = attempt
-                        profile = await session.get(JudgeProfile, row.judge_profile_id)
-                        model = (
-                            await session.get(ModelProfile, profile.model_profile_id)
-                            if profile
+                        frozen_judge_value = row.input_snapshot.get("_judge_runtime")
+                        frozen_judge = (
+                            cast(dict[str, Any], frozen_judge_value)
+                            if isinstance(frozen_judge_value, dict)
                             else None
                         )
+                        profile = (
+                            await session.get(JudgeProfile, row.judge_profile_id)
+                            if row.judge_profile_id is not None
+                            else None
+                        )
+                        frozen_model = (
+                            cast(dict[str, Any], frozen_judge.get("model", {}))
+                            if frozen_judge is not None
+                            else {}
+                        )
+                        frozen_model_id = frozen_model.get("id")
+                        try:
+                            model_profile_id = (
+                                UUID(str(frozen_model_id))
+                                if frozen_judge is not None
+                                else profile.model_profile_id
+                                if profile is not None
+                                else None
+                            )
+                        except ValueError as error:
+                            raise LlmProviderError("judge_profile_unavailable") from error
+                        model = (
+                            await session.get(ModelProfile, model_profile_id)
+                            if model_profile_id is not None
+                            else None
+                        )
+                        base_url = str(
+                            frozen_model.get("base_url") or (model.base_url if model else "")
+                        )
+                        provider_model_id = str(
+                            frozen_model.get("model_id") or (model.model_id if model else "")
+                        )
                         if (
-                            profile is None
+                            (profile is None and frozen_judge is None)
                             or model is None
-                            or not model.base_url
-                            or not model.model_id
+                            or not base_url
+                            or not provider_model_id
                             or model.api_key_ciphertext is None
                             or model.api_key_nonce is None
                             or self._settings.llm_key_encryption_key is None
@@ -284,19 +387,47 @@ class PostmatchService:
                             model.api_key_nonce,
                             self._settings.llm_key_encryption_key.get_secret_value(),
                         )
+                        judge_prompt = (
+                            str(frozen_judge.get("judge_prompt") or "")
+                            if frozen_judge is not None
+                            else profile.judge_prompt
+                            if profile is not None
+                            else ""
+                        )
+                        system_prompt = (
+                            str(frozen_judge.get("system_prompt") or "")
+                            if frozen_judge is not None
+                            else profile.system_prompt
+                            if profile is not None
+                            else ""
+                        )
+                        debate_snapshot = {
+                            key: value
+                            for key, value in row.input_snapshot.items()
+                            if key != "_judge_runtime"
+                        }
                         prompt = (
-                            (profile.judge_prompt or "请严格按 JSON 评分。")
+                            (judge_prompt or "请严格按 JSON 评分。")
                             + "\n"
-                            + json.dumps(row.input_snapshot, ensure_ascii=False)
+                            + json.dumps(debate_snapshot, ensure_ascii=False)
                         )
                         messages = [
                             {
                                 "role": "system",
-                                "content": profile.system_prompt or "你是客观的中文辩论裁判。",
+                                "content": system_prompt or "你是客观的中文辩论裁判。",
                             },
                             {"role": "user", "content": prompt},
                         ]
-                        config = dict(profile.generation_params)
+                        config = (
+                            {
+                                **cast(dict[str, Any], frozen_model.get("generation_params", {})),
+                                **cast(dict[str, Any], frozen_judge.get("generation_params", {})),
+                            }
+                            if frozen_judge is not None
+                            else dict(profile.generation_params)
+                            if profile is not None
+                            else {}
+                        )
                         participant_records = cast(
                             list[dict[str, Any]], row.input_snapshot.get("participants", [])
                         )
@@ -304,7 +435,7 @@ class PostmatchService:
                             str(item["participant_id"]) for item in participant_records
                         }
                         request_payload = {
-                            "model": model.model_id,
+                            "model": provider_model_id,
                             "messages": messages,
                             "stream": True,
                             "stream_options": {"include_usage": True},
@@ -329,21 +460,26 @@ class PostmatchService:
                                 call_kind="JUDGE",
                                 provider="OPENAI_COMPATIBLE",
                                 operation="chat.completions.stream",
-                                model=model.model_id,
+                                model=provider_model_id,
                                 attempt_no=attempt,
                                 status="STARTED",
                                 match_id=row.match_id,
                                 judge_result_id=row.id,
                                 context_version=row.context_version,
-                                request_blob_id=request_blob_id,
+                                capture_version=PROVIDER_CAPTURE_VERSION,
+                                captured_at=datetime.now(UTC),
+                                source_kind="MATCH",
+                                logical_call_id=result_id,
                                 started_at=datetime.now(UTC),
                             )
                         )
                 leases = await self._limiter.acquire(
-                    model.name, model.max_concurrency, timeout_seconds=3
+                    str(frozen_model.get("name") or model.name),
+                    int(frozen_model.get("max_concurrency") or model.max_concurrency),
+                    timeout_seconds=3,
                 )
                 client = OpenAIStreamingClient(
-                    base_url=model.base_url, api_key=key, model=model.model_id
+                    base_url=base_url, api_key=key, model=provider_model_id
                 )
                 try:
                     result = await client.stream_chat(
@@ -351,8 +487,8 @@ class PostmatchService:
                         max_tokens=1600,
                         generation_params=config,
                         on_delta=lambda _: _async_noop(),
+                        capture=provider_capture,
                     )
-                    raw_response = result.text
                 finally:
                     await client.close()
                     self._limiter.release(leases)
@@ -374,8 +510,8 @@ class PostmatchService:
                                 ExternalCall, external_call_id, with_for_update=True
                             )
                             if call is not None:
+                                await persist_provider_capture(session, call, provider_capture)
                                 call.status = "SUCCEEDED"
-                                call.response_blob_id = response_blob_id
                                 call.first_result_latency_ms = result.first_token_latency_ms
                                 call.completed_latency_ms = result.completed_latency_ms
                                 call.completion_tokens = result.completion_tokens
@@ -393,13 +529,7 @@ class PostmatchService:
                             else None
                         )
                         if call is not None and call.status == "STARTED":
-                            if raw_response is not None:
-                                response_blob_id = await store_content_blob(
-                                    session,
-                                    content_kind="RESPONSE",
-                                    payload={"text": raw_response},
-                                )
-                                call.response_blob_id = response_blob_id
+                            await persist_provider_capture(session, call, provider_capture)
                             call.status = "FAILED"
                             call.error_code = getattr(error, "code", "judge_failed")
                             call.completed_at = datetime.now(UTC)

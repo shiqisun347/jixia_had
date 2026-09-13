@@ -5,6 +5,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import type { MatchCommand, MatchSnapshot } from '@/lib/matches-api';
 import { matchesApi } from '@/lib/matches-api';
+import { useAppTranslations } from '@/i18n';
 
 declare global {
   interface Window {
@@ -17,6 +18,7 @@ export type MatchSocketStatus = 'connecting' | 'open' | 'closed' | 'error';
 
 type MatchSocketEvent = {
   type?: string;
+  sequence?: number;
   connection_epoch?: number;
   message_id?: string;
   duplicate?: boolean;
@@ -26,15 +28,18 @@ type MatchSocketEvent = {
   snapshot?: MatchSnapshot;
 };
 
-export function matchSocketErrorText(event: MatchSocketEvent): string | null | undefined {
+export function matchSocketErrorText(
+  event: MatchSocketEvent,
+  t?: (key: string, values?: Record<string, string | number | Date>) => string,
+): string | null | undefined {
   if (event.type === 'command.error') {
-    return event.message ?? '比赛指令未执行，请刷新后重试。';
+    return event.message ?? t?.('runtime.commandFailed') ?? '比赛指令未执行，请刷新后重试。';
   }
   if (event.type === 'match.resume_check_failed') {
     const reasons = event.payload?.reasons?.filter(Boolean) ?? [];
     return reasons.length > 0
-      ? `恢复条件未满足：${reasons.join('；')}`
-      : '恢复条件未满足，请检查辩手在线状态与设备。';
+      ? t?.('runtime.recoveryRequirements', { reasons: reasons.join('；') }) ?? `恢复条件未满足：${reasons.join('；')}`
+      : t?.('runtime.recoveryFallback') ?? '恢复条件未满足，请检查辩手在线状态与设备。';
   }
   if (event.type === 'match.resume_countdown') return null;
   return undefined;
@@ -67,6 +72,8 @@ function createMatchSocket(matchId: string): WebSocket {
 }
 
 export function useMatchRuntime(matchId: string) {
+  const t = useAppTranslations('Match');
+  const tRef = useRef(t);
   const queryClient = useQueryClient();
   const query = useQuery({
     queryKey: ['matches', matchId, 'snapshot'],
@@ -75,6 +82,8 @@ export function useMatchRuntime(matchId: string) {
     retry: 1,
   });
   const socketRef = useRef<WebSocket | null>(null);
+  const connectionEpochRef = useRef<number | null>(null);
+  const latestSequenceRef = useRef(0);
   const pendingRef = useRef(
     new Map<
       string,
@@ -83,10 +92,22 @@ export function useMatchRuntime(matchId: string) {
   );
   const [socketStatus, setSocketStatus] = useState<MatchSocketStatus>('connecting');
   const [connectionEpoch, setConnectionEpoch] = useState<number | null>(null);
+  const [latestSequence, setLatestSequence] = useState(0);
   const [socketError, setSocketError] = useState<string | null>(null);
   const [resumeReasons, setResumeReasons] = useState<string[]>(query.data?.resume_reasons ?? []);
-  const [interimText, setInterimText] = useState('');
+  const [interimText, setInterimText] = useState(() => query.data?.interim_text ?? '');
   const hasInitialSnapshot = Boolean(query.data);
+
+  useEffect(() => {
+    tRef.current = t;
+  }, [t]);
+
+  useEffect(() => {
+    const sequence = query.data?.sequence;
+    if (sequence === undefined || sequence <= latestSequenceRef.current) return;
+    latestSequenceRef.current = sequence;
+    setLatestSequence(sequence);
+  }, [query.data?.sequence]);
 
   useEffect(() => {
     if (!hasInitialSnapshot) return;
@@ -104,9 +125,24 @@ export function useMatchRuntime(matchId: string) {
     const onMessage = (message: MessageEvent) => {
       try {
         const event = JSON.parse(String(message.data)) as MatchSocketEvent;
-        if (event.connection_epoch) setConnectionEpoch(event.connection_epoch);
+        const observeSequence = (sequence: number | undefined) => {
+          if (sequence === undefined || sequence <= latestSequenceRef.current) return;
+          latestSequenceRef.current = sequence;
+          setLatestSequence(sequence);
+        };
+        observeSequence(event.sequence);
+        if (event.connection_epoch) {
+          connectionEpochRef.current = event.connection_epoch;
+          setConnectionEpoch(event.connection_epoch);
+        }
         if (event.type === 'match.snapshot') {
           const snapshot = (event as unknown as { payload: MatchSnapshot }).payload;
+          observeSequence(snapshot.sequence);
+          // Older Core/client snapshots may omit the transient field. Do not
+          // erase a live subtitle merely because a compatibility snapshot lacks it.
+          if (Object.prototype.hasOwnProperty.call(snapshot, 'interim_text')) {
+            setInterimText(snapshot.interim_text ?? '');
+          }
           queryClient.setQueryData<MatchSnapshot>(['matches', matchId, 'snapshot'], (current) =>
             newestMatchSnapshot(current, snapshot),
           );
@@ -123,6 +159,7 @@ export function useMatchRuntime(matchId: string) {
         } else if (event.type === 'command.ack' && event.message_id) {
           if (event.snapshot) {
             const acknowledged = event.snapshot;
+            observeSequence(acknowledged.sequence);
             queryClient.setQueryData<MatchSnapshot>(['matches', matchId, 'snapshot'], (current) =>
               newestMatchSnapshot(current, acknowledged),
             );
@@ -136,7 +173,8 @@ export function useMatchRuntime(matchId: string) {
             pendingRef.current.delete(event.message_id);
           }
         } else if (event.type === 'command.error' && event.message_id) {
-          setSocketError(matchSocketErrorText(event) ?? '比赛指令未执行，请刷新后重试。');
+          const translate = tRef.current;
+          setSocketError(matchSocketErrorText(event, translate) ?? translate('runtime.commandFailed'));
           const pending = pendingRef.current.get(event.message_id);
           if (pending) {
             clearTimeout(pending.timeout);
@@ -145,9 +183,8 @@ export function useMatchRuntime(matchId: string) {
           }
         } else if (event.type === 'match.resume_check_failed') {
           setResumeReasons(event.payload?.reasons?.filter(Boolean) ?? []);
-          setSocketError(
-            matchSocketErrorText(event) ?? '恢复条件未满足，请检查辩手在线状态与设备。',
-          );
+          const translate = tRef.current;
+          setSocketError(matchSocketErrorText(event, translate) ?? translate('runtime.recoveryFallback'));
         } else if (event.type === 'match.resume_countdown') {
           setResumeReasons([]);
           setSocketError(null);
@@ -173,6 +210,7 @@ export function useMatchRuntime(matchId: string) {
             matchId,
             'snapshot',
           ]);
+          void queryClient.invalidateQueries({ queryKey: ['matches', matchId, 'snapshot'] });
           if (snapshot) {
             void queryClient.invalidateQueries({
               queryKey: ['rooms', snapshot.room_id, 'snapshot'],
@@ -182,15 +220,16 @@ export function useMatchRuntime(matchId: string) {
           void queryClient.invalidateQueries({ queryKey: ['matches', matchId, 'snapshot'] });
         }
       } catch {
-        setSocketError('比赛事件格式异常，请刷新页面重试。');
+        setSocketError(tRef.current('runtime.eventInvalid'));
       }
     };
     function scheduleReconnect() {
       if (disposed || reconnectTimer !== null) return;
+      connectionEpochRef.current = null;
       setConnectionEpoch(null);
       setSocketStatus('connecting');
       setSocketError((current) =>
-        current?.startsWith('恢复条件未满足') ? current : '比赛实时连接已断开，正在自动重连。',
+        current?.startsWith('恢复条件未满足') ? current : tRef.current('runtime.reconnecting'),
       );
       const delay = Math.min(500 * 2 ** reconnectAttempt, 5_000);
       reconnectAttempt += 1;
@@ -215,8 +254,8 @@ export function useMatchRuntime(matchId: string) {
         reconnectAttempt = 0;
         setSocketStatus('open');
         setSocketError((current) =>
-          current === '比赛实时连接已断开，正在自动重连。' ||
-          current === '比赛实时连接失败，正在自动重连。'
+          current === tRef.current('runtime.reconnecting') ||
+          current === tRef.current('runtime.reconnectFailed')
             ? null
             : current,
         );
@@ -225,7 +264,7 @@ export function useMatchRuntime(matchId: string) {
       socket.addEventListener('error', () => {
         if (disposed || socketRef.current !== socket) return;
         setSocketStatus('error');
-        setSocketError('比赛实时连接失败，正在自动重连。');
+        setSocketError(tRef.current('runtime.reconnectFailed'));
       });
       socket.addEventListener('close', () => {
         if (disposed || socketRef.current !== socket) return;
@@ -242,22 +281,44 @@ export function useMatchRuntime(matchId: string) {
       if (reconnectTimer !== null) clearTimeout(reconnectTimer);
       const socket = socketRef.current;
       socketRef.current = null;
+      connectionEpochRef.current = null;
       socket?.close();
       settlePendingCommands();
     };
   }, [hasInitialSnapshot, matchId, queryClient]);
 
   const sendCommand = useCallback(
-    (command: Omit<MatchCommand, 'expected_sequence' | 'connection_epoch'>) => {
+    async (command: Omit<MatchCommand, 'expected_sequence' | 'connection_epoch'>) => {
+      const queryKey = ['matches', matchId, 'snapshot'] as const;
+      let snapshot = queryClient.getQueryData<MatchSnapshot>(queryKey);
+
+      for (
+        let attempt = 0;
+        snapshot && snapshot.sequence < latestSequenceRef.current && attempt < 2;
+        attempt += 1
+      ) {
+        try {
+          snapshot = await queryClient.fetchQuery({
+            queryKey,
+            queryFn: () => matchesApi.snapshot(matchId),
+            staleTime: 0,
+          });
+        } catch {
+          return false;
+        }
+      }
+
       const socket = socketRef.current;
-      const snapshot = queryClient.getQueryData<MatchSnapshot>(['matches', matchId, 'snapshot']);
+      const connectionEpoch = connectionEpochRef.current;
+      snapshot = queryClient.getQueryData<MatchSnapshot>(queryKey);
       if (
         !socket ||
         socket.readyState !== WebSocket.OPEN ||
         !snapshot ||
-        connectionEpoch === null
+        connectionEpoch === null ||
+        snapshot.sequence < latestSequenceRef.current
       ) {
-        return Promise.resolve(false);
+        return false;
       }
       const payload: MatchCommand = {
         ...command,
@@ -270,10 +331,16 @@ export function useMatchRuntime(matchId: string) {
           resolve(false);
         }, 10_000);
         pendingRef.current.set(payload.message_id, { resolve, timeout });
-        socket.send(JSON.stringify(payload));
+        try {
+          socket.send(JSON.stringify(payload));
+        } catch {
+          clearTimeout(timeout);
+          pendingRef.current.delete(payload.message_id);
+          resolve(false);
+        }
       });
     },
-    [connectionEpoch, matchId, queryClient],
+    [matchId, queryClient],
   );
 
   return useMemo(
@@ -286,7 +353,10 @@ export function useMatchRuntime(matchId: string) {
       socketError,
       resumeReasons,
       interimText,
-      commandReady: socketStatus === 'open' && connectionEpoch !== null,
+      commandReady:
+        socketStatus === 'open' &&
+        connectionEpoch !== null &&
+        Boolean(query.data && query.data.sequence >= latestSequence),
       sendCommand,
     }),
     [
@@ -298,6 +368,7 @@ export function useMatchRuntime(matchId: string) {
       resumeReasons,
       socketError,
       interimText,
+      latestSequence,
       socketStatus,
     ],
   );

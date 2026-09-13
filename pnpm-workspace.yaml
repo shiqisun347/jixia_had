@@ -5,7 +5,15 @@ packages:
 # pnpm 11 denies lifecycle scripts by default. These are the only packages
 # whose install scripts are required by the approved 001/002 toolchain.
 allowBuilds:
+  '@parcel/watcher': set this to true or false
+  '@swc/core': set this to true or false
+  bufferutil: set this to true or false
+  canvas: set this to true or false
+  core-js: set this to true or false
+  edgedriver: set this to true or false
   esbuild: true
+  geckodriver: set this to true or false
   msw: true
   sharp: true
   unrs-resolver: true
+  utf-8-validate: set this to true or false

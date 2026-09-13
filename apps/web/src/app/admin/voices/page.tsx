@@ -175,7 +175,12 @@ export default function AdminVoicesPage() {
       {
         accessorKey: 'status',
         header: '状态',
-        cell: ({ row }) => <StatusBadge status={row.original.status} />,
+        cell: ({ row }) => (
+          <div className="grid justify-items-start gap-1">
+            <StatusBadge status={row.original.status} />
+            <StatusBadge status={row.original.calibration_status ?? 'NOT_CALIBRATED'} />
+          </div>
+        ),
       },
       {
         id: 'actions',

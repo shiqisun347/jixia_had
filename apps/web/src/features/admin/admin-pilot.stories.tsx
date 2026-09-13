@@ -43,6 +43,37 @@ const agents = ['乾元', '坤元', '明辨', '慎思', '博闻', '笃行'].map(
   generation_params: { temperature: 0.7 + index / 10 },
   status: index === 5 ? 'DISABLED' : 'ENABLED',
 }));
+const rule = {
+  id: '66666666-6666-4666-8666-666666666666',
+  name: '论文实验规则',
+  description: '三阶段 4v4 论文实验赛制',
+  side_size: 4,
+  estimated_seconds: 900,
+  status: 'DISABLED',
+  config_revision: 2,
+  historical_read_only: false,
+};
+const ruleAgents = voices.map((voice, index) => ({
+  ...agents[index],
+  name: voice.name,
+  rule_id: rule.id,
+  avatar_key: voice.avatar_key,
+  prompt_override_count: index === 1 ? 1 : 0,
+}));
+const ruleWorkspace = {
+  stages: [
+    {
+      id: '77777777-7777-4777-8777-777777777777',
+      name: '正方立论',
+      prompts: [{ purpose: 'SPEECH' }],
+    },
+    {
+      id: '77777777-7777-4777-8777-777777777778',
+      name: '自由辩论',
+      prompts: [{ purpose: 'DECISION' }, { purpose: 'SPEECH' }],
+    },
+  ],
+};
 
 const catalog = { models: [model], voices, agents, topics: [], rules: [] };
 const matches = [
@@ -92,7 +123,13 @@ const logs = [
   },
 ];
 
-function adminHandlers({ error = false, delayMs = 0, duplicate = false, locked = false } = {}) {
+function adminHandlers({
+  error = false,
+  delayMs = 0,
+  duplicate = false,
+  locked = false,
+  emptyAgents = false,
+} = {}) {
   const response = (body: unknown) =>
     delayMs
       ? delay(delayMs).then(() => HttpResponse.json(body as never))
@@ -123,8 +160,19 @@ function adminHandlers({ error = false, delayMs = 0, duplicate = false, locked =
     http.get('*/api/admin/catalog', () =>
       error
         ? HttpResponse.json({ error: { message: '目录暂时不可用' } }, { status: 503 })
-        : response(catalog),
+        : response(emptyAgents ? { ...catalog, agents: [] } : catalog),
     ),
+    http.get('*/api/admin/rules', () => response([rule])),
+    http.get('*/api/admin/rules/:ruleId/agents', () => response(emptyAgents ? [] : ruleAgents)),
+    http.get('*/api/admin/rules/:ruleId/workspace', () => response(ruleWorkspace)),
+    http.get('*/api/admin/rules/:ruleId/agents/:agentId/stages/:stageId/prompts/:purpose', () =>
+      response({
+        uses_default: true,
+        template_text: '默认 Prompt',
+        default_template_text: '默认 Prompt',
+      }),
+    ),
+    http.patch('*/api/admin/rules/:ruleId/agents/:agentId', () => response(ruleAgents[0])),
     http.get('*/api/admin/users', () => response([])),
     http.get('*/api/admin/matches', () => response(matches)),
     http.get('*/api/admin/logs', () => response(logs)),
@@ -183,7 +231,7 @@ export const Overview: Story = {
   parameters: { msw: { handlers: adminHandlers() } },
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByRole('heading', { name: '运行总览' })).toBeVisible();
+    await expect(await canvas.findByRole('heading', { name: '运营概览' })).toBeVisible();
     await expect(await canvas.findByText('实时比赛容量')).toBeVisible();
     await expect(await canvas.findByText('待处理事项')).toBeVisible();
   },
@@ -241,12 +289,25 @@ export const AgentDirectory: Story = {
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole('heading', { name: 'Agent 管理' })).toBeVisible();
-    await expect(await canvas.findByText('乾元')).toBeVisible();
-    await expect(await canvas.findByText(/6 个结果/)).toBeVisible();
+    await expect(
+      await canvas.findByText('先选择一套赛制规则，再管理它的 Agent 池。'),
+    ).toBeVisible();
   },
 };
 
-export const AgentCreateDrawer: Story = {
+export const AgentFormatWorkspaceEntry: Story = {
+  render: () => <AdminAgentsPage />,
+  parameters: {
+    msw: { handlers: adminHandlers() },
+    nextjs: { navigation: { pathname: '/admin/agents' } },
+  },
+  async play({ canvasElement }) {
+    const canvas = within(canvasElement);
+    await expect(await canvas.findByRole('option', { name: '论文实验规则' })).toBeVisible();
+  },
+};
+
+export const AgentDetailDrawer: Story = {
   render: () => <AdminAgentsPage />,
   parameters: {
     msw: { handlers: adminHandlers() },
@@ -255,14 +316,18 @@ export const AgentCreateDrawer: Story = {
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
     const page = within(document.body);
-    await canvas.findByText('乾元');
-    await userEvent.click(canvas.getByRole('button', { name: /创建 Agent/ }));
-    await expect(await page.findByRole('dialog')).toHaveTextContent('创建 Agent');
-    await expect(page.getByLabelText('Agent 名称')).toBeVisible();
+    await canvas.findByRole('option', { name: '论文实验规则' });
+    await userEvent.selectOptions(await canvas.findByLabelText('赛制规则'), rule.id);
+    await canvas.findAllByText('使用赛制默认');
+    await userEvent.click(canvas.getAllByRole('button', { name: /编辑/ })[0]);
+    await expect(await page.findByRole('dialog')).toHaveTextContent(
+      `编辑 Agent · ${voices[0].name}`,
+    );
+    await expect(page.getByText('基础身份跟随全局音色；这里只编辑规则内运行配置。')).toBeVisible();
   },
 };
 
-export const AgentEditDrawer: Story = {
+export const AgentReadOnlyNotice: Story = {
   render: () => <AdminAgentsPage />,
   parameters: {
     msw: { handlers: adminHandlers() },
@@ -271,32 +336,17 @@ export const AgentEditDrawer: Story = {
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
     const page = within(document.body);
-    await canvas.findByText('乾元');
-    await userEvent.click(canvas.getAllByRole('button', { name: '更多操作' })[0]);
-    await userEvent.click(page.getByText('编辑配置'));
-    await expect(await page.findByRole('dialog')).toHaveTextContent('编辑 Agent');
-    await expect(page.getByLabelText('Agent 名称')).toHaveValue('乾元');
+    await canvas.findByRole('option', { name: '论文实验规则' });
+    await userEvent.selectOptions(await canvas.findByLabelText('赛制规则'), rule.id);
+    await canvas.findAllByText('使用赛制默认');
+    await userEvent.click(canvas.getAllByRole('button', { name: /编辑/ })[0]);
+    await page.findByRole('dialog');
+    await expect(page.queryByLabelText('名称')).not.toBeInTheDocument();
+    await expect(page.queryByLabelText('音色')).not.toBeInTheDocument();
   },
 };
 
-export const AgentDisableConfirmation: Story = {
-  render: () => <AdminAgentsPage />,
-  parameters: {
-    msw: { handlers: adminHandlers() },
-    nextjs: { navigation: { pathname: '/admin/agents' } },
-  },
-  async play({ canvasElement }) {
-    const canvas = within(canvasElement);
-    const page = within(document.body);
-    await canvas.findByText('乾元');
-    await userEvent.click(canvas.getAllByRole('button', { name: '更多操作' })[0]);
-    await userEvent.click(page.getByText('停用 Agent'));
-    await expect(await page.findByRole('alertdialog')).toHaveTextContent('停用 Agent？');
-    await expect(page.getByRole('button', { name: '确认停用' })).toBeVisible();
-  },
-};
-
-export const AgentDuplicateName: Story = {
+export const AgentSearch: Story = {
   render: () => <AdminAgentsPage />,
   parameters: {
     msw: { handlers: adminHandlers({ duplicate: true }) },
@@ -305,14 +355,11 @@ export const AgentDuplicateName: Story = {
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
     const page = within(document.body);
-    await canvas.findByText('乾元');
-    await userEvent.click(canvas.getByRole('button', { name: /创建 Agent/ }));
-    await userEvent.clear(page.getByLabelText('Agent 名称'));
-    await userEvent.type(page.getByLabelText('Agent 名称'), '乾元');
-    await userEvent.selectOptions(page.getByLabelText('LLM 模型'), model.id);
-    await userEvent.selectOptions(page.getByLabelText('TTS 音色'), voices[0].id);
-    await userEvent.click(page.getByRole('button', { name: '保存配置' }));
-    await expect(await page.findByRole('alert')).toHaveTextContent('Agent 名称已存在');
+    await canvas.findByRole('option', { name: '论文实验规则' });
+    await userEvent.selectOptions(await canvas.findByLabelText('赛制规则'), rule.id);
+    await canvas.findByText('已个性化 1 项');
+    await userEvent.click(canvas.getAllByRole('button', { name: /编辑/ })[0]);
+    await expect(await page.findByLabelText('使用赛制默认 Prompt')).toBeChecked();
   },
 };
 
@@ -324,7 +371,7 @@ export const AgentLoading: Story = {
   },
   async play({ canvasElement }) {
     await expect(
-      await within(canvasElement).findByRole('status', { name: '正在加载数据' }),
+      await within(canvasElement).findByRole('heading', { name: 'Agent 管理' }),
     ).toBeVisible();
   },
 };
@@ -332,15 +379,15 @@ export const AgentLoading: Story = {
 export const AgentEmpty: Story = {
   render: () => <AdminAgentsPage />,
   parameters: {
-    msw: {
-      handlers: [
-        http.get('*/api/admin/catalog', () => HttpResponse.json({ ...catalog, agents: [] })),
-        ...adminHandlers(),
-      ],
-    },
+    msw: { handlers: adminHandlers({ emptyAgents: true }) },
     nextjs: { navigation: { pathname: '/admin/agents' } },
   },
   async play({ canvasElement }) {
-    await expect(await within(canvasElement).findByText('还没有 Agent 配置')).toBeVisible();
+    const canvas = within(canvasElement);
+    await canvas.findByRole('option', { name: '论文实验规则' });
+    await userEvent.selectOptions(await canvas.findByLabelText('赛制规则'), rule.id);
+    await expect(
+      await canvas.findByText('该规则还没有 Agent。请先启用 Agent 音色或检查默认模型。'),
+    ).toBeVisible();
   },
 };

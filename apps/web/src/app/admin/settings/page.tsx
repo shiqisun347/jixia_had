@@ -9,6 +9,7 @@ import {
   AdminPanel,
   readableAdminError,
   type StorageStatus,
+  type SystemSettings,
 } from '@/features/admin';
 import { useOptionalToast } from '@/components/ui/toast-provider';
 import { requestJson } from '@/lib/auth-api';
@@ -18,13 +19,20 @@ export default function AdminSettingsPage() {
   const toast = useOptionalToast();
   const [storage, setStorage] = useState<StorageStatus | null>(null);
   const [error, setError] = useState('');
+  const [settings, setSettings] = useState<SystemSettings | null>(null);
   const { isSubmitting, submit } = useAdminSubmit();
 
   useEffect(() => {
     let active = true;
-    void requestJson<StorageStatus>('/api/admin/storage')
-      .then((result) => {
-        if (active) setStorage(result);
+    void Promise.all([
+      requestJson<StorageStatus>('/api/admin/storage'),
+      requestJson<SystemSettings>('/api/admin/settings'),
+    ])
+      .then(([storageResult, settingsResult]) => {
+        if (active) {
+          setStorage(storageResult);
+          setSettings(settingsResult);
+        }
       })
       .catch((requestError: unknown) => {
         if (active) setError(readableAdminError(requestError));
@@ -44,6 +52,105 @@ export default function AdminSettingsPage() {
       />
       {error ? <AdminFeedback message={error} tone="error" /> : null}
       <div className="grid gap-5 xl:grid-cols-2">
+        <AdminPanel
+          title="运行参数"
+          description="只影响后续日志写入、清理和上传请求；不改变已发布快照或进行中的比赛。"
+        >
+          {settings ? (
+            <form
+              className="space-y-4"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void submit(() =>
+                  requestJson<SystemSettings>('/api/admin/settings', {
+                    method: 'PATCH',
+                    body: JSON.stringify(settings),
+                  }).then(setSettings),
+                )
+                  .then((submitted) => {
+                    if (submitted) {
+                      toast?.showToast({ message: '系统设置已保存。', tone: 'success' });
+                    }
+                  })
+                  .catch((requestError: unknown) =>
+                    toast?.showToast({
+                      message: readableAdminError(requestError),
+                      tone: 'error',
+                    }),
+                  );
+              }}
+            >
+              <label className="grid gap-1.5 text-xs font-bold text-slate-600">
+                运行日志保留天数
+                <input
+                  className="admin-field"
+                  max={3650}
+                  min={1}
+                  onChange={(event) =>
+                    setSettings({ ...settings, log_retention_days: Number(event.target.value) })
+                  }
+                  type="number"
+                  value={settings.log_retention_days}
+                />
+              </label>
+              <label className="flex items-center gap-2 text-xs font-bold text-slate-700">
+                <input
+                  checked={settings.debug_enabled}
+                  onChange={(event) =>
+                    setSettings({
+                      ...settings,
+                      debug_enabled: event.target.checked,
+                      debug_expires_at: event.target.checked
+                        ? (settings.debug_expires_at ?? defaultDebugExpiry())
+                        : null,
+                    })
+                  }
+                  type="checkbox"
+                />
+                临时记录 DEBUG 日志
+              </label>
+              {settings.debug_enabled ? (
+                <label className="grid gap-1.5 text-xs font-bold text-slate-600">
+                  DEBUG 自动关闭时间
+                  <input
+                    className="admin-field"
+                    min={toLocalDateTime(new Date())}
+                    onChange={(event) =>
+                      setSettings({
+                        ...settings,
+                        debug_expires_at: new Date(event.target.value).toISOString(),
+                      })
+                    }
+                    type="datetime-local"
+                    value={toLocalDateTime(new Date(settings.debug_expires_at ?? ''))}
+                  />
+                </label>
+              ) : null}
+              <label className="grid gap-1.5 text-xs font-bold text-slate-600">
+                单文件上传上限（MB）
+                <input
+                  className="admin-field"
+                  max={50}
+                  min={0.25}
+                  onChange={(event) =>
+                    setSettings({
+                      ...settings,
+                      max_upload_bytes: Math.round(Number(event.target.value) * 1024 * 1024),
+                    })
+                  }
+                  step="0.25"
+                  type="number"
+                  value={settings.max_upload_bytes / 1024 / 1024}
+                />
+              </label>
+              <AdminButton loading={isSubmitting} tone="primary" type="submit">
+                保存设置
+              </AdminButton>
+            </form>
+          ) : (
+            <p className="text-sm text-slate-500">正在加载设置…</p>
+          )}
+        </AdminPanel>
         <AdminPanel title="本地存储" description="超过 80% 告警，达到 90% 阻止新比赛开赛。">
           <div className="flex items-end justify-between gap-4">
             <div>
@@ -111,4 +218,14 @@ export default function AdminSettingsPage() {
       </div>
     </div>
   );
+}
+
+function defaultDebugExpiry() {
+  return new Date(Date.now() + 60 * 60 * 1000).toISOString();
+}
+
+function toLocalDateTime(value: Date) {
+  if (Number.isNaN(value.getTime())) return '';
+  const offset = value.getTimezoneOffset() * 60_000;
+  return new Date(value.getTime() - offset).toISOString().slice(0, 16);
 }

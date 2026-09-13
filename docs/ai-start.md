@@ -5,14 +5,15 @@ GitHub：<https://github.com/shiqisun347/jixia_had>
 给新的 AI coding 工具使用本仓库时，按以下顺序读取：
 
 1. `AGENTS.md`：工程边界、修改流程和门禁。
-2. `README.md`：v1.0 项目范围、目录和本地命令。
+2. `README.md`：v2.0 项目范围、目录和本地命令。
 3. `稷下人机自动辩论实验平台需求文档.md`：产品事实来源。
 4. `TechDesign-Jixia-Debate-MVP.md`：架构、状态机和失败语义。
 5. `docs/research/realtime-voice-spike-2026-07-24.md`：语音性能证据。
 6. `agent_docs/`：简化后的产品、技术、代码和测试约定。
-7. `specs/README.md`：新增 v1.0 切片的唯一入口。
+7. `specs/README.md`：新增 v2.0 切片的唯一入口。
 8. `MEMORY.md`：只查看当前状态和已验证证据。
-9. `api.example.md`：只了解远程凭据文件结构，不读取真实 `api.md`。
+9. `api.example.md`：只了解远程凭据文件结构；只有用户明确授权时才可读取本机未跟踪的 `api.md`，其内容不得输出或提交。
+10. `docs/reference/current-system-reference.md`：快速掌握当前代码地图、状态不变量、发布门禁和已知证据缺口。
 
 ## 开始任务
 

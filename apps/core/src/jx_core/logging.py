@@ -164,6 +164,8 @@ class JsonFormatter(logging.Formatter):
         elif has_internal_exception:
             payload["error_code"] = "internal_exception"
         for key in (
+            "trace_id",
+            "format_version_id",
             "match_id",
             "speech_id",
             "generation_id",

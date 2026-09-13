@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './fixtures';
 
 const user = {
   id: '10000000-0000-4000-8000-000000000001',
@@ -274,6 +274,7 @@ test('room creation submits the selected rule, topic and automatic Agent fill', 
   await expect(page.getByRole('group', { name: /2\s*选择辩题/ })).toBeVisible();
   await page.getByLabel('比赛名称').fill('浏览器创建测试');
   await expect(page.getByLabel('赛制')).toHaveValue(formal4v4RuleId);
+  await expect(page.getByLabel('赛制').getByRole('option', { name: /1v1/ })).toHaveCount(0);
   await expect(page.getByLabel('赛制').getByRole('option', { name: '选择已启用赛制' })).toHaveCount(
     0,
   );

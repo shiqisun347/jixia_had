@@ -4,13 +4,13 @@ type RuleOption = {
   side_size: number;
 };
 
+export function supportedRoomRules(rules: readonly RuleOption[]): RuleOption[] {
+  return rules.filter((rule) => rule.side_size === 4);
+}
+
 export function selectDefaultRuleId(rules: readonly RuleOption[]): string {
-  return (
-    rules.find((rule) => rule.name === '4v4 正式辩论赛')?.id ??
-    rules.find((rule) => rule.side_size === 4)?.id ??
-    rules[0]?.id ??
-    ''
-  );
+  const supported = supportedRoomRules(rules);
+  return supported.find((rule) => rule.name === '4v4 正式辩论赛')?.id ?? supported[0]?.id ?? '';
 }
 
 export type PreparationStep = 1 | 2 | 3 | 4;

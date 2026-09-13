@@ -1,6 +1,6 @@
 [project]
 name = "jx-debate-workspace"
-version = "1.0.0"
+version = "2.1.0"
 description = "Jixia debate platform Python workspace"
 requires-python = ">=3.12,<3.13"
 dependencies = []

@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from contextlib import suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, NoReturn, cast
 from uuid import UUID, uuid4
 
-from fastapi import APIRouter, Depends, Request, WebSocket, WebSocketDisconnect
+from fastapi import APIRouter, Body, Depends, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from livekit import api
 from pydantic import ValidationError
@@ -26,26 +28,31 @@ from ..auth.permissions import PermissionError, require_password_changed
 from ..auth.service import AuthService
 from ..auth.session import AuthContext, cookie_policy
 from ..config import Settings
+from ..experiments.permissions import is_experiment_side_controller, resolve_room_link
 from ..models import (
     DeviceCheck,
     Match,
     Room,
+    RoomConnection,
     RoomConnectionLease,
     RoomMember,
     Seat,
     Speech,
     TranscriptSubmission,
     User,
+    UserSession,
 )
 from ..room_connections import RoomConnectionService
 from ..runtime import CoreRuntime
 from .domain import MatchCommand, MatchDomainError, MatchEvent, MatchRuntimeView
 from .schemas import (
     AgentDecisionResponse,
+    ExperimentTeamStateResponse,
     FreeDebateHandEntryResponse,
     MatchActionResponse,
     MatchCommandRequest,
     MatchEventResponse,
+    MatchLiveKitTokenRequest,
     MatchLiveKitTokenResponse,
     MatchSnapshotResponse,
     SpeechTextUpdateRequest,
@@ -56,6 +63,49 @@ from .service import MatchRuntimeManager
 
 router = APIRouter()
 MATCH_TOKEN_TTL_SECONDS = 600
+logger = logging.getLogger(__name__)
+
+
+class _SocketClosed(Exception):
+    """Internal control flow for a WebSocket that can no longer be written."""
+
+
+class _SerializedWebSocketSender:
+    def __init__(self, websocket: WebSocket) -> None:
+        self._websocket = websocket
+        self._lock = asyncio.Lock()
+        self._closed = False
+
+    async def send_json(self, value: object) -> None:
+        async with self._lock:
+            if self._closed:
+                raise _SocketClosed
+            try:
+                await self._websocket.send_json(value)
+            except (WebSocketDisconnect, OSError) as error:
+                self._closed = True
+                raise _SocketClosed from error
+            except RuntimeError as error:
+                if (
+                    self._websocket.application_state.name == "DISCONNECTED"
+                    or self._websocket.client_state.name == "DISCONNECTED"
+                ):
+                    self._closed = True
+                    raise _SocketClosed from error
+                raise
+
+    async def close(self, *, code: int) -> None:
+        async with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                await self._websocket.close(code=code)
+            except (WebSocketDisconnect, OSError, RuntimeError):
+                return
+
+    def mark_closed(self) -> None:
+        self._closed = True
 
 
 def _raise(code: str) -> NoReturn:
@@ -96,7 +146,7 @@ def _can_view_team_state(
     admin_control: bool = False,
 ) -> bool:
     if admin_control:
-        return True
+        return view.state.free_competition_enabled
     if viewer_user_id is None or member_role != "DEBATER":
         return False
     action = view.state.current_action
@@ -181,13 +231,16 @@ def _snapshot_response(
                 if action.host_audio_path
                 else None
             ),
+            host_audio_duration_ms=action.host_audio_duration_ms if action else None,
         )
         if action
         else None,
         current_speech_id=state.current_speech_id,
         current_speaker_user_id=state.current_speaker_user_id,
         current_agent_profile_id=state.current_agent_profile_id,
+        interim_text=state.interim_text,
         speech_remaining_ms=view.speech_remaining_ms,
+        host_audio_remaining_ms=view.host_audio_remaining_ms,
         countdown_remaining_ms=view.countdown_remaining_ms,
         current_speaker_side=state.current_speaker_side,
         current_speaker_seat_no=state.current_speaker_seat_no,
@@ -215,6 +268,20 @@ def _snapshot_response(
         offline_user_id=state.offline_user_id,
         pause_initiator_user_id=state.pause_initiator_user_id,
         resume_reasons=(resume_reasons or []) if member_role in {"ORGANIZER", "DEBATER"} else [],
+        experiment_mode=state.experiment_mode,
+        formal_4v4=state.formal_4v4,
+        experiment_team_state=(
+            ExperimentTeamStateResponse(
+                opportunity_id=state.opportunity_id,
+                opportunity_generation=state.opportunity_generation,
+                selection_phase=state.selection_phase,
+                agent_status=state.agent_effective_status,
+                selection_remaining_ms=state.selection_remaining_ms,
+                human_wait_remaining_ms=state.human_wait_remaining_ms,
+            )
+            if state.free_competition_enabled and can_view_team
+            else None
+        ),
     )
 
 
@@ -224,7 +291,11 @@ def _event_response(event: MatchEvent, *, can_view_team: bool = True) -> MatchEv
         "hand.cancelled",
         "agent.decision_started",
         "agent.decision_progress",
+        "agent.text_delta",
         "free.queue_reordered",
+        "free.opportunity_opened",
+        "free.opportunity_invalidated",
+        "free.human_wait_started",
     }
     if sensitive and not can_view_team:
         return MatchEventResponse(
@@ -233,6 +304,52 @@ def _event_response(event: MatchEvent, *, can_view_team: bool = True) -> MatchEv
             sequence=event.sequence,
             server_time_ms=event.server_time_ms,
             payload={},
+        )
+    if not can_view_team and event.type in {
+        "free.selection_locked",
+        "speech.started",
+        "agent.playback_started",
+    }:
+        # The selected speaker is public; competition/generation identities are
+        # private to the candidate side and administrators.
+        payload = {
+            key: event.payload[key]
+            for key in (
+                "speaker_kind",
+                "speaker_user_id",
+                "agent_profile_id",
+                "side",
+                "seat_no",
+                "duration_ms",
+                "speech_id",
+            )
+            if key in event.payload
+        }
+        return MatchEventResponse(
+            type=event.type,
+            match_id=event.match_id,
+            sequence=event.sequence,
+            server_time_ms=event.server_time_ms,
+            payload=payload,
+        )
+    if not can_view_team and event.type in {"speech.finished", "agent.finalized"}:
+        payload = {
+            key: event.payload[key]
+            for key in (
+                "speech_id",
+                "final_text",
+                "audio_duration_ms",
+                "audio_truncated",
+                "finish_reason",
+            )
+            if key in event.payload
+        }
+        return MatchEventResponse(
+            type=event.type,
+            match_id=event.match_id,
+            sequence=event.sequence,
+            server_time_ms=event.server_time_ms,
+            payload=payload,
         )
     if event.type == "agent.decision_started":
         payload = {
@@ -247,6 +364,14 @@ def _event_response(event: MatchEvent, *, can_view_team: bool = True) -> MatchEv
         }
     else:
         payload = dict(event.payload)
+        if not can_view_team:
+            for key in (
+                "opportunity_id",
+                "opportunity_generation",
+                "decision_round_id",
+                "generation_id",
+            ):
+                payload.pop(key, None)
     return MatchEventResponse(
         type=event.type,
         match_id=event.match_id,
@@ -264,7 +389,7 @@ async def _match_room_id(session: AsyncSession, match_id: UUID) -> UUID:
 
 
 async def _member(
-    session: AsyncSession, match_id: UUID, user_id: UUID
+    session: AsyncSession, match_id: UUID, user_id: UUID, actor_role: str = "USER"
 ) -> tuple[Match, Room, RoomMember]:
     row = (
         await session.execute(
@@ -279,18 +404,69 @@ async def _member(
             .where(Match.id == match_id)
         )
     ).first()
+    if row is None and actor_role == "ADMIN":
+        fallback = (
+            await session.execute(
+                select(Match, Room).join(Room, Room.id == Match.room_id).where(Match.id == match_id)
+            )
+        ).first()
+        if fallback is not None:
+            match, room = fallback
+            # Virtual spectator: admins must not consume room capacity or alter seats.
+            return match, room, RoomMember(
+                room_id=room.id, user_id=user_id, member_role="SPECTATOR"
+            )
     if row is None:
         _raise("room_member_required")
     return row[0], row[1], row[2]
 
 
 def match_page_permissions(
-    *, actor_user_id: UUID, organizer_user_id: UUID, member_role: str
+    *,
+    actor_user_id: UUID,
+    organizer_user_id: UUID,
+    member_role: str,
+    actor_role: str = "USER",
+    experiment_controller: bool = False,
 ) -> tuple[bool, bool]:
-    """Resolve ordinary match-page permissions without global admin elevation."""
-    privileged = actor_user_id == organizer_user_id
+    """Resolve match-page permissions; admins are globally privileged observers."""
+    privileged = (
+        actor_role == "ADMIN" or actor_user_id == organizer_user_id or experiment_controller
+    )
     authorized = privileged or member_role == "DEBATER"
     return privileged, authorized
+
+
+async def _match_page_permissions(
+    session: AsyncSession,
+    *,
+    actor_user_id: UUID,
+    actor_role: str,
+    room: Room,
+    member_role: str,
+) -> tuple[bool, bool]:
+    experiment_link = await resolve_room_link(session, room_id=room.id)
+    experiment_controller = bool(
+        experiment_link
+        and (
+            actor_role == "ADMIN"
+            or (
+                experiment_link.scheduled_match_kind == "FORMAL"
+                and await is_experiment_side_controller(
+                    session,
+                    scheduled_match_id=experiment_link.scheduled_match_id,
+                    user_id=actor_user_id,
+                )
+            )
+        )
+    )
+    return match_page_permissions(
+        actor_user_id=actor_user_id,
+        organizer_user_id=room.organizer_user_id,
+        member_role=member_role,
+        actor_role=actor_role,
+        experiment_controller=experiment_controller,
+    )
 
 
 async def _resume_reasons(session: AsyncSession, room_id: UUID) -> list[str]:
@@ -353,6 +529,7 @@ async def _set_member_online(
 @router.post(
     "/api/rooms/{room_id}/runtime-start",
     response_model=MatchSnapshotResponse,
+    response_model_exclude_none=True,
     tags=["matches"],
     dependencies=[Depends(require_browser_origin)],
 )
@@ -373,18 +550,20 @@ async def start_match_runtime(
     except (AuthError, MatchDomainError) as error:
         _raise(error.code)
     view = await manager.snapshot_view(session, state.match_id)
-    _, _, member = await _member(session, state.match_id, context.user_id)
+    _, _, member = await _member(session, state.match_id, context.user_id, context.role)
     return _snapshot_response(
         view,
         room_id,
         viewer_user_id=context.user_id,
         member_role=member.member_role,
+        admin_control=context.role == "ADMIN",
     )
 
 
 @router.get(
     "/api/matches/{match_id}/snapshot",
     response_model=MatchSnapshotResponse,
+    response_model_exclude_none=True,
     tags=["matches"],
 )
 async def get_match_snapshot(
@@ -393,7 +572,7 @@ async def get_match_snapshot(
     context: Annotated[AuthContext, Depends(get_changed_password_auth)],
     session: Annotated[AsyncSession, Depends(get_database_session)],
 ) -> MatchSnapshotResponse:
-    _, _, member = await _member(session, match_id, context.user_id)
+    _, _, member = await _member(session, match_id, context.user_id, context.role)
     room_id = await _match_room_id(session, match_id)
     try:
         view = await _manager(request.app).snapshot_view(session, match_id)
@@ -409,6 +588,7 @@ async def get_match_snapshot(
         room_id,
         viewer_user_id=context.user_id,
         member_role=member.member_role,
+        admin_control=context.role == "ADMIN",
         resume_reasons=resume_reasons,
     )
 
@@ -424,7 +604,7 @@ async def get_match_transcript(
     session: Annotated[AsyncSession, Depends(get_database_session)],
 ) -> TranscriptResponse:
     if context.role != "ADMIN":
-        await _member(session, match_id, context.user_id)
+        await _member(session, match_id, context.user_id, context.role)
     match = await session.get(Match, match_id)
     if match is None:
         _raise("match_not_found")
@@ -448,7 +628,10 @@ async def get_match_transcript(
                 user_id=speech.user_id,
                 speaker_kind=speech.speaker_kind,
                 agent_profile_id=speech.agent_profile_id,
-                generation_id=speech.generation_id,
+                # Generation IDs are internal callback identities. They are
+                # useful to administrators for diagnostics, but must not be
+                # exposed to opposing-side participants or spectators.
+                generation_id=speech.generation_id if context.role == "ADMIN" else None,
                 side=speech.side,
                 seat_no=speech.seat_no,
                 status=speech.status,
@@ -482,7 +665,7 @@ async def update_speech_display_text(
         _raise("transcript_text_invalid")
     async with session.begin():
         if context.role != "ADMIN":
-            await _member(session, match_id, context.user_id)
+            await _member(session, match_id, context.user_id, context.role)
         speech = await session.scalar(
             select(Speech)
             .where(Speech.id == speech_id, Speech.match_id == match_id)
@@ -528,6 +711,7 @@ async def update_speech_display_text(
 @router.post(
     "/api/matches/{match_id}/command",
     response_model=MatchSnapshotResponse,
+    response_model_exclude_none=True,
     tags=["matches"],
     dependencies=[Depends(require_browser_origin)],
 )
@@ -538,7 +722,7 @@ async def submit_match_command(
     context: Annotated[AuthContext, Depends(get_changed_password_auth)],
     session: Annotated[AsyncSession, Depends(get_database_session)],
 ) -> MatchSnapshotResponse:
-    match, room, member = await _member(session, match_id, context.user_id)
+    match, room, member = await _member(session, match_id, context.user_id, context.role)
     manager = _manager(request.app)
     try:
         state = await manager.snapshot(session, match.id)
@@ -553,9 +737,11 @@ async def submit_match_command(
         )
         if connection is None:
             _raise("match_connection_stale")
-        privileged, authorized = match_page_permissions(
+        privileged, authorized = await _match_page_permissions(
+            session,
             actor_user_id=context.user_id,
-            organizer_user_id=room.organizer_user_id,
+            actor_role=context.role,
+            room=room,
             member_role=member.member_role,
         )
         resume_reasons = (
@@ -570,6 +756,7 @@ async def submit_match_command(
                 payload={
                     "privileged": privileged,
                     "authorized": authorized,
+                    "connection_epoch": connection.connection_epoch,
                     "reasons": resume_reasons or payload.reasons,
                 },
             ),
@@ -582,6 +769,7 @@ async def submit_match_command(
         room.id,
         viewer_user_id=context.user_id,
         member_role=member.member_role,
+        admin_control=context.role == "ADMIN",
     )
 
 
@@ -597,7 +785,7 @@ async def get_match_host_audio(
     context: Annotated[AuthContext, Depends(get_changed_password_auth)],
     session: Annotated[AsyncSession, Depends(get_database_session)],
 ) -> FileResponse:
-    match, _, _ = await _member(session, match_id, context.user_id)
+    match, _, _ = await _member(session, match_id, context.user_id, context.role)
     raw_action_value = match.runtime_snapshot.get("current_action")
     if not isinstance(raw_action_value, dict):
         _raise("host_audio_unavailable")
@@ -629,11 +817,12 @@ async def create_match_livekit_token(
     request: Request,
     context: Annotated[AuthContext, Depends(get_changed_password_auth)],
     session: Annotated[AsyncSession, Depends(get_database_session)],
+    payload: Annotated[MatchLiveKitTokenRequest | None, Body()] = None,
 ) -> MatchLiveKitTokenResponse:
     settings: Settings = request.app.state.settings
     if not settings.livekit_url or not settings.livekit_api_key or not settings.livekit_api_secret:
         _raise("livekit_not_configured")
-    _, _, member = await _member(session, match_id, context.user_id)
+    _, _, member = await _member(session, match_id, context.user_id, context.role)
     user = await session.get(User, context.user_id)
     if user is None:
         _raise("not_authenticated")
@@ -642,13 +831,41 @@ async def create_match_livekit_token(
             select(Seat.id).where(Seat.room_id == member.room_id, Seat.user_id == context.user_id)
         )
     ) is not None
+    connection_epoch = payload.connection_epoch if payload is not None else None
+    if connection_epoch is not None:
+        active_lease = await session.scalar(
+            select(RoomConnectionLease.id).where(
+                RoomConnectionLease.user_id == context.user_id,
+                RoomConnectionLease.room_id == member.room_id,
+                RoomConnectionLease.connection_epoch == connection_epoch,
+            )
+        )
+        if active_lease is None:
+            _raise("match_connection_stale")
+    else:
+        latest_lease = await session.scalar(
+            select(RoomConnectionLease)
+            .where(
+                RoomConnectionLease.user_id == context.user_id,
+                RoomConnectionLease.room_id == member.room_id,
+            )
+            .order_by(RoomConnectionLease.connection_epoch.desc())
+            .limit(1)
+        )
+        if latest_lease is not None:
+            connection_epoch = latest_lease.connection_epoch
+        else:
+            high_water = await session.get(RoomConnection, context.user_id)
+            connection_epoch = (high_water.connection_epoch + 1) if high_water is not None else 1
     room_name = f"jx-match-{match_id}"
     token = (
         api.AccessToken(
             settings.livekit_api_key.get_secret_value(),
             settings.livekit_api_secret.get_secret_value(),
         )
-        .with_identity(f"user-{context.user_id}-{uuid4().hex[:8]}")
+        .with_identity(
+            f"jx-human-{match_id}-{context.user_id}-{connection_epoch}-{uuid4().hex[:8]}"
+        )
         .with_name(user.real_name)
         .with_ttl(timedelta(seconds=MATCH_TOKEN_TTL_SECONDS))
         .with_grants(
@@ -707,7 +924,7 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
     connection_id = uuid4()
     async with factory() as session:
         try:
-            match, room, member = await _member(session, match_id, context.user_id)
+            match, room, member = await _member(session, match_id, context.user_id, context.role)
             view = await manager.snapshot_view(session, match.id)
         except (APIError, AuthError):
             await websocket.close(code=4403)
@@ -720,7 +937,43 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
             connection_id=connection_id,
         )
     async with factory() as session:
-        await _set_member_online(session, room_id=room.id, user_id=context.user_id, online=True)
+        presence = getattr(websocket.app.state, "presence", None)
+        presence_joined = False
+        if presence is not None and member.member_role == "DEBATER":
+            try:
+                await presence.websocket_joined(
+                    match_id, context.user_id, lease.connection_epoch, connection_id
+                )
+                presence_joined = True
+            except Exception as error:
+                logger.warning(
+                    "WebSocket presence registration failed",
+                    extra={
+                        "error_code": "websocket_presence_registration_failed",
+                        "match_id": str(match_id),
+                        "connection_epoch": lease.connection_epoch,
+                        "details": {"exception_type": type(error).__name__},
+                    },
+                )
+        if member.member_role == "DEBATER" and (presence is None or not presence_joined):
+            try:
+                await manager.submit(
+                    match_id,
+                    MatchCommand(
+                        type="member.online",
+                        message_id=f"member-online:{context.user_id}:{lease.connection_epoch}",
+                        actor_user_id=context.user_id,
+                        payload={"connection_epoch": lease.connection_epoch},
+                    ),
+                )
+            except MatchDomainError:
+                pass
+    # Subscribe before taking the final snapshot.  Otherwise an authoritative
+    # transition between the initial query and subscription can be lost, leaving
+    # a reconnecting browser with a stale action/timer indefinitely.
+    queue = await manager.subscribe(match_id)
+    async with factory() as snapshot_session:
+        view = await manager.snapshot_view(snapshot_session, match.id)
     # Do not reuse the session from the previous context.  A WebSocket can
     # remain open for hours; querying a closed AsyncSession here reopens a
     # transaction without a surrounding context and leaks a pool connection.
@@ -729,76 +982,111 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
             resume_reasons = await _resume_reasons(resume_session, room.id)
     else:
         resume_reasons = []
-    await websocket.accept()
-    await websocket.send_json(
-        {
-            "type": "match.snapshot",
-            "connection_epoch": lease.connection_epoch,
-            "payload": _snapshot_response(
-                view,
-                room.id,
-                viewer_user_id=context.user_id,
-                member_role=member.member_role,
-                resume_reasons=resume_reasons,
-            ).model_dump(mode="json"),
-        }
-    )
-    queue = await manager.subscribe(match_id)
-    if member.member_role == "DEBATER":
-        try:
-            await manager.submit(
-                match_id,
-                MatchCommand(
-                    type="member.online",
-                    message_id=f"member-online:{context.user_id}:{lease.connection_epoch}",
-                    actor_user_id=context.user_id,
-                    payload={
-                        "connection_epoch": lease.connection_epoch,
-                        "connected_at_ms": lease.connected_at_ms,
-                    },
-                ),
-            )
-        except MatchDomainError:
-            pass
+    sender_boundary = _SerializedWebSocketSender(websocket)
 
     async def send_events() -> None:
         while True:
             event = await queue.get()
-            current_view = (await manager.get_actor(match_id)).view()
-            await websocket.send_json(
+            await sender_boundary.send_json(
                 _event_response(
                     event,
-                    can_view_team=_can_view_team_state(
-                        current_view,
-                        viewer_user_id=context.user_id,
-                        member_role=member.member_role,
-                    ),
+                    # Candidate state is delivered by the viewer-scoped HTTP/ack
+                    # snapshot. Keeping non-admin events public-only avoids a
+                    # queued event being authorized against the next side's state.
+                    can_view_team=context.role == "ADMIN",
                 ).model_dump(mode="json")
             )
 
-    sender = asyncio.create_task(send_events())
+    sender: asyncio.Task[None] | None = None
+    receiver: asyncio.Task[Any] | None = None
     try:
+        await websocket.accept()
+        await sender_boundary.send_json(
+            {
+                "type": "match.snapshot",
+                "connection_epoch": lease.connection_epoch,
+                "payload": _snapshot_response(
+                    view,
+                    room.id,
+                    viewer_user_id=context.user_id,
+                    member_role=member.member_role,
+                    admin_control=context.role == "ADMIN",
+                    resume_reasons=resume_reasons,
+                ).model_dump(mode="json", exclude_none=True),
+            }
+        )
+        sender = asyncio.create_task(send_events(), name=f"match-events-sender-{match_id}")
+        receiver = asyncio.create_task(
+            websocket.receive_json(), name=f"match-events-receiver-{match_id}"
+        )
         while True:
-            raw = await websocket.receive_json()
+            done, _ = await asyncio.wait(
+                {sender, receiver},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if sender in done:
+                try:
+                    sender.result()
+                except (WebSocketDisconnect, OSError, _SocketClosed):
+                    pass
+                except Exception as error:
+                    logger.warning(
+                        "WebSocket event sender stopped",
+                        extra={
+                            "error_code": "websocket_event_sender_failed",
+                            "match_id": str(match_id),
+                            "details": {"exception_type": type(error).__name__},
+                        },
+                    )
+                break
+            assert receiver in done
+            raw = receiver.result()
+            receiver = asyncio.create_task(
+                websocket.receive_json(), name=f"match-events-receiver-{match_id}"
+            )
             try:
+                # Logout/password invalidation revokes the lease while the
+                # browser socket may still be open. Re-check it before every
+                # command so an authenticated handshake cannot outlive its
+                # authorization boundary.
+                async with factory() as lease_session:
+                    lease_exists = await lease_session.scalar(
+                        select(RoomConnectionLease.id).where(
+                            RoomConnectionLease.user_id == context.user_id,
+                            RoomConnectionLease.connection_id == connection_id,
+                            RoomConnectionLease.connection_epoch == lease.connection_epoch,
+                        )
+                    )
+                    session_valid = await lease_session.scalar(
+                        select(UserSession.id).where(
+                            UserSession.id == context.session_id,
+                            UserSession.revoked_at.is_(None),
+                            UserSession.expires_at > datetime.now(UTC),
+                        )
+                    )
+                if lease_exists is None or session_valid is None:
+                    await sender_boundary.close(code=4401)
+                    break
                 payload = MatchCommandRequest.model_validate(raw)
                 if payload.connection_epoch != lease.connection_epoch:
                     raise MatchDomainError("match_connection_stale")
                 current = await manager.get_actor(match_id)
                 if current.state.sequence != payload.expected_sequence:
                     raise MatchDomainError("match_state_conflict")
-                privileged, authorized = match_page_permissions(
-                    actor_user_id=context.user_id,
-                    organizer_user_id=room.organizer_user_id,
-                    member_role=member.member_role,
-                )
                 resume_reasons: list[str] = []
-                if payload.type == "match.resume":
-                    # A WebSocket can remain open for hours. Never reuse the
-                    # initial authorization session here: SQLAlchemy may reopen
-                    # a transaction on that closed object and retain a pool
-                    # connection for the rest of the socket lifetime.
-                    async with factory() as command_session:
+                # A WebSocket can remain open for hours. Never reuse the
+                # initial authorization session here: SQLAlchemy may reopen
+                # a transaction on that closed object and retain a pool
+                # connection for the rest of the socket lifetime.
+                async with factory() as command_session:
+                    privileged, authorized = await _match_page_permissions(
+                        command_session,
+                        actor_user_id=context.user_id,
+                        actor_role=context.role,
+                        room=room,
+                        member_role=member.member_role,
+                    )
+                    if payload.type == "match.resume":
                         resume_reasons = await _resume_reasons(command_session, room.id)
                 result = await manager.submit(
                     match_id,
@@ -809,13 +1097,17 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
                         payload={
                             "privileged": privileged,
                             "authorized": authorized,
+                            # The request epoch has already been checked against
+                            # the active lease above.  MatchActor persists it with
+                            # hand events and uses it to reject stale callbacks.
+                            "connection_epoch": lease.connection_epoch,
                             "reasons": resume_reasons or payload.reasons,
                         },
                     ),
                 )
                 async with factory() as snapshot_session:
                     committed_view = await manager.snapshot_view(snapshot_session, match_id)
-                await websocket.send_json(
+                await sender_boundary.send_json(
                     {
                         "type": "command.ack",
                         "message_id": payload.message_id,
@@ -826,13 +1118,14 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
                             room.id,
                             viewer_user_id=context.user_id,
                             member_role=member.member_role,
-                        ).model_dump(mode="json"),
+                            admin_control=context.role == "ADMIN",
+                        ).model_dump(mode="json", exclude_none=True),
                     }
                 )
             except (ValidationError, MatchDomainError) as error:
                 code = error.code if isinstance(error, MatchDomainError) else "validation_error"
                 raw_message = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
-                await websocket.send_json(
+                await sender_boundary.send_json(
                     {
                         "type": "command.error",
                         "message_id": raw_message.get("message_id"),
@@ -840,10 +1133,44 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
                         "message": error_message(code),
                     }
                 )
-    except WebSocketDisconnect:
+            except Exception as error:
+                raw_message = cast(dict[str, Any], raw) if isinstance(raw, dict) else {}
+                original = getattr(error, "orig", None)
+                sqlstate = getattr(original, "sqlstate", None)
+                constraint = getattr(getattr(original, "diag", None), "constraint_name", None)
+                details: dict[str, str] = {"exception_type": type(error).__name__}
+                if isinstance(sqlstate, str):
+                    details["sqlstate"] = sqlstate
+                if isinstance(constraint, str) and constraint.isascii() and len(constraint) <= 128:
+                    details["constraint"] = constraint
+                logger.warning(
+                    "WebSocket command failed",
+                    extra={
+                        "error_code": "match_command_failed",
+                        "match_id": str(match_id),
+                        "connection_epoch": lease.connection_epoch,
+                        "details": details,
+                    },
+                )
+                await sender_boundary.send_json(
+                    {
+                        "type": "command.error",
+                        "message_id": raw_message.get("message_id"),
+                        "code": "internal_server_error",
+                        "message": error_message("internal_server_error"),
+                    }
+                )
+    except (WebSocketDisconnect, OSError, _SocketClosed):
         pass
     finally:
-        sender.cancel()
+        sender_boundary.mark_closed()
+        for task in (sender, receiver):
+            if task is not None:
+                task.cancel()
+        for task in (sender, receiver):
+            if task is not None:
+                with suppress(asyncio.CancelledError, Exception):
+                    await task
         await manager.unsubscribe(match_id, queue)
         async with factory() as session:
             released = await RoomConnectionService().release(
@@ -852,29 +1179,45 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
                 connection_id=connection_id,
                 connection_epoch=lease.connection_epoch,
             )
-        if released:
+        presence = getattr(websocket.app.state, "presence", None)
+        presence_left = False
+        if presence is not None and member.member_role == "DEBATER":
+            try:
+                await presence.websocket_left(
+                    match_id, context.user_id, lease.connection_epoch, connection_id
+                )
+                presence_left = True
+            except Exception as error:
+                logger.warning(
+                    "WebSocket presence cleanup failed",
+                    extra={
+                        "error_code": "websocket_presence_cleanup_failed",
+                        "match_id": str(match_id),
+                        "connection_epoch": lease.connection_epoch,
+                        "details": {"exception_type": type(error).__name__},
+                    },
+                )
+        if member.member_role == "DEBATER" and released and (presence is None or not presence_left):
+            try:
+                await manager.submit(
+                    match_id,
+                    MatchCommand(
+                        type="member.offline",
+                        message_id=f"member-offline:{context.user_id}:{lease.connection_epoch}",
+                        actor_user_id=context.user_id,
+                        payload={
+                            "connection_epoch": lease.connection_epoch,
+                            "offline_since_ms": int(datetime.now(UTC).timestamp() * 1000),
+                        },
+                    ),
+                )
+            except MatchDomainError:
+                pass
+        elif member.member_role != "DEBATER" and released:
             async with factory() as session:
                 await _set_member_online(
                     session, room_id=room.id, user_id=context.user_id, online=False
                 )
-            if member.member_role == "DEBATER":
-                try:
-                    await manager.submit(
-                        match_id,
-                        MatchCommand(
-                            type="member.offline",
-                            message_id=(
-                                f"member-offline:{context.user_id}:{lease.connection_epoch}"
-                            ),
-                            actor_user_id=context.user_id,
-                            payload={
-                                "connection_epoch": lease.connection_epoch,
-                                "offline_since_ms": int(datetime.now(UTC).timestamp() * 1000),
-                            },
-                        ),
-                    )
-                except MatchDomainError:
-                    pass
 
 
 __all__ = ["router"]

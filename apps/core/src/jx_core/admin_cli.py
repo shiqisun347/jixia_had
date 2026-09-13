@@ -15,7 +15,7 @@ from .auth.service import AuthService
 from .config import Settings, load_settings
 from .database import Database
 
-REQUIRED_MIGRATION_REVISION = "0024_admin_data_capture"
+REQUIRED_MIGRATION_REVISION = "0038_experiment_rule_snapshot"
 
 
 class AdminCLIError(RuntimeError):

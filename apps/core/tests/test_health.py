@@ -120,3 +120,15 @@ def test_openapi_contains_foundation_and_approved_auth_routes() -> None:
         "/api/users/me",
         "/api/matches/{match_id}/host-audio/{action_key}",
     }.issubset(paths)
+
+
+def test_openapi_keeps_legacy_formats_read_only() -> None:
+    app = create_app(settings(), runtime=FakeRuntime(Readiness(True)))
+    paths = app.openapi()["paths"]
+
+    assert set(paths["/api/admin/formats"]) == {"get"}
+    assert set(paths["/api/admin/formats/{version_id}"]) == {"get"}
+    assert not any(
+        path.startswith("/api/admin/formats/") and path != "/api/admin/formats/{version_id}"
+        for path in paths
+    )

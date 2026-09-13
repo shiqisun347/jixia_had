@@ -21,19 +21,16 @@ const targetUser = {
   average_personal_score: 0,
 };
 
-describe('admin page temporary password reset', () => {
+describe('admin page password management', () => {
   afterEach(cleanup);
 
   beforeEach(() => {
     vi.restoreAllMocks();
     vi.spyOn(window, 'confirm').mockReturnValue(true);
-    requestJson.mockImplementation((path: string) => {
+    requestJson.mockImplementation((path: string, options?: RequestInit) => {
       if (path === '/api/auth/me') return Promise.resolve({ user: { id: 'admin-1' } });
-      if (path === '/api/admin/users/user-2/temporary-password')
-        return Promise.resolve({
-          temporary_password: 'one-time-secret',
-          must_change_password: true,
-        });
+      if (path === '/api/admin/users/user-2/password' && options?.method === 'POST')
+        return Promise.resolve({ status: 'password_changed' });
       if (path.startsWith('/api/admin/users'))
         return Promise.resolve({
           items: [
@@ -58,34 +55,32 @@ describe('admin page temporary password reset', () => {
     );
   }
 
-  it('does not offer password reset for the current administrator', async () => {
+  it('sends the current administrator to the self-service password flow', async () => {
     renderPage();
 
     await screen.findByText('管理员');
     const actionMenus = screen.getAllByRole('button', { name: '更多操作' });
     expect(actionMenus).toHaveLength(2);
-    expect(actionMenus[0]).toHaveTextContent('操作');
+    fireEvent.pointerDown(actionMenus[0]);
+    expect(await screen.findByText('修改自己的密码')).toBeVisible();
   });
 
-  it('shows the generated password once and warns about revoked sessions', async () => {
+  it('sets a chosen password and warns about revoked sessions', async () => {
     renderPage();
 
     fireEvent.pointerDown((await screen.findAllByRole('button', { name: '更多操作' }))[1]);
-    fireEvent.click(await screen.findByText('重置密码'));
-    fireEvent.click(await screen.findByRole('button', { name: '确认重置' }));
+    fireEvent.click(await screen.findByText('修改密码'));
+    fireEvent.change(screen.getByLabelText('新密码'), {
+      target: { value: 'chosen-password-123' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: '保存新密码' }));
 
     await waitFor(() =>
-      expect(requestJson).toHaveBeenCalledWith('/api/admin/users/user-2/temporary-password', {
+      expect(requestJson).toHaveBeenCalledWith('/api/admin/users/user-2/password', {
         method: 'POST',
-        body: '{}',
+        body: JSON.stringify({ new_password: 'chosen-password-123' }),
       }),
     );
-    expect(screen.getByRole('dialog')).toHaveTextContent('旧会话已撤销');
-    await waitFor(() =>
-      expect(screen.getByRole('textbox', { name: '临时密码' })).toHaveValue('one-time-secret'),
-    );
-
-    fireEvent.click(screen.getByRole('button', { name: '我已安全记录，关闭' }));
     expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
   });
 });

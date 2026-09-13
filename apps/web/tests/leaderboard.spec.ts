@@ -1,4 +1,4 @@
-import { expect, test } from '@playwright/test';
+import { expect, test } from './fixtures';
 
 const rankings = {
   generated_at: '2026-08-12T08:00:00Z',

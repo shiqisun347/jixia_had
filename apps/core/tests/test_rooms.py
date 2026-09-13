@@ -6,7 +6,12 @@ import pytest
 
 from jx_core.auth.errors import ERROR_DEFINITIONS, AuthError
 from jx_core.rooms.schemas import RoomCreateRequest
-from jx_core.rooms.service import _room_code, ensure_unique_agent_ids, normalize_room_code
+from jx_core.rooms.service import (
+    _room_code,
+    ensure_supported_side_size,
+    ensure_unique_agent_ids,
+    normalize_room_code,
+)
 
 
 @pytest.mark.parametrize(
@@ -37,7 +42,7 @@ def test_unseated_debater_and_agent_capacity_errors_are_actionable() -> None:
     )
     assert ERROR_DEFINITIONS["agent_capacity_insufficient"] == (
         409,
-        "可用 Agent 数量不足，请启用更多 Agent 或选择更小赛制",
+        "可用 Agent 数量不足，请先启用至少 8 个可用 Agent",
     )
 
 
@@ -66,6 +71,14 @@ def test_room_agent_ids_must_be_unique() -> None:
     with pytest.raises(AuthError) as raised:
         ensure_unique_agent_ids([agent_id, agent_id])
     assert raised.value.code == "agent_duplicate_in_room"
+
+
+def test_new_room_creation_supports_only_4v4_rules() -> None:
+    ensure_supported_side_size(4)
+    for side_size in (1, 2, 3, 5):
+        with pytest.raises(AuthError) as raised:
+            ensure_supported_side_size(side_size)
+        assert raised.value.code == "rule_unavailable"
 
 
 def test_new_room_codes_are_numeric_and_legacy_codes_still_resolve() -> None:

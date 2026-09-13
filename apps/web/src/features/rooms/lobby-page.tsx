@@ -19,6 +19,7 @@ import { type FormEvent, useEffect, useRef, useState } from 'react';
 import { useToast } from '@/components/ui/toast-provider';
 import { ApiClientError } from '@/lib/auth-api';
 import { roomsApi, type LobbyRoom } from '@/lib/rooms-api';
+import { useAppTranslations } from '@/i18n';
 
 import { resolveRoomEntry } from './room-entry';
 
@@ -29,6 +30,7 @@ export function LobbySyncStatus({
   isError,
   onRetry,
 }: Readonly<{ isFetching: boolean; isError: boolean; onRetry: () => void }>) {
+  const t = useAppTranslations('Lobby');
   if (isError && !isFetching) {
     return (
       <button
@@ -37,7 +39,7 @@ export function LobbySyncStatus({
         type="button"
       >
         <AlertTriangle className="size-4" aria-hidden="true" />
-        同步中断 · 重新同步
+        {t('syncFailed')} · {t('syncAgain')}
       </button>
     );
   }
@@ -48,12 +50,13 @@ export function LobbySyncStatus({
       ) : (
         <Radio className="size-4" aria-hidden="true" />
       )}
-      {isFetching ? '正在同步' : '已同步'}
+      {isFetching ? t('syncing') : t('synced')}
     </div>
   );
 }
 
 function StatusLabel({ status }: Readonly<{ status: string }>) {
+  const t = useAppTranslations('Lobby');
   const running = status === 'RUNNING';
   const paused = status === 'PAUSED';
   const starting = status === 'START_PENDING_RUNTIME';
@@ -68,12 +71,13 @@ function StatusLabel({ status }: Readonly<{ status: string }>) {
       }`}
     >
       <CircleDot className="size-3" aria-hidden="true" />
-      {running ? '进行中' : paused ? '已暂停' : starting ? '正在开赛' : '准备中'}
+      {running ? t('running') : paused ? t('paused') : starting ? t('starting') : t('preparing')}
     </span>
   );
 }
 
 function RoomCard({ room }: Readonly<{ room: LobbyRoom }>) {
+  const t = useAppTranslations('Lobby');
   const entry = resolveRoomEntry(room);
   return (
     <article className="group relative overflow-hidden rounded-[1.5rem] border border-blue-100/90 bg-white/90 p-5 shadow-[0_18px_52px_rgba(40,76,142,0.09)] transition duration-200 motion-safe:hover:-translate-y-1">
@@ -94,26 +98,27 @@ function RoomCard({ room }: Readonly<{ room: LobbyRoom }>) {
         <span className="rounded-lg bg-blue-50 px-2.5 py-1.5 text-blue-700">{room.rule_name}</span>
         <span className="rounded-lg bg-slate-100 px-2.5 py-1.5">{room.label}</span>
         <span className="inline-flex items-center gap-1 rounded-lg bg-slate-100 px-2.5 py-1.5">
-          <UsersRound className="size-3.5" aria-hidden="true" /> {room.occupied_seats}/
-          {room.side_size * 2} 席
+          <UsersRound className="size-3.5" aria-hidden="true" />
+          {t('seats', { occupied: room.occupied_seats, total: room.side_size * 2 })}
         </span>
         <span
           className={`rounded-lg px-2.5 py-1.5 ${room.spectator_capacity_full ? 'bg-amber-50 text-amber-800' : 'bg-lime-50 text-lime-800'}`}
         >
-          {room.spectator_capacity_full ? '观战席已满' : `观战余量 ${room.spectator_remaining}`}
+          {room.spectator_capacity_full ? t('spectatorsFull') : t('spectatorRemaining', { count: room.spectator_remaining })}
         </span>
       </div>
       <Link
         className="mt-6 inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-slate-950 px-4 py-2.5 text-sm font-black !text-white transition hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600 focus-visible:ring-offset-2"
         href={entry.href}
       >
-        {entry.label} <ArrowRight className="size-4" aria-hidden="true" />
+        {entry.kind === 'POSTMATCH' ? t('postmatch') : entry.kind === 'CLOSED' ? t('roomClosed') : entry.kind === 'LIVE_MATCH' ? t('returnMatch') : room.viewer_membership_state === 'ACTIVE' ? (room.match_id ? t('enter') : t('returnRoom')) : (room.match_id ? t('watch') : t('enterRoom'))} <ArrowRight className="size-4" aria-hidden="true" />
       </Link>
     </article>
   );
 }
 
 function LobbyContent() {
+  const t = useAppTranslations('Lobby');
   const router = useRouter();
   const { showToast } = useToast();
   const codeInputRef = useRef<HTMLInputElement>(null);
@@ -126,14 +131,14 @@ function LobbyContent() {
     staleTime: 4_000,
   });
   const errorMessage =
-    query.error instanceof ApiClientError ? query.error.message : '大厅暂时不可用，请稍后重试。';
+    query.error instanceof ApiClientError ? query.error.message : t('unavailable');
   const rooms = query.data ?? [];
   const lookupMutation = useMutation({
     mutationFn: () => roomsApi.lookup(roomCode),
     onSuccess: (result) => router.push(`/rooms/${result.room_id}`),
     onError: (error) =>
       showToast({
-        message: error instanceof ApiClientError ? error.message : '房间号查询失败，请稍后重试。',
+        message: error instanceof ApiClientError ? error.message : t('lookupFailed'),
         tone: 'error',
       }),
   });
@@ -165,11 +170,10 @@ function LobbyContent() {
           <div className="relative flex flex-wrap items-end justify-between gap-6">
             <div>
               <h1 className="text-4xl font-black tracking-[-0.06em] text-slate-950 sm:text-5xl">
-                公开大厅
+                {t('title')}
               </h1>
               <p className="mt-4 max-w-2xl text-sm leading-7 text-slate-600 sm:text-base">
-                登录后选择一场正在准备或进行中的比赛。观战席有全平台 10
-                人上限，房间状态以服务端为准。
+                {t('description')}
               </p>
             </div>
             <div className="flex items-center gap-3">
@@ -178,7 +182,7 @@ function LobbyContent() {
                 href="/rooms/create"
               >
                 <Plus className="size-4" />
-                创建房间
+                {t('createRoom')}
               </Link>
               <LobbySyncStatus
                 isError={query.isError}
@@ -197,13 +201,13 @@ function LobbyContent() {
                 <TicketCheck className="size-5" />
               </span>
               <div>
-                <h2 className="font-black">使用房间号加入</h2>
-                <p className="mt-1 text-xs text-slate-300">输入邀请中的 6 位数字房间号。</p>
+                <h2 className="font-black">{t('joining')}</h2>
+                <p className="mt-1 text-xs text-slate-300">{t('joinDetail')}</p>
               </div>
             </div>
             <form className="flex w-full max-w-md gap-2" onSubmit={submitRoomCode}>
               <label className="sr-only" htmlFor="room-code-input">
-                房间号
+                {t('roomCode')}
               </label>
               <input
                 ref={codeInputRef}
@@ -216,7 +220,7 @@ function LobbyContent() {
                   setRoomCode(event.target.value.toUpperCase());
                   lookupMutation.reset();
                 }}
-                placeholder="输入 6 位数字房间号"
+                placeholder={t('roomCodePlaceholder')}
                 value={roomCode}
               />
               <button
@@ -229,7 +233,7 @@ function LobbyContent() {
                 ) : (
                   <ArrowRight className="size-4" />
                 )}
-                加入
+                {t('join')}
               </button>
             </form>
           </div>
@@ -239,15 +243,15 @@ function LobbyContent() {
           <div className="mt-6 flex items-start gap-3 rounded-2xl border border-blue-200 bg-blue-50/70 p-5 text-sm text-blue-800">
             <AlertTriangle className="mt-0.5 size-5 shrink-0 text-blue-600" aria-hidden="true" />
             <div className="flex-1">
-              <strong>大厅暂时没有加载出来</strong>
-              <p className="mt-1 text-blue-700">请重新同步或稍后再试。</p>
+              <strong>{t('loadFailed')}</strong>
+              <p className="mt-1 text-blue-700">{t('reloadHint')}</p>
               <button
                 className="jx-disabled-command mt-3 rounded-xl border border-blue-700 bg-blue-700 px-4 py-2 text-xs font-black text-white hover:border-blue-800 hover:bg-blue-800"
                 disabled={query.isFetching}
                 onClick={() => void query.refetch()}
                 type="button"
               >
-                {query.isFetching ? '正在同步' : '重新同步'}
+                {t('syncAgain')}
               </button>
             </div>
           </div>
@@ -255,7 +259,7 @@ function LobbyContent() {
 
         {query.isError && rooms.length > 0 ? (
           <p className="mt-4 text-xs font-bold text-amber-700" role="status">
-            当前展示上次同步结果，恢复连接后会自动更新。
+            {t('showingPrevious')}
           </p>
         ) : null}
 
@@ -276,13 +280,13 @@ function LobbyContent() {
             <div className="grid min-h-64 place-items-center rounded-[1.5rem] border border-dashed border-blue-200 bg-white/60 px-6 text-center">
               <div>
                 <Bot className="mx-auto size-9 text-blue-500" aria-hidden="true" />
-                <h2 className="mt-4 text-xl font-black">暂时没有公开房间</h2>
-                <p className="mt-2 text-sm text-slate-600">创建第一场人机辩论，邀请辩手入席。</p>
+                <h2 className="mt-4 text-xl font-black">{t('empty')}</h2>
+                <p className="mt-2 text-sm text-slate-600">{t('emptyDetail')}</p>
                 <Link
                   className="mt-5 inline-flex rounded-xl bg-lime-300 px-4 py-2.5 text-sm font-black text-slate-950"
                   href="/rooms/create"
                 >
-                  创建房间
+                  {t('createRoom')}
                 </Link>
               </div>
             </div>

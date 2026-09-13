@@ -8,6 +8,7 @@ from pydantic import ValidationError
 
 from jx_core.config import Settings
 from jx_core.devices.routes import DEVICE_PROBE_ROOM, build_livekit_probe_token
+from jx_core.livekit_routes import _event_value, _parse_human_identity
 from jx_core.models import User
 
 PROBE_SECRET = "probe-secret-with-at-least-thirty-two-bytes"
@@ -25,6 +26,7 @@ def livekit_settings() -> Settings:
 def test_livekit_settings_require_complete_credentials() -> None:
     with pytest.raises(ValidationError):
         Settings(
+            _env_file=None,
             database_url="postgresql+psycopg://jx:secret@127.0.0.1:5432/jx_debate",
             livekit_url="wss://rtc.example.test",
         )
@@ -59,3 +61,21 @@ def test_device_probe_token_only_allows_microphone_publish() -> None:
         "canPublishSources": ["microphone"],
         "hidden": True,
     }
+
+
+def test_livekit_webhook_fields_fall_back_when_provider_sends_empty_values() -> None:
+    class Event:
+        event = "  "
+
+    assert _event_value(Event(), "event", "fallback") == "fallback"
+    assert _event_value(object(), "event", "fallback") == "fallback"
+
+
+def test_livekit_webhook_identity_parser_rejects_malformed_or_zero_epoch() -> None:
+    match_id = uuid4()
+    user_id = uuid4()
+    valid = f"jx-human-{match_id}-{user_id}-3-random"
+
+    assert _parse_human_identity(valid) == (match_id, user_id, 3)
+    assert _parse_human_identity(f"jx-human-{match_id}-{user_id}-0-random") is None
+    assert _parse_human_identity("jx-human-" + "-" * 72 + "-1-random") is None

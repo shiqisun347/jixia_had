@@ -12,6 +12,8 @@ from uuid import UUID, uuid4
 
 from websockets.asyncio.client import connect
 
+from ..data_capture.provider import ProviderCallCapture
+
 
 class TtsProviderError(RuntimeError):
     def __init__(self, code: str) -> None:
@@ -104,13 +106,19 @@ class QwenTtsConnection:
         on_audio: AudioCallback,
         on_event: EventCallback | None = None,
         task_id: UUID | None = None,
+        capture: ProviderCallCapture | None = None,
     ) -> TtsStreamResult:
         async with self._lock:
             current_task = task_id or uuid4()
             socket = await self._ensure_socket()
             await self._start_rate_limiter.wait()
-            await self._send(socket, self._run_task(current_task, voice, rate))
-            await self._wait_started(socket, current_task)
+            sent_events: list[dict[str, Any]] = []
+            received_events: list[dict[str, Any]] = []
+            run_task = self._run_task(current_task, voice, rate)
+            sent_events.append(run_task)
+            await self._send(socket, run_task)
+            started_event = await self._wait_started(socket, current_task)
+            received_events.append(started_event)
             started = monotonic()
             first_audio_ms: int | None = None
             byte_count = 0
@@ -121,30 +129,28 @@ class QwenTtsConnection:
                     if not chunk:
                         continue
                     sent = True
-                    await self._send(
-                        socket,
-                        {
-                            "header": {
-                                "action": "continue-task",
-                                "task_id": str(current_task),
-                                "streaming": "duplex",
-                            },
-                            "payload": {"input": {"text": chunk}},
-                        },
-                    )
-                if not sent:
-                    raise TtsProviderError("tts_text_empty")
-                await self._send(
-                    socket,
-                    {
+                    payload: dict[str, Any] = {
                         "header": {
-                            "action": "finish-task",
+                            "action": "continue-task",
                             "task_id": str(current_task),
                             "streaming": "duplex",
                         },
-                        "payload": {"input": {}},
+                        "payload": {"input": {"text": chunk}},
+                    }
+                    sent_events.append(payload)
+                    await self._send(socket, payload)
+                if not sent:
+                    raise TtsProviderError("tts_text_empty")
+                payload = {
+                    "header": {
+                        "action": "finish-task",
+                        "task_id": str(current_task),
+                        "streaming": "duplex",
                     },
-                )
+                    "payload": {"input": {}},
+                }
+                sent_events.append(payload)
+                await self._send(socket, payload)
 
             sender = asyncio.create_task(send_text(), name=f"tts-text-{current_task}")
             try:
@@ -166,7 +172,9 @@ class QwenTtsConnection:
                     if header.get("event") == "task-failed":
                         self._socket = None
                         await socket.close()
+                        received_events.append(event)
                         raise TtsProviderError("tts_provider_failed")
+                    received_events.append(event)
                     if on_event is not None:
                         await on_event(event)
                     if header.get("event") == "task-finished":
@@ -176,19 +184,27 @@ class QwenTtsConnection:
                 sender.cancel()
                 await asyncio.gather(sender, return_exceptions=True)
                 await self._cancel(socket, current_task)
+                _capture_tts(
+                    capture, self._url, sent_events, received_events, byte_count, current_task
+                )
                 raise
             except Exception:
                 sender.cancel()
                 await asyncio.gather(sender, return_exceptions=True)
+                _capture_tts(
+                    capture, self._url, sent_events, received_events, byte_count, current_task
+                )
                 raise
             if first_audio_ms is None or byte_count == 0:
                 raise TtsProviderError("tts_audio_empty")
-            return TtsStreamResult(
+            result = TtsStreamResult(
                 task_id=current_task,
                 byte_count=byte_count,
                 first_audio_latency_ms=first_audio_ms,
                 completed_latency_ms=int((monotonic() - started) * 1000),
             )
+            _capture_tts(capture, self._url, sent_events, received_events, byte_count, current_task)
+            return result
 
     async def _ensure_socket(self) -> WebSocketLike:
         if self._socket is None:
@@ -201,7 +217,7 @@ class QwenTtsConnection:
                 raise TtsProviderError("tts_connection_failed") from error
         return self._socket
 
-    async def _wait_started(self, socket: WebSocketLike, task_id: UUID) -> None:
+    async def _wait_started(self, socket: WebSocketLike, task_id: UUID) -> dict[str, Any]:
         while True:
             try:
                 raw = await asyncio.wait_for(socket.recv(), timeout=self._timeout_seconds)
@@ -216,7 +232,7 @@ class QwenTtsConnection:
             if header.get("event") == "task-failed":
                 raise TtsProviderError("tts_provider_failed")
             if header.get("event") == "task-started":
-                return
+                return event
 
     async def _send(self, socket: WebSocketLike, payload: dict[str, Any]) -> None:
         try:
@@ -288,6 +304,35 @@ def _header(event: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(header, dict):
         raise TtsProviderError("tts_protocol_invalid")
     return cast(dict[str, Any], header)
+
+
+def _capture_tts(
+    capture: ProviderCallCapture | None,
+    url: str,
+    sent_events: list[dict[str, Any]],
+    received_events: list[dict[str, Any]],
+    byte_count: int,
+    task_id: UUID,
+) -> None:
+    if capture is None:
+        return
+    capture.provider_request_id = str(task_id)
+    capture.capture_request(
+        transport="WEBSOCKET",
+        url=url,
+        body={"messages": sent_events},
+    )
+    capture.capture_response(
+        transport="WEBSOCKET",
+        url=url,
+        body={"task_id": str(task_id)},
+        events=received_events,
+        binary_summary={
+            "direction": "provider_to_platform",
+            "format": "ogg_opus",
+            "total_bytes": byte_count,
+        },
+    )
 
 
 __all__ = [

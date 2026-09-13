@@ -6,7 +6,7 @@ from datetime import UTC, datetime
 from typing import Annotated, Literal, NoReturn, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, Request, Response
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -19,6 +19,7 @@ from ..auth.errors import APIError, AuthError
 from ..auth.schemas import TermsResponse
 from ..auth.session import AuthContext
 from ..config import Settings
+from ..experiments.permissions import is_experiment_side_controller, resolve_room_link
 from ..legal.terms import get_current_human_participation_terms
 from ..models import AgentProfile, Match, RoomMember, Seat, SeatSwapRequest, User, VoiceProfile
 from .schemas import (
@@ -41,6 +42,7 @@ from .schemas import (
 from .service import RoomService
 
 router = APIRouter()
+DEVICE_BROWSER_COOKIE = "jx_device_check"
 
 
 def _raise(error: AuthError) -> NoReturn:
@@ -89,6 +91,16 @@ async def _snapshot(
         "ACTIVE" if current is not None else "LEFT" if viewer.member else "NONE"
     )
     latest_check = viewer.latest_device_check
+    experiment_link = await resolve_room_link(database_session, room_id=room_id)
+    viewer_is_experiment_controller = bool(
+        experiment_link
+        and experiment_link.scheduled_match_kind == "FORMAL"
+        and await is_experiment_side_controller(
+            database_session,
+            scheduled_match_id=experiment_link.scheduled_match_id,
+            user_id=viewer_user_id,
+        )
+    )
     now = datetime.now(UTC)
     return RoomSnapshotResponse(
         id=room.id,
@@ -99,6 +111,13 @@ async def _snapshot(
         organizer_user_id=room.organizer_user_id,
         is_all_agent=room.is_all_agent,
         auto_fill_agents=room.auto_fill_agents,
+        experiment_mode=experiment_link is not None,
+        scheduled_match_kind=(
+            cast(Literal["FORMAL", "TRAINING"], experiment_link.scheduled_match_kind)
+            if experiment_link is not None
+            else None
+        ),
+        viewer_is_experiment_controller=viewer_is_experiment_controller,
         sequence=room.sequence,
         topic=room.topic_snapshot,
         rule=room.rule_snapshot,
@@ -337,6 +356,27 @@ async def join_room(
 
 
 @router.post(
+    "/api/rooms/{room_id}/reconnect",
+    response_model=RoomSnapshotResponse,
+    tags=["rooms"],
+    dependencies=[Depends(require_browser_origin)],
+)
+async def reconnect_room_member(
+    room_id: UUID,
+    context: Annotated[AuthContext, Depends(get_changed_password_auth)],
+    database_session: Annotated[AsyncSession, Depends(get_database_session)],
+) -> RoomSnapshotResponse:
+    service = RoomService()
+    try:
+        await service.reconnect_room_member(
+            database_session, user_id=context.user_id, room_id=room_id
+        )
+    except AuthError as error:
+        _raise(error)
+    return await _snapshot(service, database_session, room_id, context.user_id)
+
+
+@router.post(
     "/api/rooms/{room_id}/seat",
     response_model=RoomSnapshotResponse,
     tags=["rooms"],
@@ -452,14 +492,31 @@ async def save_device_check(
     payload: DeviceCheckRequest,
     context: Annotated[AuthContext, Depends(get_changed_password_auth)],
     database_session: Annotated[AsyncSession, Depends(get_database_session)],
+    request: Request,
+    response: Response,
 ) -> RoomSnapshotResponse:
     service = RoomService()
     try:
-        await service.save_device_check(
+        check = await service.save_device_check(
             database_session, user_id=context.user_id, room_id=room_id, payload=payload
+        )
+        token = await service.issue_browser_device_check(
+            database_session,
+            user_id=context.user_id,
+            check=check,
+            token=request.cookies.get(DEVICE_BROWSER_COOKIE),
         )
     except AuthError as error:
         _raise(error)
+    response.set_cookie(
+        DEVICE_BROWSER_COOKIE,
+        token,
+        max_age=24 * 60 * 60,
+        httponly=True,
+        secure=request.app.state.runtime.settings.app_env == "production",
+        samesite="lax",
+        path="/",
+    )
     return await _snapshot(service, database_session, room_id, context.user_id)
 
 
@@ -471,6 +528,7 @@ async def save_device_check(
 )
 async def invalidate_device_check(
     room_id: UUID,
+    request: Request,
     context: Annotated[AuthContext, Depends(get_changed_password_auth)],
     database_session: Annotated[AsyncSession, Depends(get_database_session)],
 ) -> RoomSnapshotResponse:
@@ -478,6 +536,36 @@ async def invalidate_device_check(
     try:
         await service.invalidate_device_check(
             database_session, user_id=context.user_id, room_id=room_id
+        )
+        await service.revoke_browser_device_check(
+            database_session,
+            user_id=context.user_id,
+            token=request.cookies.get(DEVICE_BROWSER_COOKIE),
+        )
+    except AuthError as error:
+        _raise(error)
+    return await _snapshot(service, database_session, room_id, context.user_id)
+
+
+@router.post(
+    "/api/rooms/{room_id}/device-check/reuse",
+    response_model=RoomSnapshotResponse,
+    tags=["rooms"],
+    dependencies=[Depends(require_browser_origin)],
+)
+async def reuse_device_check(
+    room_id: UUID,
+    request: Request,
+    context: Annotated[AuthContext, Depends(get_changed_password_auth)],
+    database_session: Annotated[AsyncSession, Depends(get_database_session)],
+) -> RoomSnapshotResponse:
+    token = request.cookies.get(DEVICE_BROWSER_COOKIE)
+    if not token:
+        _raise(AuthError("device_check_required"))
+    service = RoomService()
+    try:
+        await service.reuse_browser_device_check(
+            database_session, user_id=context.user_id, room_id=room_id, token=token
         )
     except AuthError as error:
         _raise(error)

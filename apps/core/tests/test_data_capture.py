@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import os
+from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
 import pytest
@@ -16,9 +17,68 @@ from jx_core.data_capture.content import (
     load_content_blob,
     store_content_blob,
 )
-from jx_core.data_capture.diagnostics import DiagnosticWriter
+from jx_core.data_capture.diagnostics import (
+    DiagnosticRecord,
+    DiagnosticWriter,
+    sanitize_log_details,
+)
 from jx_core.database import Database
 from jx_core.models import CallContentBlob, CallContentBlobChunk, SystemLogEvent
+
+
+def test_runtime_log_details_are_bounded_and_redacted() -> None:
+    value = sanitize_log_details(
+        {
+            "authorization": "Bearer secret",
+            "nested": {"password": "pw", "message": "ok"},
+            "client-secret": "hidden",
+            "values": list(range(200)),
+        }
+    )
+    assert value["authorization"] == "[REDACTED]"  # type: ignore[index]
+    assert value["nested"]["password"] == "[REDACTED]"  # type: ignore[index]
+    assert value["client-secret"] == "[REDACTED]"  # type: ignore[index]
+    assert len(value["values"]) == 100  # type: ignore[arg-type,index]
+
+
+def test_runtime_log_debug_gate_is_explicit() -> None:
+    from jx_core.data_capture.diagnostics import DiagnosticWriter
+
+    writer = DiagnosticWriter(service="test", session_factory=None)  # type: ignore[arg-type]
+    assert writer.accepts_level("INFO")
+    assert not writer.accepts_level("DEBUG")
+    writer.configure_debug(datetime.now(UTC) + timedelta(minutes=5))
+    assert writer.accepts_level("DEBUG")
+    writer.configure_debug(datetime.now(UTC) - timedelta(seconds=1))
+    assert not writer.accepts_level("DEBUG")
+
+
+def test_runtime_log_queue_tracks_dropped_records() -> None:
+    writer = DiagnosticWriter(
+        service="test", session_factory=None, queue_size=1  # type: ignore[arg-type]
+    )
+    record = DiagnosticRecord(
+        level="INFO",
+        service="test",
+        logger_name="test",
+        message="bounded queue",
+        error_code=None,
+        request_id=None,
+        trace_id=None,
+        format_version_id=None,
+        match_id=None,
+        speech_id=None,
+        generation_id=None,
+        decision_round_id=None,
+        connection_epoch=None,
+        incident_id=None,
+        details={},
+        happened_at=datetime.now(UTC),
+    )
+    writer._enqueue_on_loop(record)
+    writer._enqueue_on_loop(record)
+    assert writer.queue_size == 1
+    assert writer.dropped_count == 1
 
 
 def test_canonical_payload_is_stable_and_only_redacts_structured_secret_values() -> None:

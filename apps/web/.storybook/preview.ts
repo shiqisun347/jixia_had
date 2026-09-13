@@ -1,5 +1,6 @@
 import type { Preview } from '@storybook/nextjs-vite';
 import { mswLoader } from 'msw-storybook-addon/csf3';
+import { setupWorker } from 'msw/browser';
 import { createElement } from 'react';
 
 import '../src/app/globals.css';
@@ -26,10 +27,15 @@ const preview: Preview = {
         createElement(AuthProvider, null, createElement(Story)),
       ),
   ],
-  loaders: [mswLoader()],
+  loaders: [
+    mswLoader(async () => {
+      const worker = setupWorker(...handlers);
+      await worker.start({ onUnhandledRequest: 'warn' });
+      return worker;
+    }),
+  ],
   parameters: {
     layout: 'fullscreen',
-    msw: { handlers },
     a11y: {
       // Accessibility failures are visible in Storybook and fail component
       // tests instead of being silently ignored.

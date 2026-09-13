@@ -8,6 +8,7 @@ import { usePathname, useSearchParams } from 'next/navigation';
 import { Suspense, useContext, useState } from 'react';
 
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
+import { useAppTranslations } from '@/i18n';
 import { avatarUrl } from '@/lib/auth-api';
 import { authHrefWithReturnTo, buildReturnTo, sanitizeAuthReturnTo } from '@/lib/return-to';
 
@@ -27,6 +28,7 @@ function AuthNavigationLoading() {
 }
 
 function AuthNavigationContent() {
+  const t = useAppTranslations('Auth');
   const pathname = usePathname() || '/';
   const searchParams = useSearchParams();
   const returnTo = sanitizeAuthReturnTo(buildReturnTo(pathname, searchParams?.toString() ?? ''));
@@ -43,14 +45,14 @@ function AuthNavigationContent() {
           href={loginHref}
           prefetch={false}
         >
-          登录
+          {t('login')}
         </Link>
         <Link
           className="inline-flex items-center rounded-xl bg-lime-300 px-4 py-2.5 text-sm font-black text-slate-950 shadow-[0_8px_26px_rgba(183,237,0,0.28)]"
           href={registerHref}
           prefetch={false}
         >
-          注册
+          {t('register')}
         </Link>
       </div>
     );
@@ -62,6 +64,7 @@ function ConnectedAuthNavigation({
   loginHref,
   registerHref,
 }: Readonly<{ loginHref: string; registerHref: string }>) {
+  const t = useAppTranslations('Auth');
   const query = useCurrentUser();
   const { logout, isLoggingOut } = useLogout();
   const [logoutConfirmOpen, setLogoutConfirmOpen] = useState(false);
@@ -70,7 +73,7 @@ function ConnectedAuthNavigation({
     return (
       <div
         className="h-10 w-36 animate-pulse rounded-xl bg-slate-100"
-        aria-label="正在检查登录状态"
+        aria-label={t('checking')}
         role="status"
       />
     );
@@ -80,7 +83,7 @@ function ConnectedAuthNavigation({
     return (
       <div
         className="flex items-center gap-2"
-        title={query.isError ? '暂时无法确认登录状态，可稍后重试。' : undefined}
+        title={query.isError ? t('loginUnavailable') : undefined}
       >
         {query.isError ? (
           <button
@@ -89,7 +92,7 @@ function ConnectedAuthNavigation({
             onClick={() => void query.refetch()}
             type="button"
           >
-            {query.isFetching ? '重试中…' : '重试登录状态'}
+            {query.isFetching ? t('retrying') : t('retryLogin')}
           </button>
         ) : null}
         <Link
@@ -97,14 +100,14 @@ function ConnectedAuthNavigation({
           href={loginHref}
           prefetch={false}
         >
-          登录
+          {t('login')}
         </Link>
         <Link
           className="inline-flex items-center rounded-xl bg-lime-300 px-4 py-2.5 text-sm font-black text-slate-950 shadow-[0_8px_26px_rgba(183,237,0,0.28)]"
           href={registerHref}
           prefetch={false}
         >
-          注册
+          {t('register')}
         </Link>
       </div>
     );
@@ -131,7 +134,7 @@ function ConnectedAuthNavigation({
         {user.role === 'ADMIN' ? (
           <details className="group relative">
             <summary
-              aria-label={`打开${user.real_name}的账号菜单`}
+              aria-label={t('openAccount', { name: user.real_name })}
               className="account-control cursor-pointer list-none"
               role="button"
             >
@@ -144,17 +147,17 @@ function ConnectedAuthNavigation({
             <div className="absolute right-0 top-[calc(100%+.5rem)] z-50 grid min-w-48 gap-1 rounded-2xl border border-blue-100 bg-white p-2 shadow-xl">
               <Link className="account-menu-link" href="/me" prefetch={false}>
                 <UserRound className="size-4" aria-hidden="true" />
-                我的页面
+                {t('profile')}
               </Link>
               <Link className="account-menu-link" href="/admin" prefetch={false}>
                 <ShieldCheck className="size-4" aria-hidden="true" />
-                管理后台
+                {t('admin')}
               </Link>
             </div>
           </details>
         ) : (
           <Link
-            aria-label={`进入${user.real_name}的个人页面`}
+            aria-label={t('enterProfile', { name: user.real_name })}
             className="account-control"
             href="/me"
             prefetch={false}
@@ -167,19 +170,19 @@ function ConnectedAuthNavigation({
           disabled={isLoggingOut}
           onClick={() => setLogoutConfirmOpen(true)}
           type="button"
-          aria-label="退出登录"
+          aria-label={t('logout')}
         >
           <LogOut className="size-4" aria-hidden="true" />
         </button>
       </div>
       <ConfirmDialog
-        confirmLabel="退出登录"
-        description="退出后需要重新输入用户名和密码才能继续使用需要登录的功能。"
+        confirmLabel={t('logoutConfirm')}
+        description={t('logoutDescription')}
         loading={isLoggingOut}
         onConfirm={() => void logout()}
         onOpenChange={setLogoutConfirmOpen}
         open={logoutConfirmOpen}
-        title="确认退出登录？"
+        title={t('logoutTitle')}
       />
     </>
   );

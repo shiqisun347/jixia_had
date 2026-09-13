@@ -5,6 +5,8 @@ import { AlertCircle, Inbox } from 'lucide-react';
 import { cn } from '@/lib/cn';
 
 import { useOptionalToast } from '@/components/ui/toast-provider';
+import { useAppLocale, useAppTranslations } from '@/i18n';
+import { translateAdminNode, translateAdminText } from './admin-i18n';
 
 export const adminFieldClass =
   'w-full min-h-11 rounded-xl border border-slate-200 bg-white px-3.5 py-2.5 text-sm text-slate-950 outline-none transition placeholder:text-slate-400 focus:border-blue-500 focus:ring-4 focus:ring-blue-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400';
@@ -20,6 +22,7 @@ export function AdminPageHeader({
   description: string;
   actions?: ReactNode;
 }) {
+  const { locale } = useAppLocale();
   return (
     <header className="relative flex flex-wrap items-end justify-between gap-5 border-b border-slate-200 pb-6">
       <span
@@ -27,13 +30,13 @@ export function AdminPageHeader({
         aria-hidden="true"
       />
       <div className="max-w-3xl">
-        <p className="text-[0.65rem] font-black tracking-[0.16em] text-blue-600">{eyebrow}</p>
+        <p className="text-[0.65rem] font-black tracking-[0.16em] text-blue-600">{translateAdminText(eyebrow, locale)}</p>
         <h1 className="mt-2 text-[1.8rem] font-black tracking-[-0.035em] text-slate-950">
-          {title}
+          {translateAdminText(title, locale)}
         </h1>
-        <p className="mt-1.5 max-w-2xl text-sm leading-6 text-slate-600">{description}</p>
+        <p className="mt-1.5 max-w-2xl text-sm leading-6 text-slate-600">{translateAdminText(description, locale)}</p>
       </div>
-      {actions ? <div className="flex flex-wrap gap-2">{actions}</div> : null}
+      {actions ? <div className="flex flex-wrap gap-2">{translateAdminNode(actions, locale)}</div> : null}
     </header>
   );
 }
@@ -51,6 +54,7 @@ export function AdminPanel({
   children: ReactNode;
   className?: string;
 }) {
+  const { locale } = useAppLocale();
   return (
     <section
       className={cn(
@@ -60,14 +64,14 @@ export function AdminPanel({
     >
       <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 px-5 py-4">
         <div>
-          <h2 className="text-sm font-black tracking-[-0.015em] text-slate-950">{title}</h2>
+          <h2 className="text-sm font-black tracking-[-0.015em] text-slate-950">{translateAdminText(title, locale)}</h2>
           {description ? (
-            <p className="mt-1 text-xs leading-5 text-slate-500">{description}</p>
+            <p className="mt-1 text-xs leading-5 text-slate-500">{translateAdminText(description, locale)}</p>
           ) : null}
         </div>
-        {action}
+        {translateAdminNode(action, locale)}
       </div>
-      <div className="p-5">{children}</div>
+      <div className="p-5">{translateAdminNode(children, locale)}</div>
     </section>
   );
 }
@@ -79,6 +83,7 @@ export function AdminFeedback({
   message: string;
   tone?: 'info' | 'error';
 }) {
+  const { locale } = useAppLocale();
   const toast = useOptionalToast();
 
   useEffect(() => {
@@ -94,17 +99,24 @@ export function AdminFeedback({
       className="flex items-start gap-2 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800"
     >
       <AlertCircle className="mt-0.5 size-4 shrink-0" aria-hidden="true" />
-      <span>{message}</span>
+      <span>{translateAdminText(message, locale)}</span>
     </div>
   );
 }
 
+/** Translates a complete admin surface, including dialog and form descendants. */
+export function AdminI18nBoundary({ children }: { children: ReactNode }) {
+  const { locale } = useAppLocale();
+  return <>{translateAdminNode(children, locale)}</>;
+}
+
 export function AdminEmpty({ children = '暂无数据' }: { children?: ReactNode }) {
+  const t = useAppTranslations('Admin');
   return (
     <div className="grid min-h-36 place-items-center rounded-xl border border-dashed border-slate-200 bg-slate-50/70 px-5 text-center text-sm text-slate-500">
       <div>
         <Inbox className="mx-auto mb-2 size-5 text-slate-400" aria-hidden="true" />
-        {children}
+        {children === '暂无数据' ? t('common.noData') : children}
       </div>
     </div>
   );
@@ -118,9 +130,10 @@ export function Field({
   label: string;
   name: string;
 }) {
+  const { locale } = useAppLocale();
   return (
     <label className="grid gap-1.5 text-xs font-bold text-slate-600">
-      {label}
+      {translateAdminText(label, locale)}
       <input className={adminFieldClass} name={name} {...props} />
     </label>
   );
@@ -136,9 +149,10 @@ export function SelectField({
   name: string;
   children: ReactNode;
 }) {
+  const { locale } = useAppLocale();
   return (
     <label className="grid gap-1.5 text-xs font-bold text-slate-600">
-      {label}
+      {translateAdminText(label, locale)}
       <select className={adminFieldClass} name={name} {...props}>
         {children}
       </select>
@@ -151,9 +165,10 @@ export function TextArea({
   name,
   ...props
 }: React.TextareaHTMLAttributes<HTMLTextAreaElement> & { label: string; name: string }) {
+  const { locale } = useAppLocale();
   return (
     <label className="grid gap-1.5 text-xs font-bold text-slate-600">
-      {label}
+      {translateAdminText(label, locale)}
       <textarea className={cn(adminFieldClass, 'min-h-28 resize-y')} name={name} {...props} />
     </label>
   );

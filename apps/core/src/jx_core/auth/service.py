@@ -7,13 +7,13 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..audit.service import AuditService
 from ..legal.terms import get_current_platform_terms, get_platform_terms
-from ..models import RoomConnection, RoomConnectionLease, User, UserConsent
+from ..models import RoomConnectionLease, RoomMember, User, UserConsent
 from ..users.avatar_catalog import is_avatar_key, random_avatar_key
 from .errors import AuthError
 from .normalization import InputNormalizationError, normalize_real_name, prepare_username
@@ -194,11 +194,16 @@ class AuthService:
             user.password_changed_at = current
             user.failed_login_count = 0
             user.locked_until = None
-            await database_session.execute(
-                delete(RoomConnection).where(RoomConnection.user_id == user_id)
-            )
+            # Invalidate active sockets, but retain the epoch high-water row.
+            # A delayed close from a pre-password-change socket must never be
+            # able to collide with the first epoch of the new session.
             await database_session.execute(
                 delete(RoomConnectionLease).where(RoomConnectionLease.user_id == user_id)
+            )
+            await database_session.execute(
+                update(RoomMember)
+                .where(RoomMember.user_id == user_id, RoomMember.left_at.is_(None))
+                .values(online=False)
             )
             await self.sessions.revoke_all(database_session, user_id, now=current)
             created_session = self.sessions.create(database_session, user.id, now=current)
@@ -317,11 +322,14 @@ class AuthService:
             target.password_changed_at = current
             target.failed_login_count = 0
             target.locked_until = None
-            await database_session.execute(
-                delete(RoomConnection).where(RoomConnection.user_id == target_user_id)
-            )
+            # Keep RoomConnection as an epoch fence while revoking leases.
             await database_session.execute(
                 delete(RoomConnectionLease).where(RoomConnectionLease.user_id == target_user_id)
+            )
+            await database_session.execute(
+                update(RoomMember)
+                .where(RoomMember.user_id == target_user_id, RoomMember.left_at.is_(None))
+                .values(online=False)
             )
             await self.sessions.revoke_all(database_session, target_user_id, now=current)
             self.audit.record(
@@ -338,6 +346,59 @@ class AuthService:
             user=target,
             temporary_password=temporary_password,
         )
+
+    async def set_password_by_admin(
+        self,
+        database_session: AsyncSession,
+        *,
+        actor_user_id: UUID,
+        target_user_id: UUID,
+        new_password: object,
+        request_id: str | None = None,
+        now: datetime | None = None,
+    ) -> User:
+        if actor_user_id == target_user_id:
+            raise AuthError("admin_self_password_change_required")
+        try:
+            password_hash = self.passwords.hash(new_password)
+        except PasswordPolicyError as error:
+            raise AuthError("validation_error", {"new_password": "密码须为 8–64 个字符"}) from error
+        current = now or datetime.now(UTC)
+        async with database_session.begin():
+            target = (
+                await database_session.execute(
+                    select(User).where(User.id == target_user_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if target is None:
+                raise AuthError("user_not_found")
+            target.password_hash = password_hash
+            target.must_change_password = False
+            target.password_changed_at = current
+            target.failed_login_count = 0
+            target.locked_until = None
+            await database_session.execute(
+                delete(RoomConnectionLease).where(RoomConnectionLease.user_id == target_user_id)
+            )
+            await database_session.execute(
+                update(RoomMember)
+                .where(RoomMember.user_id == target_user_id, RoomMember.left_at.is_(None))
+                .values(online=False)
+            )
+            revoked_sessions = await self.sessions.revoke_all(
+                database_session, target_user_id, now=current
+            )
+            self.audit.record(
+                database_session,
+                actor_user_id=actor_user_id,
+                action="password.changed_by_admin",
+                target_type="user",
+                target_id=str(target_user_id),
+                request_id=request_id,
+                details={"revoked_sessions": revoked_sessions},
+            )
+            await database_session.flush()
+        return target
 
     def _verify_password(self, encoded_hash: str, password: object) -> PasswordVerification:
         try:

@@ -33,6 +33,8 @@ export const roomsApi = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  reconnect: (roomId: string) =>
+    requestJson<RoomSnapshot>(`/api/rooms/${roomId}/reconnect`, { method: 'POST' }),
   selectSeat: (roomId: string, payload: SeatSelectPayload) =>
     requestJson<RoomSnapshot>(`/api/rooms/${roomId}/seat`, {
       method: 'POST',
@@ -63,6 +65,8 @@ export const roomsApi = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  reuseDeviceCheck: (roomId: string) =>
+    requestJson<RoomSnapshot>(`/api/rooms/${roomId}/device-check/reuse`, { method: 'POST' }),
   invalidateDeviceCheck: (roomId: string) =>
     requestJson<RoomSnapshot>(`/api/rooms/${roomId}/device-check/invalidate`, {
       method: 'POST',

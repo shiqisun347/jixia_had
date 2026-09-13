@@ -2,17 +2,19 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import type { ReactNode } from 'react';
+import type { CSSProperties, ReactNode } from 'react';
 
 import { AuthNavigation } from '@/features/auth/auth-navigation';
+import { useAppTranslations } from '@/i18n';
 
 import { JixiaLogo } from '../brand/jixia-logo';
+import { LocaleSwitcher } from './locale-switcher';
 
 const navigation = [
-  { label: '首页', href: '/' },
-  { label: '比赛大厅', href: '/lobby' },
-  { label: '排行榜', href: '/leaderboard' },
-  { label: '使用指南', href: '/guide' },
+  { label: 'home', href: '/' },
+  { label: 'lobby', href: '/lobby' },
+  { label: 'leaderboard', href: '/leaderboard' },
+  { label: 'guide', href: '/guide' },
 ] as const;
 
 function isCurrent(pathname: string, href: string) {
@@ -22,16 +24,21 @@ function isCurrent(pathname: string, href: string) {
 
 export function SiteHeader({ authNavigation }: Readonly<{ authNavigation?: ReactNode }>) {
   const pathname = usePathname() || '/';
+  const t = useAppTranslations('Navigation');
   if (pathname.startsWith('/admin')) return null;
   const compact = pathname === '/debate' || pathname.startsWith('/matches/');
 
   return (
     <header className={`site-header${compact ? ' site-header--compact' : ''}`}>
       <div className="site-header__inner">
-        <Link className="site-header__brand" href="/" aria-label="返回首页" prefetch={false}>
+        <Link className="site-header__brand" href="/" aria-label={t('returnHome')} prefetch={false}>
           <JixiaLogo compact={compact} />
         </Link>
-        <nav className="site-header__nav" aria-label="主导航">
+        <nav
+          className="site-header__nav"
+          aria-label={t('main')}
+          style={{ '--site-nav-count': navigation.length } as CSSProperties}
+        >
           {navigation.map((item) => {
             const current = isCurrent(pathname, item.href);
             return (
@@ -42,12 +49,12 @@ export function SiteHeader({ authNavigation }: Readonly<{ authNavigation?: React
                 prefetch={false}
                 aria-current={current ? 'page' : undefined}
               >
-                {item.label}
+                {t(item.label)}
               </Link>
             );
           })}
         </nav>
-        <div className="site-header__account">{authNavigation ?? <AuthNavigation />}</div>
+        <div className="site-header__account"><LocaleSwitcher />{authNavigation ?? <AuthNavigation />}</div>
       </div>
     </header>
   );

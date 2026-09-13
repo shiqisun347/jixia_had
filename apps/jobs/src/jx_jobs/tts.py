@@ -13,6 +13,8 @@ from uuid import uuid4
 from websockets.asyncio.client import ClientConnection, connect
 from websockets.protocol import State
 
+from jx_core.data_capture.provider import ProviderCallCapture
+
 
 class TTSProviderError(RuntimeError):
     def __init__(self, code: str) -> None:
@@ -36,6 +38,11 @@ class DashScopeTTSClient:
         self.model = model
         self.timeout_seconds = timeout_seconds
         self._connection: ClientConnection | None = None
+        self._last_capture: ProviderCallCapture | None = None
+
+    def take_capture(self) -> ProviderCallCapture | None:
+        capture, self._last_capture = self._last_capture, None
+        return capture
 
     async def _connection_or_open(self) -> ClientConnection:
         if self._connection is not None and self._connection.state is State.OPEN:
@@ -63,44 +70,54 @@ class DashScopeTTSClient:
             raise TTSProviderError("tts_text_empty")
         connection = await self._connection_or_open()
         task_id = str(uuid4())
-        await self._send(
-            connection,
-            {
-                "header": {"action": "run-task", "task_id": task_id, "streaming": "duplex"},
-                "payload": {
-                    "task_group": "audio",
-                    "task": "tts",
-                    "function": "SpeechSynthesizer",
-                    "model": self.model,
-                    "parameters": {
-                        "text_type": "PlainText",
-                        "voice": voice,
-                        "format": "opus",
-                        "sample_rate": 24000,
-                        "bit_rate": 32,
-                        "rate": rate,
-                        "pitch": 1.0,
-                        "volume": 50,
-                        "enable_ssml": False,
-                    },
-                    "input": {},
+        capture = ProviderCallCapture(provider_request_id=task_id)
+        sent_events: list[dict[str, Any]] = []
+        received_events: list[dict[str, Any]] = []
+        byte_count = 0
+        run_task = {
+            "header": {"action": "run-task", "task_id": task_id, "streaming": "duplex"},
+            "payload": {
+                "task_group": "audio",
+                "task": "tts",
+                "function": "SpeechSynthesizer",
+                "model": self.model,
+                "parameters": {
+                    "text_type": "PlainText",
+                    "voice": voice,
+                    "format": "opus",
+                    "sample_rate": 24000,
+                    "bit_rate": 32,
+                    "rate": rate,
+                    "pitch": 1.0,
+                    "volume": 50,
+                    "enable_ssml": False,
                 },
+                "input": {},
             },
-        )
-        await self._wait_event(connection, task_id, "task-started")
+        }
+        sent_events.append(run_task)
         await self._send(
             connection,
-            {
-                "header": {"action": "continue-task", "task_id": task_id, "streaming": "duplex"},
-                "payload": {"input": {"text": text}},
-            },
+            run_task,
         )
+        received_events.append(await self._wait_event(connection, task_id, "task-started"))
+        continue_task = {
+            "header": {"action": "continue-task", "task_id": task_id, "streaming": "duplex"},
+            "payload": {"input": {"text": text}},
+        }
+        sent_events.append(continue_task)
         await self._send(
             connection,
-            {
-                "header": {"action": "finish-task", "task_id": task_id, "streaming": "duplex"},
-                "payload": {"input": {}},
-            },
+            continue_task,
+        )
+        finish_task: dict[str, Any] = {
+            "header": {"action": "finish-task", "task_id": task_id, "streaming": "duplex"},
+            "payload": {"input": {}},
+        }
+        sent_events.append(finish_task)
+        await self._send(
+            connection,
+            finish_task,
         )
         output_path.parent.mkdir(parents=True, exist_ok=True)
         temporary_fd, temporary_name = tempfile.mkstemp(prefix=".tts-", dir=output_path.parent)
@@ -112,11 +129,13 @@ class DashScopeTTSClient:
                     message = await self._receive(connection)
                     if isinstance(message, bytes):
                         output.write(message)
+                        byte_count += len(message)
                         continue
                     event = json.loads(message)
                     header = event.get("header", {})
                     if header.get("task_id") != task_id:
                         continue
+                    received_events.append(event)
                     if header.get("event") == "task-failed":
                         raise TTSProviderError("tts_provider_failed")
                     if header.get("event") == "task-finished":
@@ -131,6 +150,22 @@ class DashScopeTTSClient:
         except Exception:
             temporary_path.unlink(missing_ok=True)
             raise
+        finally:
+            capture.capture_request(
+                transport="WEBSOCKET", url=self.websocket_url, body={"messages": sent_events}
+            )
+            capture.capture_response(
+                transport="WEBSOCKET",
+                url=self.websocket_url,
+                body={"task_id": task_id},
+                events=received_events,
+                binary_summary={
+                    "direction": "provider_to_platform",
+                    "format": "ogg_opus",
+                    "total_bytes": byte_count,
+                },
+            )
+            self._last_capture = capture
 
     async def cancel(self, task_id: str) -> None:
         if self._connection is None:
@@ -162,7 +197,9 @@ class DashScopeTTSClient:
         except Exception as error:
             raise TTSProviderError("tts_receive_timeout") from error
 
-    async def _wait_event(self, connection: ClientConnection, task_id: str, expected: str) -> None:
+    async def _wait_event(
+        self, connection: ClientConnection, task_id: str, expected: str
+    ) -> dict[str, Any]:
         while True:
             message = await self._receive(connection)
             if isinstance(message, bytes):
@@ -174,7 +211,7 @@ class DashScopeTTSClient:
             if header.get("event") == "task-failed":
                 raise TTSProviderError("tts_provider_failed")
             if header.get("event") == expected:
-                return
+                return event
 
 
 __all__ = ["DashScopeTTSClient", "TTSProviderError"]

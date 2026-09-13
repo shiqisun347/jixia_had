@@ -16,6 +16,9 @@ from uuid import UUID
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from jx_core.data_capture.content import load_content_blob
+from jx_core.data_capture.provider import PROVIDER_CAPTURE_VERSION
+
 from .task_queue import claim_next, complete, fail
 
 
@@ -92,8 +95,14 @@ async def _match_package(
                 text(
                     "SELECT id, call_kind, provider, operation, model, voice, attempt_no, "
                     "status, speech_id, generation_id, decision_round_id, context_version, "
-                    "started_at, first_result_latency_ms, completed_latency_ms, error_code "
+                    "started_at, first_result_latency_ms, completed_latency_ms, error_code, "
+                    "capture_version, captured_at, source_kind, source_resource_id, "
+                    "logical_call_id, provider_request_id, request_capture_status, "
+                    "response_capture_status, request_original_bytes, response_original_bytes, "
+                    "request_stored_bytes, response_stored_bytes, request_sha256, response_sha256, "
+                    "capture_error_code, request_blob_id, response_blob_id "
                     "FROM external_calls WHERE match_id=:id AND started_at <= :cutoff "
+                    "AND capture_version IS NOT NULL AND source_kind='MATCH' "
                     "ORDER BY started_at"
                 ),
                 {"id": match_id, "cutoff": cutoff_at},
@@ -147,7 +156,21 @@ async def _match_package(
     speech_writer.writerows(
         {key: _safe_text(value) for key, value in row.items()} for row in transcript_rows
     )
-    call_rows = [dict(row) for row in calls]
+    call_rows: list[dict[str, Any]] = []
+    for row in calls:
+        item = dict(row)
+        content_errors: list[str] = []
+        for side in ("request", "response"):
+            blob_id = item.pop(f"{side}_blob_id")
+            payload: Any = None
+            if blob_id is not None:
+                try:
+                    payload = await load_content_blob(session, UUID(str(blob_id)))
+                except (LookupError, ValueError, OSError):
+                    content_errors.append(side)
+            item[side] = payload
+        item["content_errors"] = content_errors
+        call_rows.append(item)
     event_rows = [dict(row) for row in events]
     manifest = {
         "export_schema_version": "1.0",
@@ -158,6 +181,7 @@ async def _match_package(
         "cutoff_context_version": cutoff_context_version,
         "incomplete": match["status"] not in {"FINISHED", "TERMINATED"},
         "scope": "single_match",
+        "provider_call_capture_schema_version": PROVIDER_CAPTURE_VERSION,
     }
     files: dict[str, bytes] = {
         "manifest.json": (_json(manifest) + "\n").encode(),

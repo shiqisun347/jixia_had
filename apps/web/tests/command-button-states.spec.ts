@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './fixtures';
 
 const user = {
   id: '00000000-0000-0000-0000-000000000055',

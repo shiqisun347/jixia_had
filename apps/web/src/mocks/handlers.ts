@@ -103,6 +103,7 @@ export const prototypeDebateResponse: PrototypeDebateResponse = {
 const prototypeHomeEndpoint = '*/api/prototype/home';
 const prototypeDebateEndpoint = '*/api/prototype/debate/:matchId';
 const authMeEndpoint = '*/api/auth/me';
+const experimentCapabilitiesEndpoint = '*/api/experiments/capabilities';
 
 export const authUnauthenticatedHandler = http.get(authMeEndpoint, () =>
   HttpResponse.json({ error: { code: 'not_authenticated', message: '请先登录' } }, { status: 401 }),
@@ -127,6 +128,21 @@ export const prototypeHomeDelayedHandler = http.get(prototypeHomeEndpoint, async
 
 export const handlers = [
   authUnauthenticatedHandler,
+  http.get(experimentCapabilitiesEndpoint, () =>
+    HttpResponse.json({ creation_enabled: true, history_readable: true, target_version: '2.1.0' }),
+  ),
+  http.get('*/api/admin/incidents', () => HttpResponse.json({ items: [] })),
+  http.get('*/api/admin/external-calls', () =>
+    HttpResponse.json({ items: [], page: 1, page_size: 50, total: 0, total_pages: 0 }),
+  ),
+  http.get('*/api/admin/runtime-logs', () =>
+    HttpResponse.json({ items: [], page: 1, page_size: 50, total: 0, total_pages: 1 }),
+  ),
+  http.get('*/api/admin/runtime-logs/stats', () =>
+    HttpResponse.json({ queue_size: 0, queue_capacity: 1024, dropped_count: 0 }),
+  ),
+  http.get('*/api/admin/diagnostics/events', () => HttpResponse.json({ items: [] })),
+  http.get('*/api/admin/diagnostics/tasks', () => HttpResponse.json({ items: [] })),
   http.get(prototypeHomeEndpoint, () => HttpResponse.json(prototypeHomeResponse)),
   http.get(prototypeDebateEndpoint, ({ params }) => {
     const matchId =

@@ -6,6 +6,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import uuid4
 
+import av
 import pytest
 from pydantic import ValidationError
 from sqlalchemy import text
@@ -23,7 +24,17 @@ class FakeTTSClient:
         assert voice == "host-probe"
         assert rate == 1.0
         output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_bytes(b"OggS-probe")
+        with av.open(str(output_path), mode="w", format="ogg") as container:
+            stream = container.add_stream("libopus", rate=48_000)
+            stream.layout = "mono"
+            for _ in range(5):
+                frame = av.AudioFrame(format="s16", layout="mono", samples=960)
+                frame.sample_rate = 48_000
+                frame.planes[0].update(bytes(960 * 2))
+                for packet in stream.encode(frame):
+                    container.mux(packet)
+            for packet in stream.encode(None):
+                container.mux(packet)
 
 
 pytestmark = pytest.mark.integration
@@ -117,7 +128,7 @@ async def test_host_tts_task_is_claimed_and_published_with_real_postgres() -> No
                     (
                         await session.execute(
                             text(
-                                "SELECT a.status AS asset_status, a.storage_path, "
+                                "SELECT a.status AS asset_status, a.storage_path, a.duration_ms, "
                                 "t.status AS task_status "
                                 "FROM host_audio_assets a JOIN background_tasks t "
                                 "ON t.id = :task_id "
@@ -131,7 +142,8 @@ async def test_host_tts_task_is_claimed_and_published_with_real_postgres() -> No
                 )
             assert row["asset_status"] == "READY"
             assert row["task_status"] == "SUCCEEDED"
-            assert (Path(directory) / row["storage_path"]).read_bytes() == b"OggS-probe"
+            assert row["duration_ms"] > 0
+            assert (Path(directory) / row["storage_path"]).read_bytes().startswith(b"OggS")
     finally:
         async with database.session_factory() as session:
             async with session.begin():

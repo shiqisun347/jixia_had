@@ -1,9 +1,11 @@
 [project]
 name = "jx-jobs"
-version = "1.0.0"
+version = "2.1.0"
 description = "Jixia debate background-job process boundary"
 requires-python = ">=3.12,<3.13"
 dependencies = [
+  "av>=15,<17",
+  "jx-core",
   "psycopg[binary,pool]==3.3.4",
   "greenlet==3.2.4",
   "pydantic==2.13.4",
@@ -14,6 +16,9 @@ dependencies = [
 
 [project.scripts]
 jx-jobs = "jx_jobs.cli:main"
+
+[tool.uv.sources]
+jx-core = { workspace = true }
 
 [build-system]
 requires = ["hatchling"]

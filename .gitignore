@@ -27,6 +27,8 @@ tmp/
 # Local runtime data
 data/
 logs/
+!apps/web/src/app/admin/logs/
+!apps/web/src/app/admin/logs/page.tsx
 artifacts/
 *.pcm
 *.tsbuildinfo

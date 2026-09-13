@@ -9,7 +9,7 @@ import pytest
 from jx_core.admin_routes import agent_generation_detail, agent_generation_view
 from jx_core.agent.llm import LlmProviderError
 from jx_core.models import AgentGeneration
-from jx_core.postmatch import _parse_result
+from jx_core.postmatch import _parse_result, _snapshot_judge
 from jx_core.postmatch_routes import can_retry_judge_for_viewer, public_leaderboard_avatar_key
 
 
@@ -35,6 +35,28 @@ def _result() -> dict[str, object]:
 def test_parse_judge_result_accepts_complete_stable_ids() -> None:
     parsed = _parse_result(json.dumps(_result()), {"p1", "p2"})
     assert parsed["winner"] == "AFFIRMATIVE"
+
+
+def test_snapshot_judge_requires_enabled_version_module() -> None:
+    judge = {"system_prompt": "frozen", "model": {"id": str(uuid4())}}
+    assert (
+        _snapshot_judge({"modules": [{"module_key": "JUDGE", "enabled": True}], "judge": judge})
+        == judge
+    )
+    assert (
+        _snapshot_judge({"modules": [{"module_key": "JUDGE", "enabled": False}], "judge": judge})
+        is None
+    )
+    assert _snapshot_judge({"modules": [], "judge": judge}) is None
+
+
+def test_snapshot_judge_supports_rule_owned_enabled_flag() -> None:
+    judge = {"enabled": True, "judge_prompt": "frozen", "model": {"id": str(uuid4())}}
+    assert _snapshot_judge({"schema": "rule-config-v1", "judge": judge}) == judge
+    assert (
+        _snapshot_judge({"schema": "rule-config-v1", "judge": {**judge, "enabled": False}})
+        is None
+    )
 
 
 def test_parse_judge_result_rejects_missing_participant() -> None:

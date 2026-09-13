@@ -20,6 +20,7 @@ async def ensure_daily_tasks(session_factory: async_sessionmaker[AsyncSession]) 
                 "LEADERBOARD_DAILY",
                 "TRANSCRIPT_AUTO_ARCHIVE",
                 "FILE_CLEANUP",
+                "RUNTIME_LOG_RETENTION",
             ):
                 await session.execute(
                     text(
@@ -58,7 +59,24 @@ async def process_one_leaderboard(
                             SELECT DISTINCT ON (jr.match_id) jr.match_id, jr.result
                             FROM judge_results jr
                             JOIN matches m ON m.id = jr.match_id AND m.status = 'FINISHED'
+                            JOIN rooms r ON r.id = m.room_id
+                            LEFT JOIN experiment_match_attempts ema ON ema.match_id = jr.match_id
+                            LEFT JOIN scheduled_matches sm ON sm.id = ema.scheduled_match_id
                             WHERE jr.status = 'SUCCEEDED'
+                              AND (
+                                r.format_snapshot->>'schema' IS DISTINCT FROM 'rule-config-v1'
+                                OR COALESCE(
+                                  (r.format_snapshot->'judge'->>'include_in_leaderboard')::boolean,
+                                  false
+                                )
+                              )
+                              AND (
+                                ema.id IS NULL OR (
+                                  sm.kind = 'FORMAL'
+                                  AND sm.effective_attempt_id = ema.id
+                                  AND ema.public_at IS NOT NULL
+                                )
+                              )
                             ORDER BY jr.match_id, jr.created_at DESC
                         )
                         SELECT latest.match_id, latest.result, mp.id AS match_participant_id,
@@ -210,4 +228,41 @@ async def process_one_transcript_archive(
     return True
 
 
-__all__ = ["ensure_daily_tasks", "process_one_leaderboard", "process_one_transcript_archive"]
+async def process_one_runtime_log_retention(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> bool:
+    async with session_factory() as session:
+        claim = await claim_next(session, task_type="RUNTIME_LOG_RETENTION")
+    if claim is None:
+        return False
+    try:
+        async with session_factory() as session:
+            async with session.begin():
+                await session.execute(
+                    text(
+                        """
+                        DELETE FROM system_log_events
+                        WHERE happened_at < now() - make_interval(
+                          days => COALESCE(
+                            (SELECT CAST(value->>'value' AS integer)
+                             FROM system_settings WHERE key='log_retention_days'),
+                            30
+                          )
+                        )
+                        """
+                    )
+                )
+        async with session_factory() as session:
+            await complete(session, task_id=claim.task_id)
+    except Exception:
+        async with session_factory() as session:
+            await fail(session, task_id=claim.task_id, error_code="runtime_log_retention_failed")
+    return True
+
+
+__all__ = [
+    "ensure_daily_tasks",
+    "process_one_leaderboard",
+    "process_one_runtime_log_retention",
+    "process_one_transcript_archive",
+]

@@ -23,6 +23,9 @@ export type MatchRow = {
   label: string;
   display_topic: string;
   admin_note: string;
+  format_version_id: string | null;
+  batch_id: string | null;
+  scheduled_match_id: string | null;
 };
 
 export type AgentGenerationDiagnostic = {
@@ -81,6 +84,22 @@ export type ExternalCallRow = {
   attempt_no: number;
   status: string;
   status_label: string;
+  match_id: string | null;
+  capture_version: number | null;
+  captured_at: string | null;
+  source_kind: string | null;
+  source_resource_id: string | null;
+  logical_call_id: string | null;
+  provider_request_id: string | null;
+  request_capture_status: string | null;
+  response_capture_status: string | null;
+  request_original_bytes: number | null;
+  response_original_bytes: number | null;
+  request_stored_bytes: number | null;
+  response_stored_bytes: number | null;
+  request_sha256: string | null;
+  response_sha256: string | null;
+  capture_error_code: string | null;
   speech_id: string | null;
   generation_id: string | null;
   decision_round_id: string | null;
@@ -127,6 +146,21 @@ export type LogRow = {
   created_at: string;
 };
 
+export type RuntimeLogRow = {
+  id: string;
+  level: string;
+  service: string;
+  logger_name: string;
+  message: string;
+  error_code: string | null;
+  request_id: string | null;
+  trace_id: string | null;
+  format_version_id: string | null;
+  match_id: string | null;
+  happened_at: string;
+  details: Record<string, unknown>;
+};
+
 export type DiagnosticEventRow = {
   id: string;
   level: string;
@@ -143,6 +177,7 @@ export type DiagnosticTaskRow = {
   task_type: string;
   status: string;
   attempts: number;
+  max_attempts: number;
   error_code: string | null;
   available_at: string;
   updated_at: string;
@@ -171,6 +206,11 @@ export type ModelRow = {
   api_key_last4?: string | null;
   token_per_char?: number;
   generation_params?: Record<string, unknown>;
+  capability_schema?: {
+    temperature?: { minimum: number; maximum: number } | null;
+    top_p?: { minimum: number; maximum: number } | null;
+    max_tokens?: { minimum: number; maximum: number } | null;
+  };
   status: string;
 };
 
@@ -183,11 +223,15 @@ export type VoiceRow = {
   chars_per_second: number | null;
   playback_gain?: number;
   avatar_key?: string | null;
+  calibration_status?: string;
+  calibrated_at?: string | null;
   status: string;
 };
 
 export type AgentRow = {
   id: string;
+  format_version_id?: string | null;
+  rule_id?: string | null;
   name: string;
   model_profile_id: string;
   voice_profile_id: string;
@@ -196,6 +240,7 @@ export type AgentRow = {
   generation_params?: Record<string, unknown>;
   avatar_key?: string;
   status: string;
+  prompt_override_count?: number;
 };
 
 export type TopicRow = {
@@ -205,6 +250,8 @@ export type TopicRow = {
   title: string;
   affirmative_text: string;
   negative_text: string;
+  source_text?: string | null;
+  cedar_id?: string | null;
   status: string;
 };
 
@@ -216,6 +263,12 @@ export type RuleRow = {
   estimated_seconds: number;
   status: string;
   audio_reviewed_at: string | null;
+  host_voice_profile_id: string | null;
+  default_agent_model_profile_id: string | null;
+  topic_policy: string;
+  config_revision: number;
+  historical_read_only: boolean;
+  postmatch_questionnaire_enabled: boolean;
 };
 
 export type Catalog = {
@@ -244,6 +297,13 @@ export type StorageStatus = {
   automatic_backup: boolean;
 };
 
+export type SystemSettings = {
+  log_retention_days: number;
+  debug_enabled: boolean;
+  debug_expires_at: string | null;
+  max_upload_bytes: number;
+};
+
 export type AdminPage<T> = {
   items: T[];
   page: number;
@@ -268,6 +328,13 @@ export type AdminListQuery = {
   page_size?: 10 | 25 | 50 | 100;
   q?: string;
   status?: string;
+  level?: string;
+  service?: string;
+  match_id?: string;
+  format_version_id?: string;
+  batch_id?: string;
+  since?: string;
+  until?: string;
   sort?: string;
   order?: 'asc' | 'desc';
 };
@@ -277,6 +344,9 @@ export type MatchWorkbenchOverview = {
     id: string;
     room_id: string;
     status: string;
+    action_state: string;
+    error_code: string | null;
+    current_speech_id: string | null;
     sequence: number;
     context_version: number;
     created_at: string;

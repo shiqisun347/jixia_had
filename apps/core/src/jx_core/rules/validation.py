@@ -38,6 +38,8 @@ class RuleStageDraft(BaseModel):
     end_host_text: str = Field(default="", max_length=2000)
     parameters: dict[str, Any] = Field(default_factory=dict)
     actions: list[StageActionDraft] = Field(default_factory=_empty_actions, max_length=50)
+    speech_prompt: str | None = Field(default=None, min_length=1, max_length=20_000)
+    decision_prompt: str | None = Field(default=None, min_length=1, max_length=20_000)
 
 
 class RuleDraft(BaseModel):
@@ -57,6 +59,8 @@ class RuleDraft(BaseModel):
             raise ValueError("规则必须以且只能以结束阶段结尾")
         for stage in self.stages:
             if stage.stage_kind == "FIXED_SPEECH":
+                if stage.decision_prompt is not None:
+                    raise ValueError("固定发言阶段不接受决策 Prompt")
                 if not stage.actions:
                     raise ValueError("固定发言阶段至少需要一个发言动作")
                 for action in stage.actions:
@@ -80,11 +84,18 @@ class RuleDraft(BaseModel):
                 if starting_side not in {"AFFIRMATIVE", "NEGATIVE"}:
                     raise ValueError("自由辩论起始方无效")
             elif stage.stage_kind == "PREPARATION":
+                if stage.speech_prompt is not None or stage.decision_prompt is not None:
+                    raise ValueError("准备阶段不接受 Agent Prompt")
                 if stage.duration_seconds <= 0:
                     raise ValueError("准备阶段必须设置正数时长")
                 if stage.actions:
                     raise ValueError("准备阶段不接受发言动作")
-            elif stage.actions or stage.duration_seconds:
+            elif (
+                stage.actions
+                or stage.duration_seconds
+                or stage.speech_prompt is not None
+                or stage.decision_prompt is not None
+            ):
                 raise ValueError("结束阶段不能包含动作或时长")
         return self
 

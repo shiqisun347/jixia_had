@@ -20,6 +20,7 @@ import { ApiClientError, authApi } from '@/lib/auth-api';
 import { useToast } from '@/components/ui/toast-provider';
 import { authHrefWithReturnTo, sanitizeAuthReturnTo } from '@/lib/return-to';
 import { avatarAssetUrl, HUMAN_AVATAR_KEYS } from '@/lib/avatar-catalog';
+import { useAppTranslations } from '@/i18n';
 
 import { AuthShell } from './auth-shell';
 import { authQueryKey } from './use-auth';
@@ -54,6 +55,7 @@ function PasswordInput<TFieldValues extends FieldValues>({
   register: UseFormRegister<TFieldValues>;
   error?: string;
 }>) {
+  const t = useAppTranslations('Auth');
   const [visible, setVisible] = useState(false);
   const fieldName = String(name);
   const inputId = `auth-${fieldName}`;
@@ -76,7 +78,7 @@ function PasswordInput<TFieldValues extends FieldValues>({
           className="absolute right-2 top-1/2 grid size-9 -translate-y-1/2 place-items-center rounded-lg text-slate-500 hover:bg-slate-50 hover:text-slate-700"
           onClick={() => setVisible((current) => !current)}
           type="button"
-          aria-label={visible ? '隐藏密码' : '显示密码'}
+          aria-label={visible ? t('hidePassword') : t('showPassword')}
         >
           {visible ? <EyeOff className="size-4" /> : <Eye className="size-4" />}
         </button>
@@ -93,6 +95,7 @@ const loginSchema = z.object({
 type LoginValues = z.infer<typeof loginSchema>;
 
 export function LoginForm() {
+  const t = useAppTranslations('Auth');
   const router = useRouter();
   const searchParams = useSearchParams();
   const queryClient = useQueryClient();
@@ -113,18 +116,18 @@ export function LoginForm() {
 
   return (
     <AuthShell
-      eyebrow="WELCOME BACK"
-      title="继续你的辩论"
-      description="登录后即可进入公开大厅、参加比赛或查看属于你的记录。"
+      eyebrow={t('loginEyebrow')}
+      title={t('loginTitle')}
+      description={t('loginDescription')}
       footer={
         <p className="text-center text-sm text-slate-500">
-          还没有账号？{' '}
+          {t('noAccount')}{' '}
           <Link
             className="font-black text-blue-700 hover:text-blue-900"
             href={registerHref}
             prefetch={false}
           >
-            创建账号
+            {t('createAccount')}
           </Link>
         </p>
       }
@@ -153,7 +156,7 @@ export function LoginForm() {
         })}
       >
         <label className="block text-sm font-bold text-slate-700">
-          用户名
+          {t('username')}
           <input
             {...form.register('username')}
             aria-describedby={form.formState.errors.username ? 'login-username-error' : undefined}
@@ -165,7 +168,7 @@ export function LoginForm() {
         </label>
         <PasswordInput
           name="password"
-          label="密码"
+          label={t('password')}
           register={form.register}
           error={form.formState.errors.password?.message}
         />
@@ -175,7 +178,7 @@ export function LoginForm() {
           ) : (
             <ArrowRight className="size-4" />
           )}
-          {submitting ? '正在登录…' : '登录并进入'}
+          {submitting ? t('loggingIn') : t('loginSubmit')}
         </button>
       </form>
     </AuthShell>
@@ -198,6 +201,7 @@ const registerSchema = z
 type RegisterValues = z.infer<typeof registerSchema>;
 
 export function RegisterForm() {
+  const t = useAppTranslations('Auth');
   const router = useRouter();
   const searchParams = useSearchParams();
   const queryClient = useQueryClient();
@@ -220,18 +224,18 @@ export function RegisterForm() {
 
   return (
     <AuthShell
-      eyebrow="JOIN THE FIELD"
-      title="创建你的账号"
-      description="使用真实姓名加入稷下。用户名只用于登录，比赛页面只展示真实姓名。"
+      eyebrow={t('registerEyebrow')}
+      title={t('registerTitle')}
+      description={t('registerDescription')}
       footer={
         <p className="text-center text-sm text-slate-500">
-          已有账号？{' '}
+          {t('hasAccount')}{' '}
           <Link
             className="font-black text-blue-700 hover:text-blue-900"
             href={loginHref}
             prefetch={false}
           >
-            返回登录
+            {t('backToLogin')}
           </Link>
         </p>
       }
@@ -273,7 +277,7 @@ export function RegisterForm() {
         })}
       >
         <label className="block text-sm font-bold text-slate-700">
-          用户名
+          {t('username')}
           <input
             {...form.register('username')}
             aria-describedby={
@@ -289,7 +293,7 @@ export function RegisterForm() {
           />
         </label>
         <label className="block text-sm font-bold text-slate-700">
-          真实姓名
+          {t('realName')}
           <input
             {...form.register('real_name')}
             aria-describedby={
@@ -306,19 +310,19 @@ export function RegisterForm() {
         </label>
         <PasswordInput
           name="password"
-          label="密码"
+          label={t('password')}
           register={form.register}
           error={form.formState.errors.password?.message}
         />
         <PasswordInput
           name="confirm_password"
-          label="确认密码"
+          label={t('confirmPassword')}
           register={form.register}
           error={form.formState.errors.confirm_password?.message}
         />
         <fieldset>
-          <legend className="text-sm font-bold text-slate-700">选择头像</legend>
-          <p className="mt-1 text-xs text-slate-500">注册后仍可在“我的页面”修改。</p>
+          <legend className="text-sm font-bold text-slate-700">{t('avatar')}</legend>
+          <p className="mt-1 text-xs text-slate-500">{t('avatarDetail')}</p>
           <div
             aria-describedby={
               form.formState.errors.avatar_key ? 'register-avatar-error' : undefined
@@ -326,11 +330,11 @@ export function RegisterForm() {
             aria-invalid={Boolean(form.formState.errors.avatar_key)}
             className="mt-3 grid grid-cols-8 gap-2"
             role="radiogroup"
-            aria-label="选择头像"
+            aria-label={t('avatar')}
           >
             {HUMAN_AVATAR_KEYS.map((key, index) => {
               const selected = selectedAvatar === key;
-              const avatarName = `头像 ${index + 1}`;
+              const avatarName = t('avatarOption', { number: index + 1 });
               return (
                 <label className={`avatar-preset ${selected ? 'is-selected' : ''}`} key={key}>
                   <input
@@ -360,7 +364,7 @@ export function RegisterForm() {
         <label className="flex cursor-pointer items-center gap-3 rounded-xl border border-dashed border-blue-200 bg-blue-50/50 px-4 py-3 text-sm font-semibold text-slate-600">
           <Upload className="size-4 text-blue-600" aria-hidden="true" />
           <span className="min-w-0 flex-1 truncate">
-            {file ? file.name : '可选：上传头像（JPEG、PNG、WebP，2 MB 内）'}
+            {file ? file.name : t('optionalAvatar')}
           </span>
           <input
             className="sr-only"
@@ -380,14 +384,14 @@ export function RegisterForm() {
             type="checkbox"
           />
           <span>
-            我已阅读并同意{' '}
+            {t('acceptTerms')}{' '}
             <Link
               className="font-bold text-blue-700 underline-offset-4 hover:underline"
               href={termsHref}
               prefetch={false}
               target="_blank"
             >
-              平台条款
+              {t('terms')}
             </Link>
           </span>
         </label>
@@ -401,7 +405,7 @@ export function RegisterForm() {
             data-testid="register-terms-error"
             role="alert"
           >
-            <span>平台条款暂时无法加载，创建账号已暂停。</span>
+            <span>{t('termsUnavailable')}</span>
             <button
               className="inline-flex min-h-9 items-center gap-2 rounded-lg border border-rose-300 bg-white px-3 text-xs font-black text-rose-800 hover:bg-rose-100 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-rose-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
               disabled={termsQuery.isFetching}
@@ -412,7 +416,7 @@ export function RegisterForm() {
                 aria-hidden="true"
                 className={`size-3.5 ${termsQuery.isFetching ? 'animate-spin' : ''}`}
               />
-              {termsQuery.isFetching ? '正在加载' : '重新加载条款'}
+              {termsQuery.isFetching ? t('loading') : t('reloadTerms')}
             </button>
           </div>
         ) : null}
@@ -421,9 +425,9 @@ export function RegisterForm() {
             className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm font-semibold text-amber-800"
             role="status"
           >
-            账号已创建，头像可稍后在资料页补充。{' '}
+            {t('accountCreatedAvatarPending')}{' '}
             <Link className="underline" href="/profile" prefetch={false}>
-              去资料页重试
+              {t('retryProfile')}
             </Link>
           </div>
         ) : null}
@@ -433,7 +437,7 @@ export function RegisterForm() {
           ) : (
             <Check className="size-4" />
           )}
-          {submitting ? '正在创建…' : '创建账号'}
+          {submitting ? t('creating') : t('createAccount')}
         </button>
       </form>
     </AuthShell>
@@ -441,19 +445,20 @@ export function RegisterForm() {
 }
 
 export function TermsPageView() {
+  const t = useAppTranslations('Auth');
   const searchParams = useSearchParams();
   const returnTo = sanitizeAuthReturnTo(searchParams.get('return_to'));
   const registerHref = authHrefWithReturnTo('/register', returnTo);
   const query = useQuery({ queryKey: ['legal', 'platform-terms'], queryFn: authApi.currentTerms });
   return (
     <AuthShell
-      eyebrow="PLATFORM TERMS"
-      title="平台条款"
-      description="注册前请了解平台如何使用账号资料与比赛记录。"
+      eyebrow={t('termsEyebrow')}
+      title={t('termsTitle')}
+      description={t('termsDescription')}
       footer={
         <p className="text-center text-sm text-slate-500">
           <Link className="font-bold text-blue-700" href={registerHref} prefetch={false}>
-            返回注册
+            {t('backToRegister')}
           </Link>
         </p>
       }
@@ -465,7 +470,7 @@ export function TermsPageView() {
           data-testid="terms-page-error"
           role="alert"
         >
-          <p>条款暂时无法加载，请重试。</p>
+          <p>{t('termsLoadFailed')}</p>
           <button
             className="mt-4 inline-flex min-h-10 items-center gap-2 rounded-xl border border-rose-300 bg-white px-4 text-sm font-black text-rose-800 hover:bg-rose-100 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-rose-100 disabled:cursor-not-allowed disabled:border-slate-200 disabled:bg-slate-100 disabled:text-slate-400"
             disabled={query.isFetching}
@@ -476,14 +481,14 @@ export function TermsPageView() {
               aria-hidden="true"
               className={`size-4 ${query.isFetching ? 'animate-spin' : ''}`}
             />
-            {query.isFetching ? '正在加载' : '重新加载条款'}
+            {query.isFetching ? t('loading') : t('reloadTerms')}
           </button>
         </div>
       ) : null}
       {query.data ? (
         <article className="rounded-2xl border border-slate-100 bg-slate-50/80 p-5 text-sm leading-7 text-slate-700">
           <p className="mb-3 text-xs font-black tracking-[0.12em] text-blue-700">
-            版本 {query.data.version}
+            {t('version', { version: query.data.version })}
           </p>
           <h2 className="mb-3 text-lg font-black text-slate-950">{query.data.title}</h2>
           <p>{query.data.body}</p>

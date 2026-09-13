@@ -21,6 +21,7 @@ from .auth.dependencies import (
 )
 from .auth.errors import APIError
 from .auth.session import AuthContext
+from .experiments.visibility import can_view_experiment_result
 from .models import (
     AgentProfile,
     BackgroundTask,
@@ -61,6 +62,7 @@ class PostmatchResponse(BaseModel):
     participants: list[ParticipantView]
     submissions: list[dict[str, Any]]
     judge: dict[str, Any] | None
+    result_restricted: bool = False
     can_retry_judge: bool = False
     archived_at: datetime | None
     files: list[dict[str, Any]]
@@ -151,6 +153,12 @@ async def _response(session: AsyncSession, match: Match, context: AuthContext) -
         .limit(1)
     )
     is_participant = await _is_participant(session, match.id, context.user_id)
+    can_view_result = await can_view_experiment_result(
+        session,
+        match_id=match.id,
+        user_id=context.user_id,
+        role=context.role,
+    )
     can_retry_judge = can_retry_judge_for_viewer(
         match_status=match.status,
         judge_status=judge.status if judge else None,
@@ -219,9 +227,10 @@ async def _response(session: AsyncSession, match: Match, context: AuthContext) -
             "result": judge.result,
             "error_code": judge.error_code,
         }
-        if judge
+        if judge and can_view_result
         else None,
-        can_retry_judge=can_retry_judge,
+        result_restricted=judge is not None and not can_view_result,
+        can_retry_judge=can_retry_judge and can_view_result,
         archived_at=match.archived_at,
         files=[
             {

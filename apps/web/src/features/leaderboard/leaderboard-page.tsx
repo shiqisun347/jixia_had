@@ -5,6 +5,7 @@ import { useEffect, useMemo, useState } from 'react';
 
 import { requestJson } from '@/lib/auth-api';
 import { avatarAssetUrl } from '@/lib/avatar-catalog';
+import { useAppLocale, useAppTranslations } from '@/i18n';
 
 type RankingRow = {
   rank: number;
@@ -19,6 +20,8 @@ type RankingRow = {
 type Leaderboards = { generated_at: string | null; human: RankingRow[]; agent: RankingRow[] };
 
 export function LeaderboardPage() {
+  const { locale } = useAppLocale();
+  const t = useAppTranslations('Leaderboard');
   const [kind, setKind] = useState<'human' | 'agent'>('human');
   const [query, setQuery] = useState('');
   const [data, setData] = useState<Leaderboards | null>(null);
@@ -55,11 +58,11 @@ export function LeaderboardPage() {
     );
   }, [data, kind, query]);
   const updatedAt = data?.generated_at
-    ? new Date(data.generated_at).toLocaleString('zh-CN', {
+    ? new Date(data.generated_at).toLocaleString(locale, {
         dateStyle: 'medium',
         timeStyle: 'short',
       })
-    : '暂无快照';
+    : t('noSnapshot');
   const switchKind = (next: 'human' | 'agent') => {
     setKind(next);
     setQuery('');
@@ -76,17 +79,17 @@ export function LeaderboardPage() {
       <div className="mx-auto max-w-6xl px-6 pb-16 pt-10 xl:px-10">
         <header className="flex flex-wrap items-end justify-between gap-5">
           <div>
-            <p className="text-xs font-black tracking-[0.18em] text-blue-600">DAILY SNAPSHOT</p>
-            <h1 className="mt-2 text-4xl font-black tracking-tight">辩手排行榜</h1>
-            <p className="mt-3 text-sm text-slate-500">按每日比赛评分快照更新，展示全部参赛者。</p>
+            <p className="text-xs font-black tracking-[0.18em] text-blue-600">{t('eyebrow')}</p>
+            <h1 className="mt-2 text-4xl font-black tracking-tight">{t('title')}</h1>
+            <p className="mt-3 text-sm text-slate-500">{t('description')}</p>
           </div>
-          <span className="text-sm text-slate-500">最近更新：{updatedAt}</span>
+          <span className="text-sm text-slate-500">{t('updatedAt', { time: updatedAt })}</span>
         </header>
         <div className="mt-8 flex flex-wrap items-center justify-between gap-4">
           <div
             className="inline-flex rounded-xl border border-slate-200 bg-white p-1 shadow-sm"
             role="tablist"
-            aria-label="排行榜类型"
+            aria-label={t('kind')}
           >
             <button
               className={`rounded-lg px-5 py-2.5 text-sm font-bold ${kind === 'human' ? 'bg-red-50 text-red-700' : 'text-slate-500 hover:bg-slate-50'}`}
@@ -96,7 +99,7 @@ export function LeaderboardPage() {
               type="button"
             >
               <UserRound className="mr-2 inline size-4" />
-              人类辩手
+              {t('humans')}
             </button>
             <button
               className={`rounded-lg px-5 py-2.5 text-sm font-bold ${kind === 'agent' ? 'bg-blue-50 text-blue-700' : 'text-slate-500 hover:bg-slate-50'}`}
@@ -106,7 +109,7 @@ export function LeaderboardPage() {
               type="button"
             >
               <Bot className="mr-2 inline size-4" />
-              Agent 辩手
+              {t('agents')}
             </button>
           </div>
           <label className="relative block w-full max-w-xs">
@@ -114,12 +117,12 @@ export function LeaderboardPage() {
               className="pointer-events-none absolute left-3 top-3 size-4 text-slate-400"
               aria-hidden="true"
             />
-            <span className="sr-only">搜索排行榜</span>
+            <span className="sr-only">{t('search')}</span>
             <input
               className="h-10 w-full rounded-xl border border-slate-200 bg-white pl-9 pr-3 text-sm outline-none focus:border-blue-500 focus:ring-4 focus:ring-blue-100"
               value={query}
               onChange={(event) => setQuery(event.target.value)}
-              placeholder="搜索姓名或编号"
+              placeholder={t('searchPlaceholder')}
             />
           </label>
         </div>
@@ -128,42 +131,42 @@ export function LeaderboardPage() {
           aria-live="polite"
         >
           {loading ? (
-            <div aria-label="正在加载排行榜" className="p-14 text-center" role="status">
+            <div aria-label={t('loading')} className="p-14 text-center" role="status">
               <Trophy className="mx-auto size-8 animate-pulse text-blue-300 motion-reduce:animate-none" />
-              <p className="mt-3 text-sm font-bold text-slate-500">正在加载排行榜…</p>
+              <p className="mt-3 text-sm font-bold text-slate-500">{t('loading')}</p>
             </div>
           ) : error ? (
             <div className="p-10 text-center">
-              <p className="text-sm font-bold text-red-600">排行榜暂时无法加载。</p>
+              <p className="text-sm font-bold text-red-600">{t('loadFailed')}</p>
               <button
                 className="mt-4 inline-flex min-h-10 items-center justify-center rounded-xl bg-blue-600 px-4 py-2 text-sm font-bold text-white shadow-sm transition hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-blue-100 focus-visible:ring-offset-2"
                 onClick={retry}
                 type="button"
               >
-                重新加载
+                {t('reload')}
               </button>
             </div>
           ) : rows.length === 0 ? (
             <div className="p-14 text-center">
               <Trophy className="mx-auto size-8 text-slate-300" />
               <p className="mt-3 text-sm font-bold text-slate-600">
-                {query.trim() ? '没有找到匹配的辩手' : '当前暂无可展示的排名'}
+                {query.trim() ? t('noMatch') : t('empty')}
               </p>
               {!query.trim() && !data?.generated_at ? (
-                <p className="mt-2 text-xs text-slate-500">每日排名快照生成后会显示在这里。</p>
+                <p className="mt-2 text-xs text-slate-500">{t('emptyDetail')}</p>
               ) : null}
             </div>
           ) : (
-            <div className="overflow-x-auto">
+            <div className="overflow-x-auto" role="region" aria-label={t('table')} tabIndex={0}>
               <table className="w-full min-w-[680px] text-left text-sm">
                 <thead className="bg-slate-50 text-xs font-black text-slate-500">
                   <tr>
-                    <th className="px-6 py-4">排名</th>
-                    <th className="px-6 py-4">辩手</th>
-                    <th className="px-6 py-4">积分</th>
-                    <th className="px-6 py-4">场次</th>
-                    <th className="px-6 py-4">胜场</th>
-                    <th className="px-6 py-4">个人均分</th>
+                    <th className="px-6 py-4">{t('rank')}</th>
+                    <th className="px-6 py-4">{t('debater')}</th>
+                    <th className="px-6 py-4">{t('points')}</th>
+                    <th className="px-6 py-4">{t('matches')}</th>
+                    <th className="px-6 py-4">{t('wins')}</th>
+                    <th className="px-6 py-4">{t('averageScore')}</th>
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">

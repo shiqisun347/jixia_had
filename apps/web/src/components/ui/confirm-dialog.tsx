@@ -5,6 +5,7 @@ import { type ReactNode, useEffect, useRef } from 'react';
 import { AlertDialog } from 'radix-ui';
 
 import { Button } from './button';
+import { useAppTranslations } from '@/i18n';
 
 type ConfirmDialogProps = {
   open: boolean;
@@ -24,13 +25,14 @@ export function ConfirmDialog({
   onOpenChange,
   title,
   description,
-  confirmLabel = '确认',
-  cancelLabel = '取消',
+  confirmLabel,
+  cancelLabel,
   onConfirm,
   loading = false,
   tone = 'danger',
   icon,
 }: ConfirmDialogProps) {
+  const t = useAppTranslations('Common');
   const Icon = tone === 'danger' ? AlertTriangle : Info;
   const synchronousClickGate = useRef(false);
   const contentRef = useRef<HTMLDivElement | null>(null);
@@ -98,7 +100,7 @@ export function ConfirmDialog({
           <div className="mt-6 flex justify-end gap-2">
             <AlertDialog.Cancel asChild>
               <Button disabled={loading} variant="secondary">
-                {cancelLabel}
+                {cancelLabel ?? t('cancel')}
               </Button>
             </AlertDialog.Cancel>
             <Button
@@ -108,7 +110,7 @@ export function ConfirmDialog({
               variant={tone === 'danger' ? 'danger' : 'primary'}
             >
               {loading ? <LoaderCircle className="size-4 animate-spin" aria-hidden="true" /> : null}
-              {loading ? '正在处理' : confirmLabel}
+              {loading ? t('processing') : (confirmLabel ?? t('confirm'))}
             </Button>
           </div>
         </AlertDialog.Content>

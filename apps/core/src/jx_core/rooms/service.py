@@ -8,29 +8,38 @@ import shutil
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 from uuid import UUID
 
 from sqlalchemy import and_, func, not_, select, true, update
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..auth.errors import AuthError
+from ..experiments.permissions import is_experiment_side_controller, resolve_room_link
 from ..legal.terms import get_current_human_participation_terms
 from ..models import (
     AgentProfile,
+    AgentPromptOverride,
+    BrowserDeviceCheck,
     CapacityGuard,
     DeviceCheck,
+    ExperimentMatchAttempt,
     HostAudioAsset,
     Match,
     ModelProfile,
     Room,
     RoomMember,
     Rule,
+    RuleJudgeConfig,
     RuleStage,
+    ScheduledMatch,
     Seat,
     SeatSwapRequest,
     StageAction,
+    StagePromptTemplate,
     Topic,
     User,
     UserConsent,
@@ -65,7 +74,7 @@ def ensure_storage_capacity(
 ROOM_CODE_ALPHABET = "0123456789"
 ROOM_CODE_PATTERN = re.compile(r"^\d{6}$")
 LEGACY_ROOM_CODE_PATTERN = re.compile(r"^[23456789ABCDEFGHJKMNPQRSTUVWXYZ]{6}$")
-DEVICE_CHECK_TTL = timedelta(minutes=30)
+DEVICE_CHECK_TTL = timedelta(hours=24)
 ACTIVE_ROOM_STATUSES = ("START_PENDING_RUNTIME", "RUNNING", "PAUSED")
 
 
@@ -97,7 +106,130 @@ def ensure_unique_agent_ids(agent_ids: list[UUID]) -> None:
         raise AuthError("agent_duplicate_in_room")
 
 
+def ensure_supported_side_size(side_size: int) -> None:
+    if side_size != 4:
+        raise AuthError("rule_unavailable")
+
+
 class RoomService:
+    @staticmethod
+    def _device_token_hash(token: str) -> str:
+        return sha256(token.encode("ascii")).hexdigest()
+
+    async def issue_browser_device_check(
+        self,
+        database_session: AsyncSession,
+        *,
+        user_id: UUID,
+        check: DeviceCheck,
+        token: str | None = None,
+    ) -> str:
+        raw_token = token or secrets.token_urlsafe(32)
+        current = datetime.now(UTC)
+        async with database_session.begin():
+            await database_session.execute(
+                sa_delete(BrowserDeviceCheck).where(
+                    BrowserDeviceCheck.user_id == user_id,
+                    BrowserDeviceCheck.token_hash == self._device_token_hash(raw_token),
+                )
+            )
+            database_session.add(
+                BrowserDeviceCheck(
+                    user_id=user_id,
+                    token_hash=self._device_token_hash(raw_token),
+                    status=check.status,
+                    details=check.details,
+                    issued_at=current,
+                    valid_until=current + DEVICE_CHECK_TTL,
+                )
+            )
+        return raw_token
+
+    async def reuse_browser_device_check(
+        self,
+        database_session: AsyncSession,
+        *,
+        user_id: UUID,
+        room_id: UUID,
+        token: str,
+    ) -> DeviceCheck:
+        current = datetime.now(UTC)
+        async with database_session.begin():
+            room = await database_session.get(Room, room_id, with_for_update=True)
+            member = await database_session.scalar(
+                select(RoomMember).where(
+                    RoomMember.room_id == room_id,
+                    RoomMember.user_id == user_id,
+                    RoomMember.left_at.is_(None),
+                    RoomMember.member_role == "DEBATER",
+                ).with_for_update()
+            )
+            browser_check = await database_session.scalar(
+                select(BrowserDeviceCheck).where(
+                    BrowserDeviceCheck.user_id == user_id,
+                    BrowserDeviceCheck.token_hash == self._device_token_hash(token),
+                    BrowserDeviceCheck.status.in_(("PASS", "WARN")),
+                    BrowserDeviceCheck.valid_until > current,
+                ).with_for_update()
+            )
+            if room is None or room.status in ("FINISHED", "TERMINATED"):
+                raise AuthError("room_unavailable")
+            if member is None:
+                raise AuthError("room_member_required")
+            if browser_check is None:
+                raise AuthError("device_check_required")
+            latest_version = await database_session.scalar(
+                select(func.max(DeviceCheck.check_version)).where(
+                    DeviceCheck.room_id == room_id, DeviceCheck.user_id == user_id
+                )
+            )
+            check = DeviceCheck(
+                room_id=room_id,
+                user_id=user_id,
+                check_version=int(latest_version or 0) + 1,
+                status=browser_check.status,
+                details=browser_check.details,
+                warning_confirmed_at=current if browser_check.status == "WARN" else None,
+                checked_at=current,
+                valid_until=browser_check.valid_until,
+            )
+            database_session.add(check)
+            member.ready = False
+            room.sequence += 1
+            await database_session.flush()
+        return check
+    async def available_agent_ids(
+        self,
+        database_session: AsyncSession,
+        *,
+        rule_id: UUID | None = None,
+        format_version_id: UUID | None = None,
+        excluded_ids: set[UUID] | None = None,
+    ) -> list[UUID]:
+        if rule_id is None and format_version_id is None:
+            return []
+        filters = [
+            AgentProfile.status == "ENABLED",
+            ModelProfile.status == "ENABLED",
+            VoiceProfile.status == "ENABLED",
+        ]
+        if rule_id is not None:
+            filters.append(AgentProfile.rule_id == rule_id)
+        else:
+            filters.append(AgentProfile.format_version_id == format_version_id)
+        if excluded_ids:
+            filters.append(AgentProfile.id.not_in(excluded_ids))
+        return list(
+            (
+                await database_session.scalars(
+                    select(AgentProfile.id)
+                    .join(ModelProfile, ModelProfile.id == AgentProfile.model_profile_id)
+                    .join(VoiceProfile, VoiceProfile.id == AgentProfile.voice_profile_id)
+                    .where(*filters)
+                )
+            ).all()
+        )
+
     async def _cancel_user_seat_swaps(
         self, database_session: AsyncSession, *, room_id: UUID, user_id: UUID
     ) -> None:
@@ -124,6 +256,9 @@ class RoomService:
             room = await database_session.get(Room, room_id, with_for_update=True)
             if room is None or room.status != "WAITING" or room.is_all_agent:
                 raise AuthError("seat_swap_forbidden")
+            experiment_link = await resolve_room_link(database_session, room_id=room_id)
+            if experiment_link is not None and experiment_link.scheduled_match_kind == "FORMAL":
+                raise AuthError("experiment_fixed_seats")
             members = list(
                 (
                     await database_session.scalars(
@@ -231,6 +366,9 @@ class RoomService:
                 or request.status != "PENDING"
             ):
                 raise AuthError("seat_swap_not_found")
+            experiment_link = await resolve_room_link(database_session, room_id=room_id)
+            if experiment_link is not None and experiment_link.scheduled_match_kind == "FORMAL":
+                raise AuthError("experiment_fixed_seats")
             if request.target_user_id != user_id:
                 raise AuthError("seat_swap_forbidden")
             if payload.decision == "REJECT":
@@ -281,7 +419,7 @@ class RoomService:
             raise AuthError("seat_swap_stale")
         return request
 
-    async def _assert_spectator_capacity(self, database_session: AsyncSession) -> None:
+    async def assert_spectator_capacity(self, database_session: AsyncSession) -> None:
         await database_session.execute(
             select(CapacityGuard).where(CapacityGuard.id == 1).with_for_update()
         )
@@ -328,19 +466,12 @@ class RoomService:
         if agent_id in used_agent_ids:
             agent_id = None
         if agent_id is None and room.auto_fill_agents:
-            agent_id = await database_session.scalar(
-                select(AgentProfile.id)
-                .join(ModelProfile, ModelProfile.id == AgentProfile.model_profile_id)
-                .join(VoiceProfile, VoiceProfile.id == AgentProfile.voice_profile_id)
-                .where(
-                    AgentProfile.status == "ENABLED",
-                    ModelProfile.status == "ENABLED",
-                    VoiceProfile.status == "ENABLED",
-                    AgentProfile.id.not_in(used_agent_ids) if used_agent_ids else true(),
-                )
-                .order_by(AgentProfile.created_at, AgentProfile.id)
-                .limit(1)
+            candidates = await self.available_agent_ids(
+                database_session,
+                rule_id=room.rule_id,
+                excluded_ids={item for item in used_agent_ids if item is not None},
             )
+            agent_id = secrets.choice(candidates) if candidates else None
             seat.configured_agent_profile_id = agent_id
         seat.user_id = None
         seat.agent_profile_id = agent_id
@@ -410,7 +541,7 @@ class RoomService:
         if owned is not None:
             raise AuthError("room_owner_conflict")
 
-    async def _rule_snapshot(
+    async def load_rule_snapshot(
         self, database_session: AsyncSession, *, rule_id: UUID
     ) -> tuple[Rule, dict[str, Any]]:
         rule = await database_session.get(Rule, rule_id)
@@ -482,9 +613,159 @@ class RoomService:
                     "segment_key": asset.segment_key,
                     "storage_path": asset.storage_path,
                     "text_hash": asset.text_hash,
+                    "duration_ms": asset.duration_ms,
                 }
                 for asset in audio_assets
             ],
+        }
+
+    async def load_rule_config_snapshot(
+        self,
+        database_session: AsyncSession,
+        *,
+        rule: Rule,
+    ) -> dict[str, Any]:
+        agents = list(
+            (
+                await database_session.scalars(
+                    select(AgentProfile)
+                    .where(AgentProfile.rule_id == rule.id)
+                    .order_by(AgentProfile.name, AgentProfile.id)
+                )
+            ).all()
+        )
+        model_ids = {agent.model_profile_id for agent in agents}
+        voice_ids = {agent.voice_profile_id for agent in agents}
+        judge = await database_session.get(RuleJudgeConfig, rule.id)
+        if judge is not None and judge.model_profile_id is not None:
+            model_ids.add(judge.model_profile_id)
+        models = list(
+            (
+                await database_session.scalars(
+                    select(ModelProfile).where(ModelProfile.id.in_(model_ids))
+                )
+            ).all()
+        )
+        voices = list(
+            (
+                await database_session.scalars(
+                    select(VoiceProfile).where(VoiceProfile.id.in_(voice_ids))
+                )
+            ).all()
+        )
+        model_by_id = {model.id: model for model in models}
+        voice_by_id = {voice.id: voice for voice in voices}
+        stages = list(
+            (
+                await database_session.scalars(
+                    select(RuleStage)
+                    .where(RuleStage.rule_id == rule.id)
+                    .order_by(RuleStage.position)
+                )
+            ).all()
+        )
+        stage_ids = [stage.id for stage in stages]
+        defaults = (
+            list(
+                (
+                    await database_session.scalars(
+                        select(StagePromptTemplate).where(
+                            StagePromptTemplate.stage_id.in_(stage_ids)
+                        )
+                    )
+                ).all()
+            )
+            if stage_ids
+            else []
+        )
+        agent_ids = [agent.id for agent in agents]
+        overrides = (
+            list(
+                (
+                    await database_session.scalars(
+                        select(AgentPromptOverride).where(
+                            AgentPromptOverride.agent_profile_id.in_(agent_ids)
+                        )
+                    )
+                ).all()
+            )
+            if agent_ids
+            else []
+        )
+        stage_key = {stage.id: f"stage-{stage.position}" for stage in stages}
+
+        def prompt_snapshot(prompt: StagePromptTemplate | AgentPromptOverride) -> dict[str, Any]:
+            return {
+                "agent_profile_id": (
+                    str(prompt.agent_profile_id)
+                    if isinstance(prompt, AgentPromptOverride)
+                    else None
+                ),
+                "stage_key": stage_key[prompt.stage_id],
+                "purpose": prompt.purpose,
+                "template_text": prompt.template_text,
+                "variables": list(prompt.variables),
+                "output_contract": prompt.output_contract,
+            }
+
+        return {
+            "schema": "rule-config-v1",
+            "rule_id": str(rule.id),
+            "rule_key": rule.rule_key,
+            "config_revision": rule.config_revision,
+            "postmatch_questionnaire_enabled": rule.postmatch_questionnaire_enabled,
+            "agents": [
+                {
+                    "id": str(agent.id),
+                    "name": agent.name,
+                    "status": agent.status,
+                    "model": {
+                        "id": str(model_by_id[agent.model_profile_id].id),
+                        "name": model_by_id[agent.model_profile_id].name,
+                        "base_url": model_by_id[agent.model_profile_id].base_url,
+                        "model_id": model_by_id[agent.model_profile_id].model_id,
+                        "max_concurrency": model_by_id[agent.model_profile_id].max_concurrency,
+                        "token_per_char": model_by_id[agent.model_profile_id].token_per_char,
+                        "generation_params": dict(
+                            model_by_id[agent.model_profile_id].generation_params
+                        ),
+                    },
+                    "voice": {
+                        "id": str(voice_by_id[agent.voice_profile_id].id),
+                        "name": voice_by_id[agent.voice_profile_id].name,
+                        "provider_voice": voice_by_id[agent.voice_profile_id].provider_voice,
+                        "rate": voice_by_id[agent.voice_profile_id].rate,
+                        "chars_per_second": voice_by_id[agent.voice_profile_id].chars_per_second,
+                        "playback_gain": voice_by_id[agent.voice_profile_id].playback_gain,
+                        "avatar_key": voice_by_id[agent.voice_profile_id].avatar_key,
+                    },
+                    "generation_params": dict(agent.generation_params),
+                }
+                for agent in agents
+            ],
+            "prompts": [prompt_snapshot(prompt) for prompt in [*defaults, *overrides]],
+            "judge": (
+                {
+                    "enabled": judge.enabled,
+                    "model": (
+                        {
+                            "id": str(model_by_id[judge.model_profile_id].id),
+                            "name": model_by_id[judge.model_profile_id].name,
+                            "base_url": model_by_id[judge.model_profile_id].base_url,
+                            "model_id": model_by_id[judge.model_profile_id].model_id,
+                            "generation_params": dict(
+                                model_by_id[judge.model_profile_id].generation_params
+                            ),
+                        }
+                        if judge.model_profile_id is not None
+                        else None
+                    ),
+                    "judge_prompt": judge.judge_prompt,
+                    "include_in_leaderboard": judge.include_in_leaderboard,
+                }
+                if judge is not None
+                else None
+            ),
         }
 
     async def _topic_snapshot(
@@ -531,9 +812,10 @@ class RoomService:
                 await self._assert_no_active_participation(
                     database_session, user_id=organizer_user_id
                 )
-            rule, rule_snapshot = await self._rule_snapshot(
+            rule, rule_snapshot = await self.load_rule_snapshot(
                 database_session, rule_id=payload.rule_id
             )
+            ensure_supported_side_size(rule.side_size)
             topic_id, topic_snapshot = await self._topic_snapshot(database_session, payload=payload)
             if not payload.is_all_agent:
                 await self._require_consent(
@@ -541,50 +823,18 @@ class RoomService:
                     user_id=organizer_user_id,
                     version=payload.human_participation_terms_version,
                 )
-            assignments = {
-                (item.side, item.seat_no): item.agent_profile_id
-                for item in payload.agent_assignments
-            }
-            if len(assignments) != len(payload.agent_assignments):
-                raise AuthError("seat_unavailable")
-            ensure_unique_agent_ids([item.agent_profile_id for item in payload.agent_assignments])
-            for item in payload.agent_assignments:
-                if item.seat_no > rule.side_size:
-                    raise AuthError("seat_unavailable")
-                agent = await database_session.get(AgentProfile, item.agent_profile_id)
-                if agent is None or agent.status != "ENABLED":
-                    raise AuthError("agent_unavailable")
-                model = await database_session.get(ModelProfile, agent.model_profile_id)
-                voice = await database_session.get(VoiceProfile, agent.voice_profile_id)
-                if (
-                    model is None
-                    or model.status != "ENABLED"
-                    or voice is None
-                    or voice.status != "ENABLED"
-                ):
-                    raise AuthError("agent_unavailable")
-            configured_agent_ids = set(assignments.values())
-            available_agent_ids = list(
-                (
-                    await database_session.scalars(
-                        select(AgentProfile.id)
-                        .join(ModelProfile, ModelProfile.id == AgentProfile.model_profile_id)
-                        .join(VoiceProfile, VoiceProfile.id == AgentProfile.voice_profile_id)
-                        .where(
-                            AgentProfile.status == "ENABLED",
-                            ModelProfile.status == "ENABLED",
-                            VoiceProfile.status == "ENABLED",
-                            AgentProfile.id.not_in(configured_agent_ids)
-                            if configured_agent_ids
-                            else true(),
-                        )
-                        .order_by(AgentProfile.created_at, AgentProfile.id)
-                    )
-                ).all()
+            format_snapshot = await self.load_rule_config_snapshot(database_session, rule=rule)
+            available_agent_ids = await self.available_agent_ids(
+                database_session,
+                rule_id=rule.id,
             )
-            required_agent_count = 2 * rule.side_size - len(assignments)
+            required_agent_count = 2 * rule.side_size
             if len(available_agent_ids) < required_agent_count:
                 raise AuthError("agent_capacity_insufficient")
+            available_agent_ids = secrets.SystemRandom().sample(
+                available_agent_ids, required_agent_count
+            )
+            assignments: dict[tuple[str, int], UUID] = {}
             next_agent = 0
             for side in ("AFFIRMATIVE", "NEGATIVE"):
                 for seat_no in range(1, rule.side_size + 1):
@@ -608,6 +858,8 @@ class RoomService:
                 topic_snapshot=topic_snapshot,
                 rule_id=rule.id,
                 rule_snapshot=rule_snapshot,
+                format_version_id=None,
+                format_snapshot=format_snapshot,
                 organizer_user_id=organizer_user_id,
                 is_all_agent=payload.is_all_agent,
                 auto_fill_agents=True,
@@ -658,7 +910,40 @@ class RoomService:
                     RoomMember.user_id == user_id,
                 )
             )
+            experiment_link = await resolve_room_link(database_session, room_id=room_id)
+            if experiment_link is not None and experiment_link.scheduled_match_kind == "FORMAL":
+                if existing is not None and existing.member_role == "DEBATER":
+                    raise AuthError("experiment_use_appointment")
+                if payload.member_role != "SPECTATOR":
+                    raise AuthError("experiment_fixed_seats")
+                await self.assert_spectator_capacity(database_session)
+                if existing is None:
+                    member = RoomMember(
+                        room_id=room_id,
+                        user_id=user_id,
+                        member_role="SPECTATOR",
+                        online=True,
+                        ready=False,
+                    )
+                    database_session.add(member)
+                else:
+                    member = existing
+                    member.member_role = "SPECTATOR"
+                    member.left_at = None
+                    member.online = True
+                    member.ready = False
+                room.sequence += 1
+                await database_session.flush()
+                return member
             if existing is not None and existing.left_at is None:
+                # Re-entering an existing waiting-room membership is the room-level
+                # reconnect path. A previous browser/session disconnect may already
+                # have marked the member offline; leaving it stale blocks an otherwise
+                # fully prepared room from starting.
+                if not existing.online:
+                    existing.online = True
+                    room.sequence += 1
+                    await database_session.flush()
                 return existing
             if room.status != "WAITING" and payload.member_role != "SPECTATOR":
                 raise AuthError("room_locked")
@@ -672,7 +957,7 @@ class RoomService:
                     version=payload.human_participation_terms_version,
                 )
             if payload.member_role == "SPECTATOR":
-                await self._assert_spectator_capacity(database_session)
+                await self.assert_spectator_capacity(database_session)
             if existing is None:
                 member = RoomMember(
                     room_id=room_id, user_id=user_id, member_role=payload.member_role
@@ -686,6 +971,35 @@ class RoomService:
                 member.ready = False
             room.sequence += 1
             await database_session.flush()
+        return member
+
+    async def reconnect_room_member(
+        self,
+        database_session: AsyncSession,
+        *,
+        user_id: UUID,
+        room_id: UUID,
+    ) -> RoomMember:
+        """Mark an already active room member online after an authenticated page re-entry."""
+        async with database_session.begin():
+            room = await database_session.get(Room, room_id, with_for_update=True)
+            if room is None or room.status in ("FINISHED", "TERMINATED"):
+                raise AuthError("room_unavailable")
+            member = await database_session.scalar(
+                select(RoomMember)
+                .where(
+                    RoomMember.room_id == room_id,
+                    RoomMember.user_id == user_id,
+                    RoomMember.left_at.is_(None),
+                )
+                .with_for_update()
+            )
+            if member is None:
+                raise AuthError("room_member_required")
+            if not member.online:
+                member.online = True
+                room.sequence += 1
+                await database_session.flush()
         return member
 
     async def select_seat(
@@ -703,6 +1017,9 @@ class RoomService:
             room = await database_session.get(Room, room_id, with_for_update=True)
             if room is None or room.status != "WAITING":
                 raise AuthError("room_locked")
+            experiment_link = await resolve_room_link(database_session, room_id=room_id)
+            if experiment_link is not None and experiment_link.scheduled_match_kind == "FORMAL":
+                raise AuthError("experiment_fixed_seats")
             if room.is_all_agent:
                 raise AuthError("forbidden")
             member = await database_session.scalar(
@@ -789,6 +1106,9 @@ class RoomService:
             )
             if room is None or room.status != "WAITING" or member is None:
                 raise AuthError("room_locked")
+            experiment_link = await resolve_room_link(database_session, room_id=room_id)
+            if experiment_link is not None and experiment_link.scheduled_match_kind == "FORMAL":
+                raise AuthError("experiment_fixed_seats")
             if member.member_role == "ORGANIZER":
                 raise AuthError("forbidden")
             if member.member_role == payload.member_role:
@@ -803,7 +1123,7 @@ class RoomService:
                     version=payload.human_participation_terms_version,
                 )
             else:
-                await self._assert_spectator_capacity(database_session)
+                await self.assert_spectator_capacity(database_session)
                 seat = await database_session.scalar(
                     select(Seat)
                     .where(Seat.room_id == room_id, Seat.user_id == user_id)
@@ -948,6 +1268,15 @@ class RoomService:
             await database_session.flush()
         return room
 
+    async def revoke_browser_device_check(
+        self, database_session: AsyncSession, *, user_id: UUID, token: str | None = None
+    ) -> None:
+        async with database_session.begin():
+            filters = [BrowserDeviceCheck.user_id == user_id]
+            if token:
+                filters.append(BrowserDeviceCheck.token_hash == self._device_token_hash(token))
+            await database_session.execute(sa_delete(BrowserDeviceCheck).where(*filters))
+
     async def start_room(
         self,
         database_session: AsyncSession,
@@ -964,8 +1293,20 @@ class RoomService:
             room = await database_session.get(Room, room_id, with_for_update=True)
             if room is None or room.status != "WAITING":
                 raise AuthError("room_unavailable")
-            if actor_role != "ADMIN" and room.organizer_user_id != actor_user_id:
-                raise AuthError("forbidden")
+            experiment_link = await resolve_room_link(database_session, room_id=room_id)
+            if experiment_link is None:
+                if actor_role != "ADMIN" and room.organizer_user_id != actor_user_id:
+                    raise AuthError("forbidden")
+            elif actor_role != "ADMIN":
+                if experiment_link.scheduled_match_kind == "TRAINING":
+                    if room.organizer_user_id != actor_user_id:
+                        raise AuthError("forbidden")
+                elif not await is_experiment_side_controller(
+                    database_session,
+                    scheduled_match_id=experiment_link.scheduled_match_id,
+                    user_id=actor_user_id,
+                ):
+                    raise AuthError("forbidden")
             await database_session.execute(
                 select(CapacityGuard).where(CapacityGuard.id == 1).with_for_update()
             )
@@ -1081,6 +1422,14 @@ class RoomService:
                 if previous_member is not None and previous_member.left_at is not None:
                     return room
                 raise AuthError("room_member_required")
+            experiment_link = await resolve_room_link(database_session, room_id=room_id)
+            if experiment_link is not None and experiment_link.scheduled_match_kind == "FORMAL":
+                member.left_at = current
+                member.online = False
+                member.ready = False
+                room.sequence += 1
+                await database_session.flush()
+                return room
             if room.status == "WAITING":
                 await self._cancel_user_seat_swaps(
                     database_session, room_id=room_id, user_id=user_id
@@ -1135,12 +1484,40 @@ class RoomService:
             room = await database_session.get(Room, room_id, with_for_update=True)
             if room is None:
                 raise AuthError("room_unavailable")
-            if actor_role != "ADMIN" and room.organizer_user_id != actor_user_id:
-                raise AuthError("forbidden")
+            experiment_link = await resolve_room_link(database_session, room_id=room_id)
+            if experiment_link is None:
+                if actor_role != "ADMIN" and room.organizer_user_id != actor_user_id:
+                    raise AuthError("forbidden")
+            elif actor_role != "ADMIN":
+                if experiment_link.scheduled_match_kind == "TRAINING":
+                    if room.organizer_user_id != actor_user_id:
+                        raise AuthError("forbidden")
+                elif not await is_experiment_side_controller(
+                    database_session,
+                    scheduled_match_id=experiment_link.scheduled_match_id,
+                    user_id=actor_user_id,
+                ):
+                    raise AuthError("forbidden")
             if room.status not in ("FINISHED", "TERMINATED"):
                 room.status = "TERMINATED"
                 room.ended_at = datetime.now(UTC)
                 room.sequence += 1
+                if experiment_link is not None:
+                    attempt = await database_session.get(
+                        ExperimentMatchAttempt,
+                        experiment_link.attempt_id,
+                        with_for_update=True,
+                    )
+                    scheduled = await database_session.get(
+                        ScheduledMatch,
+                        experiment_link.scheduled_match_id,
+                        with_for_update=True,
+                    )
+                    if attempt is None or scheduled is None:
+                        raise AuthError("room_unavailable")
+                    attempt.status = "TERMINATED"
+                    attempt.ended_at = room.ended_at
+                    scheduled.status = "INCOMPLETE"
                 await database_session.flush()
         return room
 

@@ -134,6 +134,7 @@ export const RoomSeatCard = memo(function RoomSeatCard({
   onRequestSwap,
   disabled,
   loading,
+  fixed = false,
 }: Readonly<{
   room: RoomSnapshot;
   side: 'AFFIRMATIVE' | 'NEGATIVE';
@@ -143,28 +144,40 @@ export const RoomSeatCard = memo(function RoomSeatCard({
   onRequestSwap: (targetUserId: string) => void;
   disabled: boolean;
   loading: boolean;
+  fixed?: boolean;
 }>) {
   const seat = room.seats.find((item) => item.side === side && item.seat_no === seatNo);
   if (!seat) return null;
   const own = seat.user_id === currentUserId;
   const human = seat.occupant_type === 'HUMAN';
   const agent = seat.occupant_type === 'AGENT';
-  const actionLabel = own ? '我的席位' : human ? '申请交换席位' : '选择此席位';
+  const actionLabel = fixed
+    ? own
+      ? '我的固定席位'
+      : '固定席位'
+    : own
+      ? '我的席位'
+      : human
+        ? '申请交换席位'
+        : '选择此席位';
   const sideName = side === 'AFFIRMATIVE' ? '正方' : '反方';
   const unavailable = disabled || (human && !seat.user_id);
   const actionTone = own
     ? 'border-lime-400 bg-lime-300 text-slate-950'
-    : unavailable
-      ? 'border-slate-300 bg-slate-200 text-slate-500'
-      : human
-        ? 'border-amber-500 bg-amber-500 text-white'
-        : side === 'AFFIRMATIVE'
-          ? 'border-red-600 bg-red-600 text-white'
-          : 'border-blue-600 bg-blue-600 text-white';
+    : fixed
+      ? 'border-slate-200 bg-white text-slate-600'
+      : unavailable
+        ? 'border-slate-300 bg-slate-200 text-slate-500'
+        : human
+          ? 'border-amber-500 bg-amber-500 text-white'
+          : side === 'AFFIRMATIVE'
+            ? 'border-red-600 bg-red-600 text-white'
+            : 'border-blue-600 bg-blue-600 text-white';
 
   return (
     <button
       aria-label={`${sideName} ${seatNo} 辩，${actionLabel}`}
+      aria-disabled={fixed || undefined}
       aria-pressed={own}
       className={`group grid h-[8.75rem] w-full grid-cols-[3.5rem_minmax(0,1fr)] gap-3 rounded-2xl border p-3.5 text-left transition-[border-color,background-color,box-shadow,transform] focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-blue-200 active:translate-y-px ${
         own
@@ -173,8 +186,13 @@ export const RoomSeatCard = memo(function RoomSeatCard({
             ? 'border-red-100 bg-red-50/45 hover:-translate-y-0.5 hover:border-red-300'
             : 'border-blue-100 bg-blue-50/45 hover:-translate-y-0.5 hover:border-blue-300'
       } disabled:cursor-not-allowed disabled:transform-none disabled:border-slate-300 disabled:bg-slate-100 disabled:text-slate-400 disabled:shadow-none`}
-      disabled={unavailable || own || loading}
-      onClick={() => (human && seat.user_id ? onRequestSwap(seat.user_id) : onSelect())}
+      disabled={(!fixed && unavailable) || own || loading}
+      onClick={() => {
+        if (fixed) return;
+        if (human && seat.user_id) onRequestSwap(seat.user_id);
+        else onSelect();
+      }}
+      tabIndex={fixed ? -1 : undefined}
       type="button"
     >
       <SeatAvatar seat={seat} side={side} />

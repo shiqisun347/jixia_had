@@ -1,4 +1,7 @@
+'use client';
+
 import Image from 'next/image';
+import { useAppLocale } from '@/i18n';
 
 type JixiaLogoProps = {
   compact?: boolean;
@@ -6,18 +9,23 @@ type JixiaLogoProps = {
 };
 
 export function JixiaLogo({ compact = false, className = '' }: JixiaLogoProps) {
+  const { locale } = useAppLocale();
+  const english = locale === 'en';
   return (
     <span className={`jx-brand ${compact ? 'jx-brand--compact' : ''} ${className}`.trim()}>
       <Image
-        alt="稷下"
+        alt={english ? 'JX-Debate' : '稷下'}
         className="jx-brand__mark"
-        height={72}
+        height={88}
         priority
-        src="/assets/logo-ui.webp"
-        width={72}
+        src="/assets/logo-new.jpeg"
+        width={88}
       />
       <span className="jx-brand__copy">
-        <strong>稷下人机交互平台</strong>
+        <strong>
+          {english ? 'JX-Debate' : <>稷下<span className="jx-brand__dot" aria-hidden="true">·</span>争鸣</>}
+        </strong>
+        <small>{english ? 'Multi-person, multi-agent live voice debate platform' : '多人多智能体实时语音交互平台'}</small>
       </span>
     </span>
   );

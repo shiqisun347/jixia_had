@@ -5,6 +5,7 @@ import { expect, userEvent, waitFor, within } from 'storybook/test';
 
 import type { MatchSnapshot, MatchTranscript } from '@/lib/matches-api';
 import type { RoomSnapshot } from '@/lib/rooms-api';
+import { LocaleProvider } from '@/i18n';
 
 import { DebatePageLayout } from './debate-page-layout';
 
@@ -34,6 +35,43 @@ function RuntimeModalHarness(args: LayoutProps) {
         onOpenNetwork={() => setNetworkOpen(true)}
       />
     </>
+  );
+}
+
+function HumanAudioHarness(args: LayoutProps) {
+  const [mutedUserIds, setMutedUserIds] = useState(args.mutedHumanUserIds);
+  const remoteHumanUserIds = args.room.seats.flatMap((seat) =>
+    seat.occupant_type === 'HUMAN' && seat.user_id && seat.user_id !== args.currentUserId
+      ? [seat.user_id]
+      : [],
+  );
+  return (
+    <DebatePageLayout
+      {...args}
+      mutedHumanUserIds={mutedUserIds}
+      onToggleAllHumanOutputMuted={() =>
+        setMutedUserIds((current) =>
+          remoteHumanUserIds.every((userId) => current.includes(userId))
+            ? current.filter((userId) => !remoteHumanUserIds.includes(userId))
+            : [...new Set([...current, ...remoteHumanUserIds])],
+        )
+      }
+      onToggleHumanOutputMuted={(userId) =>
+        setMutedUserIds((current) =>
+          current.includes(userId)
+            ? current.filter((candidate) => candidate !== userId)
+            : [...current, userId],
+        )
+      }
+    />
+  );
+}
+
+function EnglishLocaleHarness(args: LayoutProps) {
+  return (
+    <LocaleProvider initialLocale="en">
+      <DebatePageLayout {...args} />
+    </LocaleProvider>
   );
 }
 
@@ -249,8 +287,10 @@ const baseArgs: LayoutProps = {
   myHandIndex: -1,
   canRaiseHand: false,
   audioStatus: 'ready',
+  playbackStatus: 'ready',
   audioError: null,
   outputMuted: false,
+  mutedHumanUserIds: [],
   commandPending: false,
   leaving: false,
   editingSpeechId: null,
@@ -266,12 +306,67 @@ const baseArgs: LayoutProps = {
   onLeave: () => undefined,
   onEnableAudio: () => undefined,
   onToggleOutputMuted: () => undefined,
+  onToggleAllHumanOutputMuted: () => undefined,
+  onToggleHumanOutputMuted: () => undefined,
   onOpenDrawer: () => undefined,
   onCloseDrawer: () => undefined,
   onEditSpeech: () => undefined,
   onSaveSpeech: () => undefined,
   onDraftTextChange: () => undefined,
 };
+
+const multiHumanRoom = {
+  ...room,
+  seats: room.seats.map((seat) => {
+    if (seat.id === 'a2') {
+      return {
+        ...seat,
+        occupant_type: 'HUMAN',
+        user_id: 'user-014',
+        agent_profile_id: null,
+        occupant_name: '周明远',
+      };
+    }
+    if (seat.id === 'n1') {
+      return {
+        ...seat,
+        occupant_type: 'HUMAN',
+        user_id: 'user-015',
+        agent_profile_id: null,
+        occupant_name: '顾清和',
+      };
+    }
+    return seat;
+  }),
+} as unknown as RoomSnapshot;
+
+const paperExperimentRoom = {
+  ...room,
+  title: '论文实验·正式辩论',
+  seats: room.seats.map((seat) => {
+    const humanSeats: Record<string, { userId: string; name: string; avatar: string }> = {
+      a1: { userId: 'user-013', name: '林知夏', avatar: 'human-01' },
+      a2: { userId: 'user-014', name: '周明远', avatar: 'human-02' },
+      a3: { userId: 'user-015', name: '顾清和', avatar: 'human-03' },
+      n1: { userId: 'user-016', name: '沈安然', avatar: 'human-04' },
+      n2: { userId: 'user-017', name: '陈思语', avatar: 'human-05' },
+      n3: { userId: 'user-018', name: '许沐风', avatar: 'human-06' },
+    };
+    const human = humanSeats[seat.id];
+    if (human) {
+      return {
+        ...seat,
+        occupant_type: 'HUMAN',
+        user_id: human.userId,
+        agent_profile_id: null,
+        occupant_name: human.name,
+        occupant_avatar_key: human.avatar,
+        occupant_avatar_version: 0,
+      };
+    }
+    return seat;
+  }),
+} as unknown as RoomSnapshot;
 
 const meta = {
   title: 'Debate/DebatePageLayout',
@@ -306,6 +401,30 @@ export const LocalOutputMuted: Story = {
     );
   },
 };
+export const HumanAudioControls: Story = {
+  args: { ...baseArgs, room: multiHumanRoom },
+  render: (args) => <HumanAudioHarness {...args} />,
+  async play({ canvasElement }) {
+    const canvas = within(canvasElement);
+    const menuTrigger = canvas.getByRole('button', { name: '真人声音设置' });
+    await userEvent.click(menuTrigger);
+    const page = within(document.body);
+    const affirmativeHuman = page.getByRole('menuitemcheckbox', { name: /周明远.*正方 2 辩/ });
+    const negativeHuman = page.getByRole('menuitemcheckbox', { name: /顾清和.*反方 1 辩/ });
+    await expect(affirmativeHuman).toBeVisible();
+    await expect(negativeHuman).toBeVisible();
+
+    await userEvent.click(affirmativeHuman);
+    await expect(canvas.getByRole('button', { name: '真人声音设置，已静音 1 人' })).toBeVisible();
+
+    const muteAllHumans = page.getByRole('menuitemcheckbox', { name: '静音全部真人' });
+    await userEvent.click(muteAllHumans);
+    await expect(canvas.getByRole('button', { name: '真人声音设置，已静音 2 人' })).toBeVisible();
+
+    await userEvent.click(muteAllHumans);
+    await expect(canvas.getByRole('button', { name: '真人声音设置' })).toBeVisible();
+  },
+};
 export const HumanSpeaking: Story = {
   args: {
     ...baseArgs,
@@ -316,6 +435,34 @@ export const HumanSpeaking: Story = {
       detail: '服务端正在控制发言时长，你可以提前结束。',
     },
     runtime: { ...baseArgs.runtime, interimText: '这是当前正在识别的实时发言' },
+  },
+};
+export const HumanSpeakingEnglishCompact: Story = {
+  render: (args) => <EnglishLocaleHarness {...args} />,
+  parameters: { viewport: { defaultViewport: 'compact' } },
+  args: {
+    ...HumanSpeaking.args,
+  },
+  async play({ canvasElement }) {
+    const canvas = within(canvasElement);
+    const finish = await canvas.findByRole('button', { name: 'Finish early' });
+    const restart = canvas.getByRole('button', { name: 'Restart speech' });
+    await expect(canvas.queryByText('Reset abnormal speech')).not.toBeInTheDocument();
+
+    const audioControls = canvas.getByTestId('match-controls-audio');
+    const speechControls = canvas.getByTestId('match-controls-speech');
+    const systemControls = canvas.getByTestId('match-controls-system');
+    await waitFor(() => {
+      expect(
+        Math.abs(speechControls.clientHeight - audioControls.clientHeight),
+      ).toBeLessThanOrEqual(1);
+      expect(
+        Math.abs(speechControls.clientHeight - systemControls.clientHeight),
+      ).toBeLessThanOrEqual(1);
+      expect(
+        Math.abs(finish.getBoundingClientRect().top - restart.getBoundingClientRect().top),
+      ).toBeLessThanOrEqual(1);
+    });
   },
 };
 export const AgentThinking: Story = {
@@ -632,6 +779,68 @@ export const FreeDebateAgentDecisionProgress: Story = {
   },
 };
 
+export const PaperExperimentFreeDebate: Story = {
+  args: {
+    ...baseArgs,
+    room: paperExperimentRoom,
+    canRaiseHand: true,
+    myHandIndex: 0,
+    handQueue: ['user-013'],
+    snapshot: snapshot('FREE_SELECTING', {
+      current_action: freeDebateAction,
+      current_speech_id: null,
+      current_speaker_user_id: null,
+      current_agent_profile_id: null,
+      current_speaker_side: null,
+      current_speaker_seat_no: null,
+      hand_queue: ['user-013'],
+      hand_window_open: true,
+      free_holder_side: 'AFFIRMATIVE',
+      free_affirmative_remaining_ms: 138_000,
+      free_negative_remaining_ms: 162_000,
+      agent_hand_queue: ['agent-a4'],
+      agent_decisions: [
+        {
+          agent_profile_id: 'agent-a4',
+          side: 'AFFIRMATIVE',
+          seat_no: 4,
+          status: 'HAND',
+          queue_rank: 2,
+        },
+      ],
+      team_hand_queue: [
+        {
+          speaker_kind: 'HUMAN',
+          user_id: 'user-013',
+          agent_profile_id: null,
+          side: 'AFFIRMATIVE',
+          seat_no: 1,
+          rank: 1,
+        },
+        {
+          speaker_kind: 'AGENT',
+          user_id: null,
+          agent_profile_id: 'agent-a4',
+          side: 'AFFIRMATIVE',
+          seat_no: 4,
+          rank: 2,
+        },
+      ],
+    }),
+    presentation: {
+      eyebrow: '自由辩论候选中',
+      title: '本方正在形成举手队列',
+      detail: '人类与 AI 使用同一发言申请机制；队列在窗口关闭后锁定。',
+    },
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    await expect(canvas.getByTestId('current-debate-stage')).toHaveTextContent('自由辩论');
+    await expect(canvas.getByText('第 2 名')).toBeVisible();
+    await expect(canvas.getByText('取消举手（第 1 位）')).toBeVisible();
+  },
+};
+
 export const FreeDebateAgentVolunteers: Story = {
   args: {
     ...baseArgs,
@@ -790,6 +999,7 @@ export const Terminated: Story = {
     currentSeat: undefined,
     isCurrentSpeaker: false,
     audioStatus: 'ready',
+    playbackStatus: 'ready',
     presentation: {
       eyebrow: '比赛终止',
       title: '本场比赛已终止',

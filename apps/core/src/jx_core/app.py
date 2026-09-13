@@ -12,11 +12,14 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel
+from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from . import __version__
 from .admin_bulk_routes import router as admin_bulk_router
 from .admin_data_routes import router as admin_data_router
 from .admin_diagnostic_routes import router as admin_diagnostic_router
+from .admin_routes import SystemSettingsPatch
 from .admin_routes import router as admin_router
 from .agent.runtime import AgentRuntime
 from .asr.runtime import AsrRuntime
@@ -27,6 +30,9 @@ from .auth.session import SessionService
 from .config import Settings, load_settings
 from .data_capture.diagnostics import DiagnosticWriter
 from .devices.routes import router as devices_router
+from .experiments.routes import router as experiments_router
+from .formats.routes import router as formats_router
+from .livekit_routes import router as livekit_router
 from .logging import (
     configure_logging,
     current_request_id,
@@ -36,11 +42,15 @@ from .logging import (
 )
 from .matches.routes import router as matches_router
 from .matches.service import MatchRuntimeManager
+from .models import RoomMember, SystemSetting
 from .postmatch import PostmatchService
 from .postmatch_routes import router as postmatch_router
+from .presence import MatchPresenceCoordinator
+from .room_connections import RoomConnectionService
 from .rooms.routes import router as rooms_router
 from .rules.routes import router as rules_router
 from .runtime import CoreRuntime, CoreStartupError, Readiness
+from .survey_routes import router as survey_router
 from .users.avatar import AvatarService
 
 
@@ -95,12 +105,35 @@ def create_app(
         database = getattr(resolved_runtime, "database", None)
         session_factory = getattr(database, "session_factory", None)
         if session_factory is not None:
+            # A process restart invalidates every old WebSocket.  Clear only
+            # active leases; RoomConnection remains as the epoch high-water.
+            async with cast(async_sessionmaker[AsyncSession], session_factory)() as cleanup_session:
+                stale_leases = await RoomConnectionService().clear_active_leases(cleanup_session)
+                if stale_leases:
+                    async with cleanup_session.begin():
+                        for user_id, room_id in set(stale_leases):
+                            await cleanup_session.execute(
+                                update(RoomMember)
+                                .where(
+                                    RoomMember.user_id == user_id,
+                                    RoomMember.room_id == room_id,
+                                    RoomMember.left_at.is_(None),
+                                )
+                                .values(online=False)
+                            )
             diagnostic_writer = DiagnosticWriter(
                 service="jx-core",
                 session_factory=cast(async_sessionmaker[AsyncSession], session_factory),
                 queue_size=resolved_settings.diagnostic_queue_size,
                 batch_size=resolved_settings.diagnostic_batch_size,
                 flush_interval_seconds=resolved_settings.diagnostic_flush_interval_ms / 1000,
+            )
+            session_factory_cast = cast(async_sessionmaker[AsyncSession], session_factory)
+            async with session_factory_cast() as settings_session:
+                setting_rows = list((await settings_session.scalars(select(SystemSetting))).all())
+            runtime_controls = SystemSettingsPatch.from_rows(setting_rows)
+            diagnostic_writer.configure_debug(
+                runtime_controls.debug_expires_at if runtime_controls.debug_enabled else None
             )
             await diagnostic_writer.start()
             app.state.diagnostic_writer = diagnostic_writer
@@ -126,6 +159,9 @@ def create_app(
             app.state.postmatch_service = postmatch_service
             await manager.recover_unfinished()
             app.state.match_runtime_manager = manager
+            app.state.presence = MatchPresenceCoordinator(
+                cast(async_sessionmaker[AsyncSession], session_factory), manager
+            )
         try:
             yield
         finally:
@@ -142,7 +178,7 @@ def create_app(
 
     app = FastAPI(
         title="Jixia Debate Core",
-        version="1.0.0",
+        version=__version__,
         lifespan=lifespan,
         docs_url="/docs",
         redoc_url=None,
@@ -157,6 +193,7 @@ def create_app(
     )
     app.state.avatar_service = AvatarService(resolved_settings.avatar_storage_dir)
     app.state.match_runtime_manager = None
+    app.state.presence = None
     app.state.postmatch_service = None
     app.state.diagnostic_writer = None
     app.add_middleware(
@@ -241,9 +278,13 @@ def create_app(
 
     app.include_router(auth_router)
     app.include_router(devices_router)
+    app.include_router(experiments_router)
+    app.include_router(formats_router)
     app.include_router(rules_router)
+    app.include_router(survey_router)
     app.include_router(rooms_router)
     app.include_router(matches_router)
+    app.include_router(livekit_router)
     app.include_router(postmatch_router)
     app.include_router(admin_router)
     app.include_router(admin_data_router)

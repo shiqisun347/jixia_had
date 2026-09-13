@@ -15,7 +15,13 @@ import { ApiClientError } from '@/lib/auth-api';
 import { roomsApi, type RoomCreatePayload } from '@/lib/rooms-api';
 import { useSubmissionGate } from '@/lib/use-submission-gate';
 
-import { selectDefaultRuleId } from './room-experience';
+import { selectDefaultRuleId, supportedRoomRules } from './room-experience';
+
+function ruleLabel(rule: { name: string; rule_key?: string }) {
+  return rule.name.includes('论文') || rule.rule_key === 'formal-4v4-standard'
+    ? `论文同款 · ${rule.name}`
+    : rule.name;
+}
 
 const schema = z
   .object({
@@ -75,7 +81,8 @@ export function CreateRoomPage() {
   const selectedRuleId = useWatch({ control: form.control, name: 'ruleId' });
   const selectedTopicId = useWatch({ control: form.control, name: 'topicId' });
   const customTopicTitle = useWatch({ control: form.control, name: 'customTitle' });
-  const selectedRule = catalogQuery.data?.rules.find((rule) => rule.id === selectedRuleId);
+  const availableRules = supportedRoomRules(catalogQuery.data?.rules ?? []);
+  const selectedRule = availableRules.find((rule) => rule.id === selectedRuleId);
   const selectedTopic = catalogQuery.data?.topics.find((topic) => topic.id === selectedTopicId);
   const mutation = useMutation({
     mutationFn: roomsApi.create,
@@ -96,7 +103,6 @@ export function CreateRoomPage() {
         label: values.label,
         rule_id: values.ruleId,
         is_all_agent: false,
-        agent_assignments: [],
         topic_id: values.topicSource === 'LIBRARY' ? values.topicId : null,
         custom_topic_title: values.topicSource === 'CUSTOM' ? values.customTitle : null,
         affirmative_text: values.topicSource === 'CUSTOM' ? values.affirmativeText : null,
@@ -117,15 +123,15 @@ export function CreateRoomPage() {
     }
   }, [catalogQuery.isError, showToast]);
   useEffect(() => {
-    const rules = catalogQuery.data?.rules;
+    const rules = supportedRoomRules(catalogQuery.data?.rules ?? []);
     if (!rules || rules.length === 0 || form.getValues('ruleId')) return;
     form.setValue('ruleId', selectDefaultRuleId(rules), { shouldValidate: true });
   }, [catalogQuery.data?.rules, form]);
   useEffect(() => {
-    if (catalogQuery.isSuccess && catalogQuery.data.rules.length === 0) {
-      showToast({ message: '当前没有可用赛制，请联系管理员启用赛制。', tone: 'error' });
+    if (catalogQuery.isSuccess && availableRules.length === 0) {
+      showToast({ message: '当前没有可用的 4v4 赛制，请联系管理员。', tone: 'error' });
     }
-  }, [catalogQuery.data?.rules.length, catalogQuery.isSuccess, showToast]);
+  }, [availableRules.length, catalogQuery.isSuccess, showToast]);
 
   return (
     <main className="jx-page-grid jx-page-viewport px-6 py-7 sm:px-10">
@@ -180,13 +186,13 @@ export function CreateRoomPage() {
                 赛制
                 <select
                   className={inputClass}
-                  disabled={catalogQuery.isPending || !catalogQuery.data?.rules.length}
+                  disabled={catalogQuery.isPending || availableRules.length === 0}
                   {...form.register('ruleId')}
                 >
                   {catalogQuery.isPending ? <option value="">正在加载赛制…</option> : null}
-                  {catalogQuery.data?.rules.map((rule) => (
+                  {availableRules.map((rule) => (
                     <option key={rule.id} value={rule.id}>
-                      {rule.name} · {rule.side_size}v{rule.side_size}
+                      {ruleLabel(rule)} · {rule.side_size}v{rule.side_size}
                     </option>
                   ))}
                 </select>

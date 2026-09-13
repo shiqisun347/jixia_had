@@ -11,6 +11,8 @@ from typing import Any, cast
 
 import httpx
 
+from ..data_capture.provider import ProviderCallCapture, unavailable_provider_payload
+
 
 class LlmProviderError(RuntimeError):
     def __init__(self, code: str) -> None:
@@ -99,6 +101,7 @@ class OpenAIStreamingClient:
         max_tokens: int,
         generation_params: dict[str, Any],
         on_delta: DeltaCallback,
+        capture: ProviderCallCapture | None = None,
     ) -> LlmStreamResult:
         started = monotonic()
         body: dict[str, Any] = {
@@ -110,15 +113,35 @@ class OpenAIStreamingClient:
             **generation_params,
         }
         body.setdefault("enable_thinking", False)
+        url = f"{self._base_url}/chat/completions"
+        if capture is not None:
+            capture.capture_request(
+                transport="SSE",
+                url=url,
+                headers={"content-type": "application/json"},
+                body=body,
+            )
+        key_events: list[dict[str, Any]] = []
+        last_event: dict[str, Any] | None = None
         try:
             async with self._client.stream(
                 "POST",
-                f"{self._base_url}/chat/completions",
+                url,
                 headers={"Authorization": f"Bearer {self._api_key}"},
                 json=body,
                 timeout=httpx.Timeout(None, connect=self._connection_timeout_seconds),
             ) as response:
+                if capture is not None:
+                    capture.provider_request_id = _provider_request_id(response.headers)
                 if response.status_code < 200 or response.status_code >= 300:
+                    if capture is not None:
+                        capture.capture_response(
+                            transport="SSE",
+                            url=url,
+                            headers=response.headers,
+                            body=_response_json_or_text(await response.aread()),
+                            events=[],
+                        )
                     raise LlmProviderError("llm_provider_failed")
                 lines = response.aiter_lines()
                 text_parts: list[str] = []
@@ -147,6 +170,9 @@ class OpenAIStreamingClient:
                     if payload == "[DONE]":
                         break
                     event = _json_event(payload)
+                    if not key_events:
+                        key_events.append(event)
+                    last_event = event
                     usage_value = event.get("usage")
                     usage = (
                         cast(dict[str, Any], usage_value) if isinstance(usage_value, dict) else {}
@@ -161,19 +187,55 @@ class OpenAIStreamingClient:
                     text_parts.append(delta)
                     await on_delta(delta)
         except asyncio.CancelledError:
+            if capture is not None and capture.response is None:
+                capture.response = unavailable_provider_payload("provider_call_cancelled")
             raise
         except LlmProviderError:
+            if capture is not None and capture.response is None:
+                capture.response = unavailable_provider_payload("provider_stream_failed")
             raise
         except Exception as error:
+            if capture is not None and capture.response is None:
+                capture.response = unavailable_provider_payload("provider_transport_failed")
             raise LlmProviderError("llm_provider_failed") from error
         if first_token_latency_ms is None:
             raise LlmProviderError("llm_provider_failed")
-        return LlmStreamResult(
+        result = LlmStreamResult(
             text="".join(text_parts),
             first_token_latency_ms=first_token_latency_ms,
             completed_latency_ms=int((monotonic() - started) * 1000),
             completion_tokens=completion_tokens,
         )
+        if capture is not None:
+            if last_event is not None and (not key_events or last_event is not key_events[-1]):
+                key_events.append(last_event)
+            capture.capture_response(
+                transport="SSE",
+                url=url,
+                body={
+                    "text": result.text,
+                    "completion_tokens": result.completion_tokens,
+                },
+                events=key_events,
+            )
+        return result
+
+
+def _provider_request_id(headers: httpx.Headers) -> str | None:
+    for name in ("x-request-id", "x-dashscope-request-id", "request-id"):
+        value = headers.get(name)
+        if value:
+            return value[:256]
+    return None
+
+
+def _response_json_or_text(raw: bytes) -> Any:
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {"text": raw.decode("utf-8", errors="replace")}
 
 
 def _sse_payload(line: str) -> str | None:

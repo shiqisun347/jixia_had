@@ -3,6 +3,7 @@
 import { useCallback, useRef, useState } from 'react';
 
 import { useToast } from '@/components/ui/toast-provider';
+import { useAppTranslations } from '@/i18n';
 
 export const MATCH_COMMAND_FAILURE_MESSAGE = '比赛指令未执行，请检查实时连接后重试。';
 
@@ -14,6 +15,7 @@ export function useMatchCommand<Command extends string>(
   sendCommand: (type: Command) => Promise<boolean>,
 ) {
   const { showToast } = useToast();
+  const t = useAppTranslations('Match');
   const [isPending, setIsPending] = useState(false);
   const inFlight = useRef(false);
 
@@ -29,14 +31,14 @@ export function useMatchCommand<Command extends string>(
         } catch {
           success = false;
         }
-        if (!success) showToast({ message: MATCH_COMMAND_FAILURE_MESSAGE, tone: 'error' });
+        if (!success) showToast({ message: t('connectionUnavailable'), tone: 'error' });
         return success;
       } finally {
         inFlight.current = false;
         setIsPending(false);
       }
     },
-    [sendCommand, showToast],
+    [sendCommand, showToast, t],
   );
 
   return { command, isPending } as const;

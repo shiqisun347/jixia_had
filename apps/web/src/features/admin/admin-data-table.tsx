@@ -5,6 +5,8 @@ import type { ReactNode } from 'react';
 import { flexRender, type Header, type Table } from '@tanstack/react-table';
 
 import { cn } from '@/lib/cn';
+import { useAppLocale } from '@/i18n';
+import { translateAdminNode, translateAdminText } from './admin-i18n';
 
 export function AdminDataTable<TData>({
   table,
@@ -17,6 +19,7 @@ export function AdminDataTable<TData>({
   emptyDescription?: string;
   className?: string;
 }) {
+  const { locale } = useAppLocale();
   const rows = table.getRowModel().rows;
   return (
     <div className={cn('overflow-hidden rounded-2xl border border-slate-200 bg-white', className)}>
@@ -34,7 +37,7 @@ export function AdminDataTable<TData>({
                   >
                     {header.isPlaceholder
                       ? null
-                      : flexRender(header.column.columnDef.header, header.getContext())}
+                      : translateAdminNode(flexRender(header.column.columnDef.header, header.getContext()), locale)}
                   </th>
                 ))}
               </tr>
@@ -45,7 +48,7 @@ export function AdminDataTable<TData>({
               <tr className="transition-colors hover:bg-blue-50/35" key={row.id}>
                 {row.getVisibleCells().map((cell) => (
                   <td className="px-4 py-3.5 text-sm text-slate-700" key={cell.id}>
-                    {flexRender(cell.column.columnDef.cell, cell.getContext())}
+                    {translateAdminNode(flexRender(cell.column.columnDef.cell, cell.getContext()), locale)}
                   </td>
                 ))}
               </tr>
@@ -59,9 +62,9 @@ export function AdminDataTable<TData>({
             <span className="mx-auto grid size-10 place-items-center rounded-xl border border-slate-200 bg-white text-slate-400">
               <Inbox className="size-5" aria-hidden="true" />
             </span>
-            <p className="mt-3 text-sm font-black text-slate-800">{emptyTitle}</p>
+            <p className="mt-3 text-sm font-black text-slate-800">{translateAdminText(emptyTitle, locale)}</p>
             {emptyDescription ? (
-              <p className="mt-1 text-xs leading-5 text-slate-500">{emptyDescription}</p>
+              <p className="mt-1 text-xs leading-5 text-slate-500">{translateAdminText(emptyDescription, locale)}</p>
             ) : null}
           </div>
         </div>

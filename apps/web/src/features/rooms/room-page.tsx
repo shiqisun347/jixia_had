@@ -110,15 +110,24 @@ export function RoomPage({
   const notifiedSwapIds = useRef(new Set<string>());
   const swapSyncIssueNotified = useRef(false);
   const probeAbortRef = useRef<AbortController | null>(null);
+  const reuseAttemptedRef = useRef(false);
+  const reconnectAttemptedRef = useRef<string | null>(null);
   const room = roomQuery.data;
+  const isFormalExperiment = room?.scheduled_match_kind === 'FORMAL';
   const currentUserId = userQuery.data?.user.id;
   const currentMember = room?.members.find((member) => member.user_id === currentUserId);
+  const ownSeat = room?.seats.find((seat) => seat.user_id === currentUserId);
   const isOrganizer = Boolean(room && currentUserId === room.organizer_user_id);
+  const isExperimentManager = Boolean(
+    isFormalExperiment &&
+    (room.viewer_is_experiment_controller || userQuery.data?.user.role === 'ADMIN'),
+  );
+  const canManageRoom = isOrganizer || isExperimentManager;
   const swapQueryKey = useMemo(() => ['rooms', roomId, 'seat-swap-requests'] as const, [roomId]);
   const swapQuery = useQuery({
     queryKey: swapQueryKey,
     queryFn: () => roomsApi.seatSwapRequests(roomId),
-    enabled: room?.status === 'WAITING' && Boolean(currentUserId),
+    enabled: room?.status === 'WAITING' && !isFormalExperiment && Boolean(currentUserId),
     refetchInterval: room?.status === 'WAITING' ? 1_500 : false,
     placeholderData: (previous) => previous,
   });
@@ -201,6 +210,18 @@ export function RoomPage({
       showToast({ message: errorText(error), tone: 'error' });
     },
   });
+  const reconnectMutation = useMutation({
+    mutationFn: () => roomsApi.reconnect(roomId),
+    onSuccess: refreshRoom,
+    onError: (error) => showToast({ message: errorText(error), tone: 'error' }),
+  });
+  useEffect(() => {
+    if (!room || room.status !== 'WAITING' || !currentMember || currentMember.online) return;
+    const attemptKey = `${room.id}:${currentMember.user_id}`;
+    if (reconnectAttemptedRef.current === attemptKey) return;
+    reconnectAttemptedRef.current = attemptKey;
+    reconnectMutation.mutate();
+  }, [currentMember, reconnectMutation, room]);
   const seatMutation = useMutation({
     mutationFn: (payload: { side: 'AFFIRMATIVE' | 'NEGATIVE'; seat_no: number }) =>
       roomsApi.selectSeat(roomId, {
@@ -324,6 +345,35 @@ export function RoomPage({
       void roomQuery.refetch();
     },
   });
+  const reuseDeviceMutation = useMutation({
+    mutationFn: () => roomsApi.reuseDeviceCheck(roomId),
+    onSuccess: async (snapshot) => {
+      await refreshRoom(snapshot);
+      const version = snapshot.latest_device_check?.check_version;
+      if (version) preparationMutation.mutate({ version });
+    },
+    onError: () => {
+      // A missing or expired browser credential falls back to the normal probe.
+      reuseAttemptedRef.current = true;
+    },
+  });
+  useEffect(() => {
+    if (
+      recheck ||
+      reuseAttemptedRef.current ||
+      reuseDeviceMutation.isPending ||
+      room?.status !== 'WAITING' ||
+      !currentMember ||
+      currentMember.member_role !== 'DEBATER' ||
+      !ownSeat ||
+      currentMember.ready ||
+      room.latest_device_check?.is_valid
+    ) {
+      return;
+    }
+    reuseAttemptedRef.current = true;
+    reuseDeviceMutation.mutate();
+  }, [currentMember, ownSeat, recheck, room, reuseDeviceMutation]);
   const startMutation = useMutation({
     mutationFn: async () => {
       const starting = await roomsApi.start(roomId);
@@ -585,7 +635,7 @@ export function RoomPage({
                     )}
                     作为观众进入比赛
                   </Button>
-                ) : isOrganizer && !room.match_id ? (
+                ) : canManageRoom && !room.match_id ? (
                   <Button
                     disabled={startGate.isPending}
                     onClick={() => {
@@ -613,7 +663,6 @@ export function RoomPage({
     );
   }
   const sideSize = Number(room.rule.side_size ?? 1);
-  const ownSeat = room.seats.find((seat) => seat.user_id === currentUserId);
   const reusableCheck =
     !recheck && room.latest_device_check?.is_valid ? room.latest_device_check : null;
   const preparationFlow = derivePreparationFlow({
@@ -637,6 +686,11 @@ export function RoomPage({
                 <span className="rounded-full bg-lime-100 px-2.5 py-1 text-[11px] font-black text-lime-800">
                   {room.status === 'WAITING' ? '准备中' : room.status}
                 </span>
+                {room.experiment_mode ? (
+                  <span className="rounded-md bg-blue-100 px-2.5 py-1 text-[11px] font-black text-blue-800">
+                    {isFormalExperiment ? '论文实验 · 固定席位' : '论文实验 · 训练房间'}
+                  </span>
+                ) : null}
                 <button
                   className="inline-flex items-center gap-1.5 rounded-lg bg-slate-100 px-2.5 py-1 font-mono text-xs font-black tracking-[0.18em] text-slate-700 transition hover:bg-blue-50 hover:text-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                   onClick={() => setInviteOpen((open) => !open)}
@@ -667,7 +721,7 @@ export function RoomPage({
                 <ArrowLeft className="size-4" />
                 {recheck ? '返回比赛' : '返回大厅'}
               </Link>
-              {currentMember && !recheck ? (
+              {currentMember && !recheck && !isFormalExperiment ? (
                 <Button
                   disabled={leaveMutation.isPending}
                   onClick={() => setLeaveConfirmOpen(true)}
@@ -677,7 +731,7 @@ export function RoomPage({
                   退出房间
                 </Button>
               ) : null}
-              {isOrganizer && !recheck ? (
+              {canManageRoom && !recheck ? (
                 <div className="grid justify-items-end gap-1.5">
                   <Button
                     disabled={
@@ -719,7 +773,9 @@ export function RoomPage({
                   </p>
                   <h2 className="mt-1 text-lg font-black">分享房间，邀请辩手或观众</h2>
                   <p className="mt-1 text-xs text-slate-300">
-                    房间公开可见，打开链接后由对方选择加入身份。
+                    {isFormalExperiment
+                      ? '房间公开可见；排表参与者自动进入固定席位，其他用户只能作为观众。'
+                      : '房间公开可见，打开链接后由对方选择加入身份。'}
                   </p>
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
@@ -769,6 +825,7 @@ export function RoomPage({
                         side="AFFIRMATIVE"
                         seatNo={index + 1}
                         currentUserId={currentUserId}
+                        fixed={isFormalExperiment}
                         disabled={
                           !currentMember || room.status !== 'WAITING' || seatMutation.isPending
                         }
@@ -804,6 +861,7 @@ export function RoomPage({
                         side="NEGATIVE"
                         seatNo={index + 1}
                         currentUserId={currentUserId}
+                        fixed={isFormalExperiment}
                         disabled={
                           !currentMember || room.status !== 'WAITING' || seatMutation.isPending
                         }
@@ -830,7 +888,7 @@ export function RoomPage({
               <section className="mt-7 rounded-2xl border border-slate-200 bg-slate-50/75 p-5">
                 <div className="flex flex-wrap items-center justify-between gap-3">
                   <h2 className="font-black text-slate-900">房间成员 · {room.members.length}</h2>
-                  {currentMember?.member_role === 'DEBATER' ? (
+                  {!isFormalExperiment && currentMember?.member_role === 'DEBATER' ? (
                     <Button
                       className="border-blue-600 bg-blue-600 !text-white shadow-[0_8px_22px_rgba(37,99,235,0.22)] hover:border-blue-700 hover:bg-blue-700"
                       disabled={roleMutation.isPending || room.status !== 'WAITING'}
@@ -844,7 +902,7 @@ export function RoomPage({
                       )}
                       切换为观众
                     </Button>
-                  ) : currentMember?.member_role === 'SPECTATOR' ? (
+                  ) : !isFormalExperiment && currentMember?.member_role === 'SPECTATOR' ? (
                     <Button
                       className="border-blue-600 bg-blue-600 !text-white shadow-[0_8px_22px_rgba(37,99,235,0.22)] hover:border-blue-700 hover:bg-blue-700"
                       disabled={
@@ -890,7 +948,9 @@ export function RoomPage({
                 {recheck
                   ? '恢复前设备复检'
                   : !currentMember
-                    ? '先选择加入身份'
+                    ? isFormalExperiment
+                      ? '作为观众进入'
+                      : '先选择加入身份'
                     : preparationFlow.isSpectator
                       ? '观众席已就绪'
                       : preparationFlow.activeStep === 2
@@ -900,28 +960,34 @@ export function RoomPage({
                           : '设备检测与准备'}
               </h2>
               <p className="mt-2 text-xs leading-5 text-slate-300">
-                {preparationFlow.nextAction}。
+                {!currentMember && isFormalExperiment
+                  ? '实验席位不能临时加入，当前账号可直接进入观众席。'
+                  : preparationFlow.activeStep === 2 && isFormalExperiment
+                    ? '席位已由实验排表固定。'
+                    : `${preparationFlow.nextAction}。`}
               </p>
               {!currentMember ? (
                 <div className="mt-6 space-y-3">
-                  <button
-                    className="flex min-h-20 w-full items-center justify-between rounded-2xl border border-lime-300/45 bg-lime-300/15 p-4 text-left transition hover:-translate-y-0.5 hover:bg-lime-300/20 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-lime-300/30 disabled:cursor-not-allowed disabled:border-slate-500 disabled:bg-slate-700 disabled:text-slate-400 disabled:shadow-none"
-                    disabled={joinMutation.isPending || !termsQuery.data}
-                    onClick={() => joinMutation.mutate('DEBATER')}
-                    type="button"
-                  >
-                    <span>
-                      <strong className="block text-sm text-white">
-                        {room.viewer_membership_state === 'LEFT'
-                          ? '重新作为辩手加入'
-                          : '作为辩手加入'}
-                      </strong>
-                      <small className="mt-1 block text-xs text-slate-300">
-                        选席后完成设备检测
-                      </small>
-                    </span>
-                    <Mic className="size-5 text-lime-300" />
-                  </button>
+                  {!isFormalExperiment ? (
+                    <button
+                      className="flex min-h-20 w-full items-center justify-between rounded-2xl border border-lime-300/45 bg-lime-300/15 p-4 text-left transition hover:-translate-y-0.5 hover:bg-lime-300/20 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-lime-300/30 disabled:cursor-not-allowed disabled:border-slate-500 disabled:bg-slate-700 disabled:text-slate-400 disabled:shadow-none"
+                      disabled={joinMutation.isPending || !termsQuery.data}
+                      onClick={() => joinMutation.mutate('DEBATER')}
+                      type="button"
+                    >
+                      <span>
+                        <strong className="block text-sm text-white">
+                          {room.viewer_membership_state === 'LEFT'
+                            ? '重新作为辩手加入'
+                            : '作为辩手加入'}
+                        </strong>
+                        <small className="mt-1 block text-xs text-slate-300">
+                          选席后完成设备检测
+                        </small>
+                      </span>
+                      <Mic className="size-5 text-lime-300" />
+                    </button>
+                  ) : null}
                   <button
                     className="flex min-h-20 w-full items-center justify-between rounded-2xl border border-blue-200/70 bg-[#22385d] p-4 text-left shadow-[0_8px_20px_rgba(4,15,39,0.18)] transition hover:-translate-y-0.5 hover:border-blue-100 hover:bg-[#2b4773] focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-blue-300/50 disabled:cursor-not-allowed disabled:border-slate-500 disabled:bg-slate-700 disabled:text-slate-400 disabled:shadow-none"
                     disabled={joinMutation.isPending}
@@ -949,16 +1015,18 @@ export function RoomPage({
                   <p className="mt-2 text-xs leading-5 text-slate-300">
                     等待房主开始比赛。观众不会开启麦克风，也没有比赛控制权限。
                   </p>
-                  <Button
-                    className="mt-4 w-full"
-                    disabled={
-                      roleMutation.isPending || room.status !== 'WAITING' || !termsQuery.data
-                    }
-                    onClick={() => roleMutation.mutate('DEBATER')}
-                    variant="primary"
-                  >
-                    <Mic className="size-4" /> 切换为辩手
-                  </Button>
+                  {!isFormalExperiment ? (
+                    <Button
+                      className="mt-4 w-full"
+                      disabled={
+                        roleMutation.isPending || room.status !== 'WAITING' || !termsQuery.data
+                      }
+                      onClick={() => roleMutation.mutate('DEBATER')}
+                      variant="primary"
+                    >
+                      <Mic className="size-4" /> 切换为辩手
+                    </Button>
+                  ) : null}
                 </div>
               ) : preparationFlow.isHumanParticipant ? (
                 <div className="mt-6 space-y-4">

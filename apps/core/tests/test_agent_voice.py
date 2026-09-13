@@ -32,17 +32,22 @@ from jx_core.agent.runtime import (
     _current_and_next_stage,
     _debate_position,
     _parse_decision,
+    _parse_experiment_decision,
     _played_prefix,
+    _prompt_side_values,
+    _side_for_action,
     _stage_name_for_action,
 )
-from jx_core.agent.tts import QwenTtsConnection, TtsStartRateLimiter
+from jx_core.agent.tts import QwenTtsConnection, TtsProviderError, TtsStartRateLimiter
 from jx_core.config import Settings
+from jx_core.data_capture.provider import ProviderCallCapture
 from jx_core.matches.domain import (
     MatchActor,
     MatchCommand,
     MatchRuntimeState,
     compile_linear_actions,
 )
+from jx_core.runtime_identity import CallbackEnvelope
 
 
 def _rule_with_agent() -> dict[str, object]:
@@ -72,6 +77,131 @@ def test_free_decision_requires_strict_json_and_clamps_willingness() -> None:
     )
     with pytest.raises(Exception, match="agent_decision_invalid"):
         _parse_decision('{"should_speak":"yes","willingness":0.5}')
+
+
+def test_experiment_decision_requires_bounded_reason() -> None:
+    assert _parse_experiment_decision(
+        '{"should_speak":true,"decision_reason":"需要回应"}'
+    ) == (True, "需要回应")
+    assert _parse_experiment_decision(
+        '{"should_speak":false,"decision_reason":"暂无新增价值"}'
+    ) == (False, "暂无新增价值")
+    with pytest.raises(Exception, match="agent_decision_invalid"):
+        _parse_experiment_decision('{"should_speak":true,"willingness":0.9}')
+    with pytest.raises(Exception, match="agent_decision_invalid"):
+        _parse_experiment_decision('```json\n{"should_speak":true}\n```')
+
+
+@pytest.mark.asyncio
+async def test_midstream_provider_failure_is_reported_before_media_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks = AsyncMock()
+    runtime = AgentRuntime(
+        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        session_factory=cast(Any, None),
+        callbacks=callbacks,
+    )
+    match_id = uuid4()
+    generation_id = uuid4()
+    run = AgentRun(
+        match_id=match_id,
+        action_key="1:0",
+        agent_profile_id=uuid4(),
+        duration_ms=90_000,
+        generation_id=generation_id,
+        speech_id=uuid4(),
+    )
+    config = AgentConfig(
+        match_id=match_id,
+        action_key=run.action_key,
+        agent_profile_id=run.agent_profile_id,
+        context_version=1,
+        match_seed=1,
+        model_key="test",
+        base_url="https://llm.test/v1",
+        model_id="test",
+        api_key="test",
+        model_limit=1,
+        generation_params={},
+        max_tokens=64,
+        messages=[],
+        voice="test",
+        rate=1.0,
+        chars_per_second=4.0,
+        playback_gain=1.0,
+    )
+    cleanup_started = asyncio.Event()
+    release_cleanup = asyncio.Event()
+    order: list[str] = []
+
+    async def report_failure(**_: object) -> None:
+        order.append("failure")
+
+    async def stalled_cleanup(_: AgentRun) -> None:
+        order.append("cleanup")
+        cleanup_started.set()
+        await release_cleanup.wait()
+
+    callbacks.handle_agent_failure.side_effect = report_failure
+    monkeypatch.setattr(runtime, "_load_config", AsyncMock(return_value=config))
+    monkeypatch.setattr(runtime, "_create_generation", AsyncMock(return_value=generation_id))
+    monkeypatch.setattr(
+        runtime,
+        "_execute",
+        AsyncMock(side_effect=TtsProviderError("tts_provider_failed")),
+    )
+    monkeypatch.setattr(runtime, "_mark_generation_failed", AsyncMock())
+    monkeypatch.setattr(runtime, "_discard_tts_connection", AsyncMock())
+    monkeypatch.setattr(runtime, "_cleanup_attempt", stalled_cleanup)
+
+    task = asyncio.create_task(runtime._run_with_retry(run))
+    await asyncio.wait_for(cleanup_started.wait(), timeout=0.2)
+
+    assert order == ["failure", "cleanup"]
+    callbacks.handle_agent_failure.assert_awaited_once()
+    failure = callbacks.handle_agent_failure.await_args.kwargs
+    assert failure["envelope"].match_id == match_id
+    assert failure["envelope"].generation_id == generation_id
+    assert failure["error_code"] == "tts_provider_failed"
+
+    release_cleanup.set()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_media_fence_rejects_frames_from_interrupted_generation() -> None:
+    callbacks = AsyncMock()
+    runtime = AgentRuntime(
+        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        session_factory=cast(Any, None),
+        callbacks=callbacks,
+    )
+    run = AgentRun(
+        match_id=uuid4(),
+        action_key="3:0",
+        agent_profile_id=uuid4(),
+        duration_ms=30_000,
+        generation_id=uuid4(),
+        media_fenced=True,
+    )
+
+    class Decoder:
+        async def frames(self):
+            yield b"\x00\x00" * 1600
+
+    class Source:
+        captures = 0
+
+        async def capture_frame(self, _frame: object) -> None:
+            self.captures += 1
+
+    run.decoder = cast(Any, Decoder())
+    run.source = cast(Any, Source())
+    runtime._runs[run.match_id] = run
+    await runtime._play_pcm(run, run.generation_id)
+
+    assert cast(Any, run.source).captures == 0
 
 
 @pytest.mark.asyncio
@@ -142,12 +272,23 @@ async def test_free_decisions_report_each_agent_independently_and_degrade_failur
     monkeypatch.setattr(runtime, "_finish_external_call", finish_capture)
     monkeypatch.setattr(runtime, "_fail_external_call", fail_capture)
     round_id = uuid4()
+    match_id = uuid4()
     await runtime.decide_free_debate(
-        match_id=uuid4(),
+        match_id=match_id,
         action_key="7:0",
         side="AFFIRMATIVE",
         agent_profile_ids=[first, second],
         decision_round_id=round_id,
+        envelope=CallbackEnvelope(
+            match_id=match_id,
+            speech_id=None,
+            attempt_no=1,
+            generation_id=None,
+            connection_epoch=None,
+            context_version=0,
+            opportunity_id=uuid4(),
+            opportunity_generation=1,
+        ),
     )
 
     assert callbacks.report_free_decision.await_count == 2
@@ -158,9 +299,13 @@ async def test_free_decisions_report_each_agent_independently_and_degrade_failur
     assert reported[first]["should_speak"] is True
     assert reported[first]["willingness"] == 0.86
     assert reported[first]["failed"] is False
+    assert reported[first]["envelope"].match_id == match_id
+    assert reported[first]["envelope"].opportunity_generation == 1
+    assert reported[first]["envelope"].attempt_no == 1
     assert reported[second]["should_speak"] is None
     assert reported[second]["failed"] is True
     assert reported[second]["attempt_no"] == 2
+    assert reported[second]["envelope"].attempt_no == 2
     assert attempts[str(first)] == 1
     assert attempts[str(second)] == 2
     assert start_capture.await_count == 3
@@ -218,6 +363,42 @@ def test_agent_prompt_context_has_readable_stage_position_and_next_stage() -> No
     assert _stage_name_for_action("1:1", rule) == "正方一辩立论"
     assert _current_and_next_stage("1:1", rule) == ("正方一辩立论", "反方一辩立论")
     assert _debate_position("1:1", rule) == "正方1辩"
+
+
+def test_agent_prompt_side_fallback_uses_canonical_side_codes() -> None:
+    rule = {
+        "stages": [
+            {
+                "position": 1,
+                "actions": [
+                    {"position": 1, "side": "AFFIRMATIVE"},
+                    {"position": 2, "side": "NEGATIVE"},
+                ],
+            }
+        ]
+    }
+
+    assert _side_for_action("1:1", rule) == "AFFIRMATIVE"
+    assert _side_for_action("1:2", rule) == "NEGATIVE"
+
+
+def test_agent_prompt_side_values_match_affirmative_and_negative_stances() -> None:
+    assert _prompt_side_values(
+        "AFFIRMATIVE",
+        affirmative_position="过程更能体现奋斗价值",
+        negative_position="结果更能体现奋斗价值",
+    ) == ("正方", "过程更能体现奋斗价值")
+    assert _prompt_side_values(
+        "NEGATIVE",
+        affirmative_position="过程更能体现奋斗价值",
+        negative_position="结果更能体现奋斗价值",
+    ) == ("反方", "结果更能体现奋斗价值")
+    with pytest.raises(LlmProviderError, match="agent_side_invalid"):
+        _prompt_side_values(
+            "正方",
+            affirmative_position="过程更能体现奋斗价值",
+            negative_position="结果更能体现奋斗价值",
+        )
 
 
 def _decode_ogg_pcm(encoded: bytes) -> np.ndarray[Any, np.dtype[np.int16]]:
@@ -321,6 +502,43 @@ async def test_agent_action_starts_timer_only_after_first_pcm() -> None:
 
 
 @pytest.mark.asyncio
+async def test_agent_playback_start_callback_retries_once() -> None:
+    callbacks = AsyncMock()
+    callbacks.start_agent_playback.side_effect = [RuntimeError("transient"), None]
+    runtime = AgentRuntime(
+        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        session_factory=cast(Any, None),
+        callbacks=callbacks,
+    )
+    generation_id = uuid4()
+    match_id = uuid4()
+    speech_id = uuid4()
+    run = AgentRun(
+        match_id=match_id,
+        action_key="3:0",
+        agent_profile_id=uuid4(),
+        duration_ms=30_000,
+        generation_id=generation_id,
+        speech_id=speech_id,
+        storage_path=Path("/tmp/agent-playback-retry.ogg"),
+        callback_envelope=CallbackEnvelope(
+            match_id=match_id,
+            speech_id=speech_id,
+            attempt_no=1,
+            generation_id=generation_id,
+            connection_epoch=None,
+            context_version=1,
+            opportunity_id=None,
+            opportunity_generation=None,
+        ),
+    )
+
+    await runtime._start_agent_playback_with_retry(run)
+
+    assert callbacks.start_agent_playback.await_count == 2
+
+
+@pytest.mark.asyncio
 async def test_openai_sse_stream_returns_text_and_usage() -> None:
     async def handler(request: httpx.Request) -> httpx.Response:
         assert request.url.path == "/v1/chat/completions"
@@ -333,14 +551,21 @@ async def test_openai_sse_stream_returns_text_and_usage() -> None:
         base_url="https://llm.test/v1", api_key="test", model="demo", client=client
     )
     chunks: list[str] = []
+    capture = ProviderCallCapture()
     result = await adapter.stream_chat(
         messages=[{"role": "user", "content": "x"}],
         max_tokens=32,
         generation_params={},
         on_delta=lambda value: _append(chunks, value),
+        capture=capture,
     )
     assert result.text == "你好"
     assert chunks == ["你好"]
+    assert capture.request is not None
+    assert capture.request.payload["body"]["messages"] == [{"role": "user", "content": "x"}]
+    assert "authorization" not in capture.request.payload["headers"]
+    assert capture.response is not None
+    assert capture.response.payload["body"]["text"] == "你好"
     await adapter.close()
 
 
@@ -450,6 +675,7 @@ async def test_tts_duplex_adapter_writes_binary_audio_and_reuses_socket() -> Non
         url="wss://tts.test", api_key="test", socket_factory=factory, timeout_seconds=1
     )
     received: list[bytes] = []
+    capture = ProviderCallCapture()
 
     async def text_chunks():
         yield "你好"
@@ -460,12 +686,18 @@ async def test_tts_duplex_adapter_writes_binary_audio_and_reuses_socket() -> Non
         rate=1.0,
         on_audio=lambda value: _append_bytes(received, value),
         task_id=task_id,
+        capture=capture,
     )
     assert result.byte_count == len(b"opus-audio")
     assert received == [b"opus-audio"]
     assert len(socket.sent) == 3
     run_task = json.loads(str(socket.sent[0]))
     assert run_task["payload"]["parameters"]["bit_rate"] == 32
+    assert capture.request is not None
+    assert capture.request.payload["body"]["messages"][0] == run_task
+    assert capture.response is not None
+    assert capture.response.payload["binary_summary"]["total_bytes"] == len(b"opus-audio")
+    assert "opus-audio" not in str(capture.response.payload)
 
 
 async def _append_bytes(target: list[bytes], value: bytes) -> None:
@@ -616,3 +848,127 @@ async def test_truncated_agent_finalization_is_bounded_when_pipeline_cleanup_sta
     assert storage_path.read_bytes() == b"audio"
     release_cleanup.set()
     await pipeline
+
+
+@pytest.mark.asyncio
+async def test_agent_finalization_failure_reports_authoritative_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    callbacks = AsyncMock()
+    runtime = AgentRuntime(
+        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        session_factory=cast(Any, None),
+        callbacks=callbacks,
+    )
+    match_id = uuid4()
+    speech_id = uuid4()
+    generation_id = uuid4()
+    spool_path = tmp_path / "speech.spool.ogg"
+    storage_path = tmp_path / "speech.ogg"
+    spool_path.write_bytes(b"audio")
+    runtime._runs[match_id] = AgentRun(
+        match_id=match_id,
+        action_key="1:0",
+        agent_profile_id=uuid4(),
+        duration_ms=5_000,
+        generation_id=generation_id,
+        speech_id=speech_id,
+        draft_parts=["完整正式文字"],
+        spool_path=spool_path,
+        storage_path=storage_path,
+        played_samples=48_000,
+        natural_complete=True,
+    )
+    monkeypatch.setattr(
+        runtime,
+        "_persist_final",
+        AsyncMock(side_effect=RuntimeError("database unavailable")),
+    )
+
+    await runtime.finalize_agent(match_id, speech_id, "COMPLETED")
+
+    callbacks.handle_agent_failure.assert_awaited_once()
+    assert callbacks.handle_agent_failure.await_args.kwargs["error_code"] == (
+        "agent_finalization_failed"
+    )
+    callbacks.finalize_agent_speech.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_finalization_retries_callback_after_transient_commit_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    callbacks = AsyncMock()
+    callbacks.finalize_agent_speech.side_effect = [RuntimeError("transient commit failure"), None]
+    runtime = AgentRuntime(
+        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        session_factory=cast(Any, None),
+        callbacks=callbacks,
+    )
+    match_id = uuid4()
+    speech_id = uuid4()
+    spool_path = tmp_path / "speech.spool.ogg"
+    storage_path = tmp_path / "speech.ogg"
+    spool_path.write_bytes(b"audio")
+    runtime._runs[match_id] = AgentRun(
+        match_id=match_id,
+        action_key="2:1",
+        agent_profile_id=uuid4(),
+        duration_ms=5_000,
+        generation_id=uuid4(),
+        speech_id=speech_id,
+        draft_parts=["完整正式文字"],
+        spool_path=spool_path,
+        storage_path=storage_path,
+        played_samples=48_000,
+        natural_complete=True,
+    )
+    monkeypatch.setattr(runtime, "_persist_final", AsyncMock())
+
+    await runtime.finalize_agent(match_id, speech_id, "COMPLETED")
+
+    assert callbacks.finalize_agent_speech.await_count == 2
+    callbacks.handle_agent_failure.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_agent_finalization_timeout_reports_authoritative_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    callbacks = AsyncMock()
+    runtime = AgentRuntime(
+        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        session_factory=cast(Any, None),
+        callbacks=callbacks,
+    )
+    match_id = uuid4()
+    speech_id = uuid4()
+    spool_path = tmp_path / "speech.spool.ogg"
+    storage_path = tmp_path / "speech.ogg"
+    spool_path.write_bytes(b"audio")
+    runtime._runs[match_id] = AgentRun(
+        match_id=match_id,
+        action_key="1:0",
+        agent_profile_id=uuid4(),
+        duration_ms=5_000,
+        generation_id=uuid4(),
+        speech_id=speech_id,
+        draft_parts=["完整正式文字"],
+        spool_path=spool_path,
+        storage_path=storage_path,
+        played_samples=48_000,
+        natural_complete=True,
+    )
+
+    async def stalled_persist(_: AgentRun) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(agent_runtime_module, "AGENT_FINALIZATION_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr(runtime, "_persist_final", stalled_persist)
+
+    await asyncio.wait_for(runtime.finalize_agent(match_id, speech_id, "COMPLETED"), timeout=0.2)
+
+    callbacks.handle_agent_failure.assert_awaited_once()
+    assert callbacks.handle_agent_failure.await_args.kwargs["error_code"] == (
+        "agent_finalization_timeout"
+    )

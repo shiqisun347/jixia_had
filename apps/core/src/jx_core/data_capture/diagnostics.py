@@ -8,14 +8,69 @@ import json
 import logging
 import sys
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..logging import JsonFormatter
 from ..models import SystemIncident, SystemLogEvent
+
+_SENSITIVE_KEYS = frozenset(
+    {
+        "authorization",
+        "cookie",
+        "password",
+        "private_key",
+        "api_key",
+        "access_token",
+        "refresh_token",
+        "supplier_response",
+        "audio",
+        "client_secret",
+        "secret",
+        "token",
+        "set_cookie",
+    }
+)
+
+
+def _is_sensitive_key(value: object) -> bool:
+    normalized = str(value).strip().lower().replace("-", "_")
+    return normalized in _SENSITIVE_KEYS
+
+
+def sanitize_log_details(value: object, *, depth: int = 0) -> object:
+    if depth >= 6:
+        return "[TRUNCATED]"
+    if isinstance(value, dict):
+        mapping = cast(dict[object, object], value)
+        return {
+            str(key)[:128]: (
+                "[REDACTED]"
+                if _is_sensitive_key(key)
+                else sanitize_log_details(item, depth=depth + 1)
+            )
+            for key, item in list(mapping.items())[:100]
+        }
+    if isinstance(value, (list, tuple)):
+        sequence = cast(list[object] | tuple[object, ...], value)
+        return [sanitize_log_details(item, depth=depth + 1) for item in sequence[:100]]
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    return str(value)[:2000]
+
+
+async def delete_expired_runtime_logs(
+    session: AsyncSession, *, retention_days: int, now: datetime | None = None
+) -> int:
+    cutoff = (now or datetime.now(UTC)) - timedelta(days=retention_days)
+    result = await session.execute(
+        delete(SystemLogEvent).where(SystemLogEvent.happened_at < cutoff)
+    )
+    return int(result.rowcount or 0)  # type: ignore[attr-defined]
 
 
 def _uuid(value: object) -> UUID | None:
@@ -33,23 +88,28 @@ class DiagnosticRecord:
     message: str
     error_code: str | None
     request_id: str | None
+    trace_id: str | None
+    format_version_id: UUID | None
     match_id: UUID | None
     speech_id: UUID | None
     generation_id: UUID | None
     decision_round_id: UUID | None
     connection_epoch: int | None
     incident_id: UUID | None
+    details: dict[str, Any]
     happened_at: datetime
 
 
 class DiagnosticHandler(logging.Handler):
     def __init__(self, writer: DiagnosticWriter) -> None:
-        super().__init__(level=logging.WARNING)
+        super().__init__(level=logging.DEBUG)
         self._writer = writer
         self._formatter = JsonFormatter(writer.service)
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
+            if not self._writer.accepts_level(record.levelname):
+                return
             payload = json.loads(self._formatter.format(record))
             happened_at = datetime.fromisoformat(str(payload["timestamp"]))
             self._writer.enqueue(
@@ -60,6 +120,8 @@ class DiagnosticHandler(logging.Handler):
                     message=str(payload["message"])[:1000],
                     error_code=(str(payload["error_code"]) if payload.get("error_code") else None),
                     request_id=(str(payload["request_id"]) if payload.get("request_id") else None),
+                    trace_id=(str(payload["trace_id"]) if payload.get("trace_id") else None),
+                    format_version_id=_uuid(payload.get("format_version_id")),
                     match_id=_uuid(payload.get("match_id")),
                     speech_id=_uuid(payload.get("speech_id")),
                     generation_id=_uuid(payload.get("generation_id")),
@@ -70,6 +132,7 @@ class DiagnosticHandler(logging.Handler):
                         else None
                     ),
                     incident_id=_uuid(payload.get("incident_id")),
+                    details=sanitize_log_details(getattr(record, "details", {})),  # type: ignore[arg-type]
                     happened_at=happened_at,
                 )
             )
@@ -108,6 +171,7 @@ class DiagnosticWriter:
         self._task: asyncio.Task[None] | None = None
         self._handler = DiagnosticHandler(self)
         self._dropped = 0
+        self._debug_expires_at: datetime | None = None
 
     @property
     def dropped_count(self) -> int:
@@ -116,6 +180,19 @@ class DiagnosticWriter:
     @property
     def queue_size(self) -> int:
         return self._queue.qsize()
+
+    @property
+    def queue_capacity(self) -> int:
+        return self._queue.maxsize
+
+    def configure_debug(self, expires_at: datetime | None) -> None:
+        self._debug_expires_at = expires_at
+
+    def accepts_level(self, level: str, *, now: datetime | None = None) -> bool:
+        if level != "DEBUG":
+            return level in {"INFO", "WARNING", "ERROR", "CRITICAL"}
+        current = now or datetime.now(UTC)
+        return self._debug_expires_at is not None and current < self._debug_expires_at
 
     async def flush(self) -> None:
         """Wait until all records accepted by the bounded queue are handled."""
@@ -200,39 +277,44 @@ class DiagnosticWriter:
                 async with self._session_factory() as session:
                     async with session.begin():
                         for item in batch:
-                            fingerprint_source = (
-                                f"{item.service}|{item.error_code or ''}|"
-                                f"{item.logger_name}|{item.message}"
-                            )
-                            fingerprint = hashlib.sha256(fingerprint_source.encode()).hexdigest()[
-                                :64
-                            ]
-                            incident = await session.scalar(
-                                select(SystemIncident)
-                                .where(SystemIncident.fingerprint == fingerprint)
-                                .with_for_update()
-                            )
-                            if incident is None:
-                                incident = SystemIncident(
-                                    fingerprint=fingerprint,
-                                    title=item.message[:256],
-                                    severity=item.level,
-                                    first_seen_at=item.happened_at,
-                                    last_seen_at=item.happened_at,
+                            incident_id = item.incident_id
+                            if item.level in {"WARNING", "ERROR", "CRITICAL"}:
+                                fingerprint_source = (
+                                    f"{item.service}|{item.error_code or ''}|"
+                                    f"{item.logger_name}|{item.message}"
                                 )
-                                session.add(incident)
-                                await session.flush()
-                            else:
-                                incident.last_seen_at = max(incident.last_seen_at, item.happened_at)
-                                incident.occurrence_count += 1
-                                if (
-                                    item.level == "CRITICAL"
-                                    or incident.severity != "CRITICAL"
-                                    and item.level == "ERROR"
-                                ):
-                                    incident.severity = item.level
-                            if item.match_id is not None:
-                                incident.affected_match_count += 1
+                                fingerprint = hashlib.sha256(
+                                    fingerprint_source.encode()
+                                ).hexdigest()[:64]
+                                incident = await session.scalar(
+                                    select(SystemIncident)
+                                    .where(SystemIncident.fingerprint == fingerprint)
+                                    .with_for_update()
+                                )
+                                if incident is None:
+                                    incident = SystemIncident(
+                                        fingerprint=fingerprint,
+                                        title=item.message[:256],
+                                        severity=item.level,
+                                        first_seen_at=item.happened_at,
+                                        last_seen_at=item.happened_at,
+                                    )
+                                    session.add(incident)
+                                    await session.flush()
+                                else:
+                                    incident.last_seen_at = max(
+                                        incident.last_seen_at, item.happened_at
+                                    )
+                                    incident.occurrence_count += 1
+                                    if (
+                                        item.level == "CRITICAL"
+                                        or incident.severity != "CRITICAL"
+                                        and item.level == "ERROR"
+                                    ):
+                                        incident.severity = item.level
+                                if item.match_id is not None:
+                                    incident.affected_match_count += 1
+                                incident_id = incident.id
                             session.add(
                                 SystemLogEvent(
                                     level=item.level,
@@ -241,12 +323,15 @@ class DiagnosticWriter:
                                     message=item.message,
                                     error_code=item.error_code,
                                     request_id=item.request_id,
+                                    trace_id=item.trace_id,
+                                    format_version_id=item.format_version_id,
                                     match_id=item.match_id,
                                     speech_id=item.speech_id,
                                     generation_id=item.generation_id,
                                     decision_round_id=item.decision_round_id,
                                     connection_epoch=item.connection_epoch,
-                                    incident_id=incident.id,
+                                    incident_id=incident_id,
+                                    details=item.details,
                                     happened_at=item.happened_at,
                                 )
                             )
@@ -272,4 +357,10 @@ class DiagnosticWriter:
                 )
 
 
-__all__ = ["DiagnosticHandler", "DiagnosticRecord", "DiagnosticWriter"]
+__all__ = [
+    "DiagnosticHandler",
+    "DiagnosticRecord",
+    "DiagnosticWriter",
+    "delete_expired_runtime_logs",
+    "sanitize_log_details",
+]

@@ -87,6 +87,18 @@ function MeContent() {
             </div>
           </div>
           <div className="flex gap-3">
+            <Link
+              className="inline-flex min-h-11 items-center gap-2 rounded-xl border border-blue-200 bg-white px-4 py-3 text-sm font-black text-blue-700 hover:bg-blue-50"
+              href="/me/ai-experience"
+            >
+              AI 辩论感受
+            </Link>
+            <Link
+              className="inline-flex min-h-11 items-center gap-2 rounded-xl border border-blue-200 bg-white px-4 py-3 text-sm font-black text-blue-700 hover:bg-blue-50"
+              href="/me/postmatch-surveys"
+            >
+              赛后问卷
+            </Link>
             <button
               className="inline-flex min-h-11 items-center gap-2 rounded-xl border border-blue-200 bg-white px-4 py-3 text-sm font-black text-blue-700 hover:bg-blue-50 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-blue-100"
               onClick={() => setProfileOpen(true)}

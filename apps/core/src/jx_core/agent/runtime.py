@@ -6,7 +6,8 @@ import asyncio
 import json
 import logging
 import os
-from dataclasses import dataclass, field
+import re
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Protocol, cast
@@ -18,18 +19,29 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..config import Settings
 from ..data_capture.content import CAPTURE_VERSION, store_content_blob
+from ..data_capture.provider import PROVIDER_CAPTURE_VERSION, ProviderCallCapture
+from ..data_capture.provider_persistence import persist_provider_capture
+from ..experiments.prompts import (
+    EXPERIMENT_PROMPT_VERSION,
+    render_experiment_decision_prompt,
+    render_experiment_speech_prompt,
+    render_history,
+)
 from ..models import (
     AgentAudioAsset,
     AgentFreeDebateDecision,
     AgentGeneration,
     AgentProfile,
+    ExperimentMatchAttempt,
     ExternalCall,
     Match,
+    MatchParticipant,
     ModelProfile,
     Room,
     Speech,
     VoiceProfile,
 )
+from ..runtime_identity import CallbackEnvelope
 from ..security.crypto import decrypt_secret
 from .audio import IncrementalOpusDecoder, apply_pcm16_gain
 from .llm import (
@@ -43,6 +55,49 @@ from .tts import QwenTtsConnection, TtsProviderError, TtsStreamResult
 
 logger = logging.getLogger("jx-core.agent")
 AGENT_TASK_CANCEL_TIMEOUT_SECONDS = 3.0
+_PROMPT_VARIABLE_RE = re.compile(r"{{\s*([A-Z][A-Z0-9_]*)\s*}}")
+
+
+def _snapshot_agent(
+    snapshot: dict[str, Any] | None, agent_profile_id: UUID
+) -> dict[str, Any] | None:
+    if not snapshot:
+        return None
+    for item in cast(list[object], snapshot.get("agents", [])):
+        if isinstance(item, dict):
+            mapping = cast(dict[str, Any], item)
+            if str(mapping.get("id")) == str(agent_profile_id):
+                return mapping
+    return None
+
+
+def _snapshot_prompt(
+    snapshot: dict[str, Any] | None,
+    *,
+    agent_profile_id: UUID,
+    stage_key: str,
+    purpose: str,
+) -> dict[str, Any] | None:
+    if not snapshot:
+        return None
+    candidates: list[dict[str, Any]] = []
+    for item in cast(list[object], snapshot.get("prompts", [])):
+        if not isinstance(item, dict):
+            continue
+        mapping = cast(dict[str, Any], item)
+        if mapping.get("stage_key") == stage_key and mapping.get("purpose") == purpose:
+            candidates.append(mapping)
+    return next(
+        (item for item in candidates if str(item.get("agent_profile_id")) == str(agent_profile_id)),
+        next((item for item in candidates if item.get("agent_profile_id") is None), None),
+    )
+
+
+def _render_snapshot_prompt(template: str, variables: dict[str, str]) -> str:
+    missing = sorted(set(_PROMPT_VARIABLE_RE.findall(template)) - set(variables))
+    if missing:
+        raise LlmProviderError("format_prompt_variable_missing")
+    return _PROMPT_VARIABLE_RE.sub(lambda match: variables[match.group(1)], template)
 
 
 async def _ignore_delta(_: str) -> None:
@@ -75,11 +130,27 @@ def _parse_decision(text: str) -> tuple[bool, float]:
     return should_speak, max(0.0, min(1.0, float(willingness_value)))
 
 
+def _parse_experiment_decision(text: str) -> tuple[bool, str]:
+    try:
+        parsed = json.loads(text.strip())
+    except json.JSONDecodeError as error:
+        raise LlmProviderError("agent_decision_invalid") from error
+    value = cast(dict[str, Any], parsed) if isinstance(parsed, dict) else {}
+    reason = value.get("decision_reason")
+    if set(value) != {"should_speak", "decision_reason"} or not isinstance(
+        value.get("should_speak"), bool
+    ):
+        raise LlmProviderError("agent_decision_invalid")
+    if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 20:
+        raise LlmProviderError("agent_decision_invalid")
+    return cast(bool, value["should_speak"]), reason.strip()
+
+
 class AgentRuntimeCallbacks(Protocol):
     async def report_free_decision(
         self,
         *,
-        match_id: UUID,
+        envelope: CallbackEnvelope,
         action_key: str,
         agent_profile_id: UUID,
         side: str,
@@ -90,38 +161,33 @@ class AgentRuntimeCallbacks(Protocol):
         attempt_no: int,
         duration_ms: int,
         error_code: str | None,
+        decision_reason: str | None = None,
     ) -> object: ...
 
-    async def publish_agent_text_delta(
-        self, match_id: UUID, generation_id: UUID, text: str
-    ) -> None: ...
+    async def publish_agent_text_delta(self, *, envelope: CallbackEnvelope, text: str) -> None: ...
+
+    async def agent_text_generated(self, *, envelope: CallbackEnvelope, text: str) -> None: ...
 
     async def publish_agent_subtitle(
-        self, match_id: UUID, speech_id: UUID, text: str, played_ms: int
+        self, *, envelope: CallbackEnvelope, text: str, played_ms: int
     ) -> None: ...
 
-    async def publish_agent_retry(
-        self, match_id: UUID, generation_id: UUID, error_code: str
-    ) -> None: ...
+    async def publish_agent_retry(self, *, envelope: CallbackEnvelope, error_code: str) -> None: ...
 
     async def start_agent_playback(
         self,
         *,
-        match_id: UUID,
-        speech_id: UUID,
-        generation_id: UUID,
+        envelope: CallbackEnvelope,
         agent_profile_id: UUID,
         audio_storage_path: str,
     ) -> object: ...
 
-    async def finish_agent_playback(self, match_id: UUID, speech_id: UUID) -> object: ...
+    async def finish_agent_playback(self, *, envelope: CallbackEnvelope) -> object: ...
 
     async def finalize_agent_speech(
         self,
         *,
-        match_id: UUID,
-        speech_id: UUID,
-        generation_id: UUID,
+        envelope: CallbackEnvelope,
         final_text: str,
         llm_draft_text: str,
         audio_storage_path: str,
@@ -130,7 +196,7 @@ class AgentRuntimeCallbacks(Protocol):
     ) -> object: ...
 
     async def handle_agent_failure(
-        self, match_id: UUID, generation_id: UUID | None, error_code: str
+        self, *, envelope: CallbackEnvelope, error_code: str
     ) -> None: ...
 
 
@@ -153,6 +219,12 @@ class AgentConfig:
     rate: float
     chars_per_second: float
     playback_gain: float
+    experiment_mode: bool = False
+    formal_4v4: bool = False
+    decision_messages: list[dict[str, str]] | None = None
+    prompt_version: str | None = None
+    opportunity_id: UUID | None = None
+    opportunity_generation: int | None = None
 
 
 @dataclass(slots=True)
@@ -185,6 +257,12 @@ class AgentRun:
     decoder: IncrementalOpusDecoder | None = None
     text_queue: asyncio.Queue[str | None] | None = None
     tts_task: asyncio.Task[TtsStreamResult] | None = None
+    logical_call_id: UUID = field(default_factory=uuid4)
+    tts_logical_call_id: UUID = field(default_factory=uuid4)
+    llm_capture: ProviderCallCapture | None = None
+    tts_capture: ProviderCallCapture | None = None
+    media_fenced: bool = False
+    callback_envelope: CallbackEnvelope | None = None
 
     @property
     def draft(self) -> str:
@@ -207,10 +285,29 @@ class AgentRuntime:
         self._decision_tasks: dict[UUID, asyncio.Task[None]] = {}
         self._tts_connections: dict[UUID, QwenTtsConnection] = {}
         self._lock = asyncio.Lock()
+        self._media_lock = asyncio.Lock()
 
     @property
     def capacity_limiter(self) -> LlmCapacityLimiter:
         return self._limiter
+
+    @staticmethod
+    def _run_envelope(run: AgentRun, *, attempt_no: int | None = None) -> CallbackEnvelope:
+        if run.callback_envelope is not None:
+            return replace(
+                run.callback_envelope,
+                attempt_no=attempt_no or run.callback_envelope.attempt_no,
+            )
+        return CallbackEnvelope(
+            match_id=run.match_id,
+            speech_id=run.speech_id,
+            attempt_no=attempt_no or 1,
+            generation_id=run.generation_id,
+            connection_epoch=None,
+            context_version=0,
+            opportunity_id=None,
+            opportunity_generation=None,
+        )
 
     async def start_agent(
         self,
@@ -253,6 +350,7 @@ class AgentRuntime:
         side: str,
         agent_profile_ids: list[UUID],
         decision_round_id: UUID,
+        envelope: CallbackEnvelope,
     ) -> None:
         """Run and report each free-debate decision independently."""
 
@@ -274,25 +372,47 @@ class AgentRuntime:
                 side=side,
             )
             last_error: Exception | None = None
+            logical_call_id = uuid4()
             for attempt in (1, 2):
                 leases: tuple[asyncio.Semaphore, asyncio.Semaphore] | None = None
                 client: OpenAIStreamingClient | None = None
-                value: tuple[bool, float] | None = None
+                value: tuple[bool, float | None, str | None] | None = None
                 external_call_id: UUID | None = None
                 raw_response: str | None = None
+                provider_capture = ProviderCallCapture()
+                callback_envelope = replace(envelope, match_id=match_id, attempt_no=attempt)
                 try:
                     config = await self._load_config(run)
-                    decision_messages = [
-                        *config.messages,
-                        {
-                            "role": "user",
-                            "content": (
-                                "这是自由辩论快速决策。只输出 JSON，不要 Markdown："
-                                '{"should_speak":true或false,"willingness":0到1的小数}。'
-                                "结合当前辩论上下文判断是否值得发言。"
-                            ),
-                        },
-                    ]
+                    callback_envelope = replace(
+                        envelope,
+                        match_id=match_id,
+                        attempt_no=attempt,
+                        context_version=config.context_version,
+                    )
+                    boolean_decision = config.experiment_mode or config.formal_4v4
+                    decision_messages = list(config.decision_messages or config.messages)
+                    if boolean_decision:
+                        decision_messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "这是自由辩论快速决策。只输出 JSON，不要 Markdown："
+                                    '{"should_speak":true或false,"decision_reason":"20字以内理由"}。'
+                                    "decision_reason 必须填写且不超过 20 个字。"
+                                    "结合当前辩论上下文判断是否值得发言。"
+                                ),
+                            }
+                        )
+                    elif not config.decision_messages:
+                        decision_messages.append(
+                            {
+                                "role": "user",
+                                "content": (
+                                    "这是自由辩论快速决策。"
+                                    "请结合当前辩论上下文判断是否值得发言。"
+                                ),
+                            }
+                        )
                     leases = await self._limiter.acquire(
                         config.model_key, config.model_limit, timeout_seconds=3.0
                     )
@@ -300,8 +420,10 @@ class AgentRuntime:
                         external_call_id = await self._start_decision_call(
                             config=config,
                             decision_round_id=decision_round_id,
+                            envelope=callback_envelope,
                             messages=decision_messages,
                             attempt_no=attempt,
+                            logical_call_id=logical_call_id,
                         )
                     except Exception:
                         logger.warning(
@@ -322,15 +444,29 @@ class AgentRuntime:
                     )
                     result = await client.stream_chat(
                         messages=decision_messages,
-                        max_tokens=64,
+                        max_tokens=32 if boolean_decision else 64,
                         generation_params={
                             **config.generation_params,
-                            "enable_thinking": False,
+                            **(
+                                {
+                                    "temperature": 0.75,
+                                    "top_p": 0.9,
+                                    "enable_thinking": False,
+                                }
+                                if boolean_decision
+                                else {"enable_thinking": False}
+                            ),
                         },
                         on_delta=_ignore_delta,
+                        capture=provider_capture,
                     )
                     raw_response = result.text
-                    value = _parse_decision(result.text)
+                    if boolean_decision:
+                        parsed_decision = _parse_experiment_decision(result.text)
+                        value = (parsed_decision[0], None, parsed_decision[1])
+                    else:
+                        parsed_decision = _parse_decision(result.text)
+                        value = (*parsed_decision, None)
                     try:
                         await self._finish_external_call(
                             external_call_id,
@@ -338,6 +474,7 @@ class AgentRuntime:
                             first_result_latency_ms=getattr(result, "first_token_latency_ms", None),
                             completed_latency_ms=getattr(result, "completed_latency_ms", None),
                             completion_tokens=getattr(result, "completion_tokens", None),
+                            provider_capture=provider_capture,
                         )
                     except Exception:
                         logger.warning(
@@ -351,7 +488,10 @@ class AgentRuntime:
                 except asyncio.CancelledError:
                     try:
                         await self._fail_external_call(
-                            external_call_id, "cancelled", cancelled=True
+                            external_call_id,
+                            "cancelled",
+                            cancelled=True,
+                            provider_capture=provider_capture,
                         )
                     except Exception:
                         logger.warning(
@@ -372,6 +512,7 @@ class AgentRuntime:
                             response_payload=(
                                 {"text": raw_response} if raw_response is not None else None
                             ),
+                            provider_capture=provider_capture,
                         )
                     except Exception:
                         logger.warning(
@@ -389,13 +530,14 @@ class AgentRuntime:
                         await _close_llm_client(client)
                 if value is not None:
                     await self._callbacks.report_free_decision(
-                        match_id=match_id,
+                        envelope=callback_envelope,
                         action_key=action_key,
                         agent_profile_id=agent_profile_id,
                         side=side,
                         decision_round_id=decision_round_id,
                         should_speak=value[0],
                         willingness=value[1],
+                        decision_reason=value[2],
                         failed=False,
                         attempt_no=attempt,
                         duration_ms=max(
@@ -407,13 +549,14 @@ class AgentRuntime:
                     return
             assert last_error is not None
             await self._callbacks.report_free_decision(
-                match_id=match_id,
+                envelope=replace(envelope, match_id=match_id, attempt_no=2),
                 action_key=action_key,
                 agent_profile_id=agent_profile_id,
                 side=side,
                 decision_round_id=decision_round_id,
                 should_speak=None,
                 willingness=None,
+                decision_reason=None,
                 failed=True,
                 attempt_no=2,
                 duration_ms=max(
@@ -451,25 +594,80 @@ class AgentRuntime:
         final_text = draft
         if run.spool_path is None or run.storage_path is None or run.generation_id is None:
             await self._callbacks.handle_agent_failure(
-                match_id, run.generation_id, "tts_audio_empty"
+                envelope=self._run_envelope(run), error_code="tts_audio_empty"
             )
             return
         if run.spool_path.exists():
             run.storage_path.parent.mkdir(parents=True, exist_ok=True)
             os.replace(run.spool_path, run.storage_path)
-        await self._persist_final(run)
-        if self._runs.get(match_id) is run:
-            self._runs.pop(match_id, None)
         try:
-            await self._callbacks.finalize_agent_speech(
-                match_id=match_id,
-                speech_id=speech_id,
-                generation_id=run.generation_id,
-                final_text=final_text,
-                llm_draft_text=draft,
-                audio_storage_path=str(run.storage_path),
-                audio_duration_ms=played_ms,
-                audio_truncated=truncated,
+            async with asyncio.timeout(AGENT_FINALIZATION_TIMEOUT_SECONDS):
+                await self._persist_final(run)
+                if self._runs.get(match_id) is run:
+                    self._runs.pop(match_id, None)
+                callback_kwargs: dict[str, Any] = {
+                    "envelope": self._run_envelope(run),
+                    "final_text": final_text,
+                    "llm_draft_text": draft,
+                    "audio_storage_path": str(run.storage_path),
+                    "audio_duration_ms": played_ms,
+                    "audio_truncated": truncated,
+                }
+                for callback_attempt in range(2):
+                    try:
+                        await self._callbacks.finalize_agent_speech(**callback_kwargs)
+                        break
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:
+                        if callback_attempt == 1:
+                            raise
+                        logger.warning(
+                            "Agent finalization callback failed; retrying",
+                            extra={
+                                "error_code": "agent_finalization_callback_retry",
+                                "match_id": str(match_id),
+                                "speech_id": str(speech_id),
+                                "generation_id": str(run.generation_id),
+                            },
+                        )
+                        await asyncio.sleep(0.05)
+        except TimeoutError:
+            logger.error(
+                "agent finalization timed out",
+                extra={
+                    "error_code": "agent_finalization_timeout",
+                    "match_id": str(match_id),
+                    "speech_id": str(speech_id),
+                    "generation_id": str(run.generation_id),
+                },
+            )
+            await self._callbacks.handle_agent_failure(
+                envelope=self._run_envelope(run), error_code="agent_finalization_timeout"
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            original = getattr(error, "orig", None)
+            diagnostic: dict[str, str] = {"exception_type": type(error).__name__}
+            sqlstate = getattr(original, "sqlstate", None)
+            if isinstance(sqlstate, str):
+                diagnostic["sqlstate"] = sqlstate
+            constraint = getattr(getattr(original, "diag", None), "constraint_name", None)
+            if isinstance(constraint, str) and constraint.isascii() and len(constraint) <= 128:
+                diagnostic["constraint"] = constraint
+            logger.exception(
+                "agent finalization failed",
+                extra={
+                    "error_code": "agent_finalization_failed",
+                    "match_id": str(match_id),
+                    "speech_id": str(speech_id),
+                    "generation_id": str(run.generation_id),
+                    "details": diagnostic,
+                },
+            )
+            await self._callbacks.handle_agent_failure(
+                envelope=self._run_envelope(run), error_code="agent_finalization_failed"
             )
         finally:
             try:
@@ -484,6 +682,16 @@ class AgentRuntime:
         run = self._runs.pop(match_id, None)
         if run is not None:
             await self._cancel_run(run)
+
+    async def fence_agent(self, match_id: UUID) -> None:
+        """Synchronously invalidate media before an interruption is broadcast."""
+        run = self._runs.get(match_id)
+        if run is None:
+            return
+        async with self._media_lock:
+            run.media_fenced = True
+            if run.source is not None:
+                run.source.clear_queue()
 
     async def cancel_free_decision(self, match_id: UUID) -> None:
         task = self._decision_tasks.pop(match_id, None)
@@ -511,31 +719,80 @@ class AgentRuntime:
             for attempt in (1, 2):
                 try:
                     config = await self._load_config(run)
+                    run.callback_envelope = CallbackEnvelope(
+                        match_id=run.match_id,
+                        speech_id=None,
+                        attempt_no=attempt,
+                        generation_id=None,
+                        connection_epoch=None,
+                        context_version=config.context_version,
+                        opportunity_id=config.opportunity_id,
+                        opportunity_generation=config.opportunity_generation,
+                    )
                     run.chars_per_second = config.chars_per_second
                     run.voice = config.voice
                     run.playback_gain = config.playback_gain
                     run.rate = config.rate
                     generation_id = await self._create_generation(config, attempt)
                     run.generation_id = generation_id
+                    assert run.callback_envelope is not None
+                    run.callback_envelope = replace(
+                        run.callback_envelope, generation_id=generation_id
+                    )
                     await self._execute(run, config, generation_id)
                     return
                 except asyncio.CancelledError:
                     raise
                 except Exception as error:
                     code = _error_code(error)
-                    await self._mark_generation_failed(run.generation_id, code)
+                    original = getattr(error, "orig", None)
+                    diagnostic: dict[str, str] = {"exception_type": type(error).__name__}
+                    sqlstate = getattr(original, "sqlstate", None)
+                    if isinstance(sqlstate, str):
+                        diagnostic["sqlstate"] = sqlstate
+                    constraint = getattr(
+                        getattr(original, "diag", None), "constraint_name", None
+                    )
+                    if (
+                        isinstance(constraint, str)
+                        and constraint.isascii()
+                        and len(constraint) <= 128
+                    ):
+                        diagnostic["constraint"] = constraint
+                    logger.exception(
+                        "agent pipeline failed",
+                        extra={
+                            "error_code": code,
+                            "match_id": str(run.match_id),
+                            "generation_id": str(run.generation_id) if run.generation_id else None,
+                            "details": diagnostic,
+                        },
+                    )
+                    playback_started = run.speech_id is not None
+                    await self._mark_generation_failed(
+                        run.generation_id,
+                        code,
+                        llm_capture=run.llm_capture,
+                        tts_capture=run.tts_capture,
+                    )
                     if isinstance(error, TtsProviderError):
                         await self._discard_tts_connection(run.match_id)
+                    if playback_started:
+                        await self._callbacks.handle_agent_failure(
+                            envelope=self._run_envelope(run, attempt_no=attempt), error_code=code
+                        )
                     await self._cleanup_attempt(run)
-                    if attempt == 1 and run.speech_id is None:
+                    if attempt == 1 and not playback_started:
                         if run.generation_id is not None:
                             await self._callbacks.publish_agent_retry(
-                                run.match_id, run.generation_id, code
+                                envelope=self._run_envelope(run, attempt_no=attempt),
+                                error_code=code,
                             )
                         continue
-                    await self._callbacks.handle_agent_failure(
-                        run.match_id, run.generation_id, code
-                    )
+                    if not playback_started:
+                        await self._callbacks.handle_agent_failure(
+                            envelope=self._run_envelope(run, attempt_no=attempt), error_code=code
+                        )
                     return
         finally:
             # Do not let a terminal task make a later recovery look like a
@@ -607,19 +864,23 @@ class AgentRuntime:
                             "generation_id": str(generation_id),
                         },
                     )
+                run.tts_capture = ProviderCallCapture()
                 run.tts_task = asyncio.create_task(
                     connection.synthesize(
                         iter_text_queue(run.text_queue),
                         voice=config.voice,
                         rate=config.rate,
                         on_audio=on_audio,
+                        capture=run.tts_capture,
                     ),
                     name=f"agent-tts-{generation_id}",
                 )
 
         async def on_delta(delta: str) -> None:
             run.draft_parts.append(delta)
-            await self._callbacks.publish_agent_text_delta(run.match_id, generation_id, delta)
+            await self._callbacks.publish_agent_text_delta(
+                envelope=self._run_envelope(run), text=delta
+            )
             await start_tts_if_needed()
             assert run.text_queue is not None
             await run.text_queue.put(delta)
@@ -636,8 +897,11 @@ class AgentRuntime:
             self._play_pcm(run, generation_id), name=f"agent-play-{generation_id}"
         )
         try:
+            run.llm_capture = ProviderCallCapture()
             try:
-                await self._start_generation_call(generation_id, config)
+                await self._start_generation_call(
+                    generation_id, config, logical_call_id=run.logical_call_id
+                )
             except Exception:
                 logger.warning(
                     "Agent LLM call capture start failed",
@@ -652,8 +916,12 @@ class AgentRuntime:
                 max_tokens=config.max_tokens,
                 generation_params=config.generation_params,
                 on_delta=on_delta,
+                capture=run.llm_capture,
             )
-            await self._mark_generation_llm_ready(generation_id, result)
+            await self._mark_generation_llm_ready(generation_id, result, run.llm_capture)
+            await self._callbacks.agent_text_generated(
+                envelope=self._run_envelope(run), text=result.text
+            )
             assert run.text_queue is not None
             assert run.tts_task is not None
             await run.text_queue.put(None)
@@ -678,6 +946,7 @@ class AgentRuntime:
                     first_result_latency_ms=tts_result.first_audio_latency_ms,
                     completed_latency_ms=tts_result.completed_latency_ms,
                     audio_bytes=run.byte_count,
+                    provider_capture=run.tts_capture,
                 )
             except Exception:
                 logger.warning(
@@ -696,7 +965,7 @@ class AgentRuntime:
             run.natural_complete = True
             if run.speech_id is None:
                 raise TtsProviderError("tts_audio_empty")
-            await self._callbacks.finish_agent_playback(run.match_id, run.speech_id)
+            await self._callbacks.finish_agent_playback(envelope=self._run_envelope(run))
         finally:
             self._limiter.release(leases)
             await _close_llm_client(client)
@@ -711,34 +980,65 @@ class AgentRuntime:
         source = run.source
         frame_no = 0
         async for pcm in run.decoder.frames():
-            if run.speech_id is None:
-                run.speech_id = uuid4()
-                assert run.storage_path is not None
-                await self._callbacks.start_agent_playback(
-                    match_id=run.match_id,
-                    speech_id=run.speech_id,
-                    generation_id=generation_id,
-                    agent_profile_id=run.agent_profile_id,
-                    audio_storage_path=str(run.storage_path),
+            async with self._media_lock:
+                if (
+                    run.media_fenced
+                    or self._runs.get(run.match_id) is not run
+                    or run.generation_id != generation_id
+                ):
+                    return
+                if run.speech_id is None:
+                    run.speech_id = uuid4()
+                    run.callback_envelope = replace(
+                        self._run_envelope(run), speech_id=run.speech_id
+                    )
+                    assert run.storage_path is not None
+                    await self._start_agent_playback_with_retry(run)
+                pcm = apply_pcm16_gain(pcm, run.playback_gain)
+                samples = len(pcm) // 2
+                frame = rtc.AudioFrame(
+                    data=pcm,
+                    sample_rate=48_000,
+                    num_channels=1,
+                    samples_per_channel=samples,
                 )
-            pcm = apply_pcm16_gain(pcm, run.playback_gain)
-            samples = len(pcm) // 2
-            frame = rtc.AudioFrame(
-                data=pcm,
-                sample_rate=48_000,
-                num_channels=1,
-                samples_per_channel=samples,
-            )
-            await source.capture_frame(frame)
-            run.played_samples += samples
-            frame_no += 1
+                await source.capture_frame(frame)
+                run.played_samples += samples
+                frame_no += 1
             if frame_no % 5 == 0:
                 assert run.speech_id is not None
                 played_ms = run.played_samples * 1000 // 48_000
                 subtitle = _played_prefix(run.draft, played_ms, run.chars_per_second)
                 await self._callbacks.publish_agent_subtitle(
-                    run.match_id, run.speech_id, subtitle, played_ms
+                    envelope=self._run_envelope(run), text=subtitle, played_ms=played_ms
                 )
+
+    async def _start_agent_playback_with_retry(self, run: AgentRun) -> None:
+        """Commit the first playback event without failing on one transient error."""
+        assert run.storage_path is not None
+        for callback_attempt in range(2):
+            try:
+                await self._callbacks.start_agent_playback(
+                    envelope=self._run_envelope(run),
+                    agent_profile_id=run.agent_profile_id,
+                    audio_storage_path=str(run.storage_path),
+                )
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if callback_attempt == 1:
+                    raise
+                logger.warning(
+                    "Agent playback-start callback failed; retrying",
+                    extra={
+                        "error_code": "agent_playback_start_callback_retry",
+                        "match_id": str(run.match_id),
+                        "speech_id": str(run.speech_id) if run.speech_id else None,
+                        "generation_id": str(run.generation_id) if run.generation_id else None,
+                    },
+                )
+                await asyncio.sleep(0.05)
 
     async def _connect_publisher(self, match_id: UUID) -> tuple[rtc.Room, rtc.AudioSource]:
         if (
@@ -782,33 +1082,67 @@ class AgentRuntime:
             match = await session.get(Match, run.match_id)
             if match is None:
                 raise LlmProviderError("match_not_found")
+            experiment_attempt = await session.scalar(
+                select(ExperimentMatchAttempt).where(
+                    ExperimentMatchAttempt.match_id == run.match_id
+                )
+            )
+            experiment_mode = experiment_attempt is not None
+            runtime_snapshot = match.runtime_snapshot or {}
+            formal_4v4 = bool(runtime_snapshot.get("formal_4v4", False))
+            competition_mode = experiment_mode or formal_4v4
             room = await session.get(Room, match.room_id)
             agent = await session.get(AgentProfile, run.agent_profile_id)
             if room is None or agent is None or agent.status != "ENABLED":
                 raise LlmProviderError("agent_unavailable")
+            format_snapshot = room.format_snapshot
+            frozen_agent = _snapshot_agent(format_snapshot, run.agent_profile_id)
+            if format_snapshot is not None and frozen_agent is None:
+                raise LlmProviderError("agent_unavailable")
             model = await session.get(ModelProfile, agent.model_profile_id)
             voice = await session.get(VoiceProfile, agent.voice_profile_id)
-            if (
-                model is None
-                or model.status != "ENABLED"
-                or not model.base_url
-                or not model.model_id
-                or model.api_key_ciphertext is None
-                or model.api_key_nonce is None
+            if model is None or model.api_key_ciphertext is None or model.api_key_nonce is None:
+                raise LlmProviderError("model_profile_unavailable")
+            if frozen_agent is None and (
+                model.status != "ENABLED" or not model.base_url or not model.model_id
             ):
                 raise LlmProviderError("model_profile_unavailable")
-            if voice is None or voice.status != "ENABLED" or voice.kind != "AGENT":
+            if voice is None or (frozen_agent is None and voice.status != "ENABLED"):
                 raise LlmProviderError("voice_profile_unavailable")
+            frozen_model = (
+                cast(dict[str, Any], frozen_agent.get("model", {})) if frozen_agent else {}
+            )
+            frozen_voice = (
+                cast(dict[str, Any], frozen_agent.get("voice", {})) if frozen_agent else {}
+            )
+            base_url = str(frozen_model.get("base_url") or model.base_url or "")
+            model_id = str(frozen_model.get("model_id") or model.model_id or "")
+            if not base_url or not model_id:
+                raise LlmProviderError("model_profile_unavailable")
+            participant = await session.scalar(
+                select(MatchParticipant).where(
+                    MatchParticipant.match_id == run.match_id,
+                    MatchParticipant.kind == "AGENT",
+                    MatchParticipant.agent_profile_id == run.agent_profile_id,
+                )
+            )
+            if experiment_mode and participant is None:
+                raise LlmProviderError("agent_unavailable")
+            speech_statuses = ("FINALIZED", "STARTED") if competition_mode else ("FINALIZED",)
             speeches = list(
                 (
                     await session.scalars(
                         select(Speech)
-                        .where(Speech.match_id == run.match_id, Speech.status == "FINALIZED")
+                        .where(
+                            Speech.match_id == run.match_id,
+                            Speech.status.in_(speech_statuses),
+                            Speech.display_text.is_not(None),
+                        )
                         .order_by(Speech.created_at)
                     )
                 ).all()
             )
-            history = [
+            history: list[dict[str, Any]] = [
                 {
                     "stage": _stage_name_for_action(speech.action_key, room.rule_snapshot),
                     "speaker": _speaker_label(speech.side, speech.seat_no),
@@ -825,11 +1159,13 @@ class AgentRuntime:
                 for speech in speeches
             ]
             topic = room.topic_snapshot
-            effective_side = run.side or _side_label(run.action_key, room.rule_snapshot)
+            effective_side = run.side or _side_for_action(run.action_key, room.rule_snapshot)
             affirmative_position = str(topic.get("affirmative_text") or "支持正方对辩题的明确判断")
             negative_position = str(topic.get("negative_text") or "支持反方对辩题的明确判断")
-            current_position = (
-                affirmative_position if effective_side == "AFFIRMATIVE" else negative_position
+            position, current_position = _prompt_side_values(
+                effective_side,
+                affirmative_position=affirmative_position,
+                negative_position=negative_position,
             )
             opponent_side = "NEGATIVE" if effective_side == "AFFIRMATIVE" else "AFFIRMATIVE"
             recent_history = history[-8:]
@@ -847,11 +1183,15 @@ class AgentRuntime:
                 if item.get("speaker_kind") == "AGENT"
                 and item.get("agent_profile_id") == str(run.agent_profile_id)
             ]
+            chars_per_second = float(
+                frozen_voice.get("chars_per_second") or voice.chars_per_second or 4.0
+            )
+            token_per_char = float(frozen_model.get("token_per_char") or model.token_per_char)
             target_chars = max(
                 20,
-                int((run.duration_ms / 1000) * (voice.chars_per_second or 4.0) * 0.85),
+                int((run.duration_ms / 1000) * chars_per_second * 0.85),
             )
-            max_tokens = max(32, int(target_chars * model.token_per_char + 16))
+            max_tokens = max(32, int(target_chars * token_per_char + 16))
             current_stage, next_stage = _current_and_next_stage(run.action_key, room.rule_snapshot)
             context = {
                 "model_name": model.model_id,
@@ -865,12 +1205,126 @@ class AgentRuntime:
                 "current_stage": current_stage,
                 "next_stage": next_stage,
                 "holder": effective_side,
-                "debate_history": history,
+                "debate_history": json.loads(render_history(history)),
                 "recent_history": recent_history,
                 "recent_opponent_speech": recent_opponent,
                 "this_agent_previous_speeches": agent_history[-4:],
                 "target_chinese_characters": target_chars,
             }
+            runtime_snapshot = match.runtime_snapshot
+            affirmative_remaining_ms = int(
+                runtime_snapshot.get("free_affirmative_remaining_ms") or 0
+            )
+            negative_remaining_ms = int(runtime_snapshot.get("free_negative_remaining_ms") or 0)
+            side_remaining_ms = (
+                affirmative_remaining_ms
+                if effective_side == "AFFIRMATIVE"
+                else negative_remaining_ms
+            )
+            opponent_remaining_ms = (
+                negative_remaining_ms
+                if effective_side == "AFFIRMATIVE"
+                else affirmative_remaining_ms
+            )
+            messages: list[dict[str, str]] = []
+            decision_messages: list[dict[str, str]] | None = None
+            params: dict[str, Any] = {}
+            stage_key = _stage_key_for_action(run.action_key, room.rule_snapshot)
+            if format_snapshot and format_snapshot.get("schema") != "rule-config-v1":
+                stage_key = _stage_kind_for_action(run.action_key, room.rule_snapshot)
+            speech_template = _snapshot_prompt(
+                format_snapshot,
+                agent_profile_id=run.agent_profile_id,
+                stage_key=stage_key,
+                purpose="SPEECH",
+            )
+            decision_template = _snapshot_prompt(
+                format_snapshot,
+                agent_profile_id=run.agent_profile_id,
+                stage_key=stage_key,
+                purpose="DECISION",
+            )
+            prompt_version: str | None = None
+            if speech_template is not None:
+                assert participant is not None
+                assert frozen_agent is not None
+                assert format_snapshot is not None
+                prompt_variables = {
+                    "TOPIC": str(topic.get("title", "")),
+                    "POSITION": position,
+                    "STANCE": current_position,
+                    "AFFIRMATIVE_STANCE": affirmative_position,
+                    "NEGATIVE_STANCE": negative_position,
+                    "SEAT": _seat_label(participant.seat_no),
+                    "DEBATER_SEAT": _seat_label(participant.seat_no),
+                    "STAGE_NAME": current_stage,
+                    "MAX_SPEECH_SECONDS": str(max(1, run.duration_ms // 1000)),
+                    "TARGET_CHAR_COUNT": str(target_chars),
+                    "DEBATE_HISTORY": render_history(history),
+                    "SIDE_REMAINING_MS": str(side_remaining_ms),
+                    "OPPONENT_REMAINING_MS": str(opponent_remaining_ms),
+                    "CURRENT_STAGE": current_stage,
+                    "NEXT_STAGE": next_stage,
+                }
+                speech_prompt = _render_snapshot_prompt(
+                    str(speech_template["template_text"]), prompt_variables
+                )
+                messages = [{"role": "user", "content": speech_prompt}]
+                if decision_template is not None:
+                    decision_messages = [
+                        {
+                            "role": "user",
+                            "content": _render_snapshot_prompt(
+                                str(decision_template["template_text"]), prompt_variables
+                            ),
+                        }
+                    ]
+                params = {
+                    **cast(dict[str, Any], frozen_model.get("generation_params", {})),
+                    **cast(dict[str, Any], frozen_agent.get("generation_params", {})),
+                }
+                prompt_version = (
+                    f"{format_snapshot.get('rule_key')}@r{format_snapshot.get('config_revision')}"
+                    if format_snapshot.get("schema") == "rule-config-v1"
+                    else f"{format_snapshot.get('format_key')}@{format_snapshot.get('version')}"
+                )
+            elif experiment_mode:
+                assert participant is not None
+                messages = [
+                    {
+                        "role": "user",
+                        "content": render_experiment_speech_prompt(
+                            side=effective_side,
+                            seat_no=participant.seat_no,
+                            topic=str(topic.get("title", "")),
+                            affirmative_stance=affirmative_position,
+                            negative_stance=negative_position,
+                            side_remaining_ms=side_remaining_ms,
+                            opponent_remaining_ms=opponent_remaining_ms,
+                            history=history,
+                            max_speech_seconds=max(1, run.duration_ms // 1000),
+                        ),
+                    }
+                ]
+                decision_messages = [
+                    {
+                        "role": "user",
+                        "content": render_experiment_decision_prompt(
+                            side=effective_side,
+                            seat_no=participant.seat_no,
+                            topic=str(topic.get("title", "")),
+                            affirmative_stance=affirmative_position,
+                            negative_stance=negative_position,
+                            side_remaining_ms=side_remaining_ms,
+                            opponent_remaining_ms=opponent_remaining_ms,
+                            history=history,
+                        ),
+                    }
+                ]
+                params = {"temperature": 0.75, "top_p": 0.9, "enable_thinking": False}
+                prompt_version = EXPERIMENT_PROMPT_VERSION
+            else:
+                decision_messages = None
             prompt_addendum = (
                 "\n\n【必须遵守的现场发言约束】\n"
                 f"你当前是{('正方' if effective_side == 'AFFIRMATIVE' else '反方')}，"
@@ -883,25 +1337,26 @@ class AgentRuntime:
                 "避免使用‘首先/其次/综上’等机械套话和‘谢谢主席，各位好’等固定开场，直接进入回应。"
                 "输出仅为可直接朗读的正式发言，不输出分析、标签、标题或舞台说明。"
             )
-            messages = [
-                {
-                    "role": "system",
-                    "content": (
-                        agent.system_prompt
-                        or "你是一名中文辩论赛辩手。论证清晰、直接回应对方，不输出舞台说明。"
-                    )
-                    + prompt_addendum,
-                },
-                {
-                    "role": "user",
-                    "content": (
-                        f"{agent.debater_prompt}\n"
-                        "请只根据下面的结构化现场上下文生成本轮发言：\n"
-                        f"{json.dumps(context, ensure_ascii=False)}"
-                    ),
-                },
-            ]
-            params = {**model.generation_params, **agent.generation_params}
+            if not experiment_mode and speech_template is None:
+                messages = [
+                    {
+                        "role": "system",
+                        "content": (
+                            agent.system_prompt
+                            or "你是一名中文辩论赛辩手。论证清晰、直接回应对方，不输出舞台说明。"
+                        )
+                        + prompt_addendum,
+                    },
+                    {
+                        "role": "user",
+                        "content": (
+                            f"{agent.debater_prompt}\n"
+                            "请只根据下面的结构化现场上下文生成本轮发言：\n"
+                            f"{json.dumps(context, ensure_ascii=False)}"
+                        ),
+                    },
+                ]
+                params = {**model.generation_params, **agent.generation_params}
             api_key = decrypt_secret(
                 model.api_key_ciphertext,
                 model.api_key_nonce,
@@ -913,18 +1368,33 @@ class AgentRuntime:
                 agent_profile_id=run.agent_profile_id,
                 context_version=match.context_version,
                 match_seed=match.match_seed,
-                model_key=str(model.id),
-                base_url=model.base_url,
-                model_id=model.model_id,
+                model_key=str(frozen_model.get("id") or model.id),
+                base_url=base_url,
+                model_id=model_id,
                 api_key=api_key,
-                model_limit=model.max_concurrency,
+                model_limit=int(frozen_model.get("max_concurrency") or model.max_concurrency),
                 generation_params=params,
                 max_tokens=max_tokens,
                 messages=messages,
-                voice=voice.provider_voice,
-                rate=voice.rate,
-                chars_per_second=voice.chars_per_second or 4.0,
-                playback_gain=voice.playback_gain,
+                voice=str(frozen_voice.get("provider_voice") or voice.provider_voice),
+                rate=float(frozen_voice.get("rate") or voice.rate),
+                chars_per_second=chars_per_second,
+                playback_gain=float(frozen_voice.get("playback_gain") or voice.playback_gain),
+                experiment_mode=experiment_mode,
+                formal_4v4=formal_4v4,
+                decision_messages=decision_messages,
+                prompt_version=prompt_version,
+                opportunity_id=(
+                    UUID(str(runtime_snapshot["opportunity_id"]))
+                    if runtime_snapshot.get("opportunity_id")
+                    else None
+                ),
+                opportunity_generation=(
+                    int(runtime_snapshot["opportunity_generation"])
+                    if runtime_snapshot.get("opportunity_generation")
+                    and int(runtime_snapshot["opportunity_generation"]) > 0
+                    else None
+                ),
             )
 
     async def _start_decision_call(
@@ -932,8 +1402,10 @@ class AgentRuntime:
         *,
         config: AgentConfig,
         decision_round_id: UUID,
+        envelope: CallbackEnvelope,
         messages: list[dict[str, str]],
         attempt_no: int,
+        logical_call_id: UUID,
     ) -> UUID:
         call_id = uuid4()
         async with self._session_factory() as session:
@@ -945,21 +1417,6 @@ class AgentRuntime:
                         AgentFreeDebateDecision.agent_profile_id == config.agent_profile_id,
                     )
                 )
-                request_blob_id = await store_content_blob(
-                    session,
-                    content_kind="REQUEST",
-                    payload={
-                        "model": config.model_id,
-                        "messages": messages,
-                        "stream": True,
-                        "stream_options": {"include_usage": True},
-                        "max_tokens": 64,
-                        "generation_params": {
-                            **config.generation_params,
-                            "enable_thinking": False,
-                        },
-                    },
-                )
                 session.add(
                     ExternalCall(
                         id=call_id,
@@ -970,16 +1427,24 @@ class AgentRuntime:
                         attempt_no=attempt_no,
                         status="STARTED",
                         match_id=config.match_id,
+                        speech_id=envelope.speech_id,
                         agent_decision_id=decision.id if decision is not None else None,
                         decision_round_id=decision_round_id,
-                        context_version=config.context_version,
-                        request_blob_id=request_blob_id,
+                        opportunity_id=envelope.opportunity_id,
+                        connection_epoch=envelope.connection_epoch,
+                        context_version=envelope.context_version,
+                        capture_version=PROVIDER_CAPTURE_VERSION,
+                        captured_at=datetime.now(UTC),
+                        source_kind="MATCH",
+                        logical_call_id=logical_call_id,
                         started_at=datetime.now(UTC),
                     )
                 )
         return call_id
 
-    async def _start_generation_call(self, generation_id: UUID, config: AgentConfig) -> UUID:
+    async def _start_generation_call(
+        self, generation_id: UUID, config: AgentConfig, *, logical_call_id: UUID
+    ) -> UUID:
         call_id = uuid4()
         async with self._session_factory() as session:
             async with session.begin():
@@ -999,7 +1464,10 @@ class AgentRuntime:
                         agent_generation_id=generation_id,
                         generation_id=generation_id,
                         context_version=config.context_version,
-                        request_blob_id=generation.request_blob_id,
+                        capture_version=PROVIDER_CAPTURE_VERSION,
+                        captured_at=datetime.now(UTC),
+                        source_kind="MATCH",
+                        logical_call_id=logical_call_id,
                         started_at=datetime.now(UTC),
                     )
                 )
@@ -1025,6 +1493,10 @@ class AgentRuntime:
                         agent_generation_id=generation_id,
                         generation_id=generation_id,
                         context_version=config.context_version,
+                        capture_version=PROVIDER_CAPTURE_VERSION,
+                        captured_at=datetime.now(UTC),
+                        source_kind="MATCH",
+                        logical_call_id=run.tts_logical_call_id,
                         started_at=datetime.now(UTC),
                     )
                 )
@@ -1041,6 +1513,7 @@ class AgentRuntime:
         completion_tokens: int | None = None,
         audio_bytes: int | None = None,
         audio_duration_ms: int | None = None,
+        provider_capture: ProviderCallCapture | None = None,
     ) -> None:
         if call_id is None:
             return
@@ -1049,7 +1522,9 @@ class AgentRuntime:
                 call = await session.get(ExternalCall, call_id, with_for_update=True)
                 if call is None:
                     return
-                if request_payload is not None:
+                if provider_capture is not None:
+                    await persist_provider_capture(session, call, provider_capture)
+                elif request_payload is not None:
                     call.request_blob_id = await store_content_blob(
                         session, content_kind="REQUEST", payload=request_payload
                     )
@@ -1073,6 +1548,7 @@ class AgentRuntime:
         *,
         cancelled: bool = False,
         response_payload: dict[str, Any] | None = None,
+        provider_capture: ProviderCallCapture | None = None,
     ) -> None:
         if call_id is None:
             return
@@ -1081,7 +1557,9 @@ class AgentRuntime:
                 call = await session.get(ExternalCall, call_id, with_for_update=True)
                 if call is None or call.status != "STARTED":
                     return
-                if response_payload is not None:
+                if provider_capture is not None:
+                    await persist_provider_capture(session, call, provider_capture)
+                elif response_payload is not None:
                     call.response_blob_id = await store_content_blob(
                         session, content_kind="RESPONSE", payload=response_payload
                     )
@@ -1097,6 +1575,7 @@ class AgentRuntime:
             "model_id": config.model_id,
             "max_tokens": config.max_tokens,
             "message_count": len(config.messages),
+            "prompt_version": config.prompt_version,
             "capture_version": CAPTURE_VERSION,
         }
         async with self._session_factory() as session:
@@ -1107,6 +1586,7 @@ class AgentRuntime:
                     "stream": True,
                     "stream_options": {"include_usage": True},
                     "max_tokens": config.max_tokens,
+                    "prompt_version": config.prompt_version,
                     "generation_params": {
                         **config.generation_params,
                         "enable_thinking": config.generation_params.get("enable_thinking", False),
@@ -1137,7 +1617,12 @@ class AgentRuntime:
                 )
         return generation_id
 
-    async def _mark_generation_llm_ready(self, generation_id: UUID, result: object) -> None:
+    async def _mark_generation_llm_ready(
+        self,
+        generation_id: UUID,
+        result: object,
+        provider_capture: ProviderCallCapture | None,
+    ) -> None:
         from .llm import LlmStreamResult
 
         if not isinstance(result, LlmStreamResult):
@@ -1167,7 +1652,8 @@ class AgentRuntime:
                 if call is not None:
                     completed_at = datetime.now(UTC)
                     call.status = "SUCCEEDED"
-                    call.response_blob_id = generation.response_blob_id
+                    if provider_capture is not None:
+                        await persist_provider_capture(session, call, provider_capture)
                     call.first_result_at = _at_latency(
                         call.started_at, result.first_token_latency_ms
                     )
@@ -1219,7 +1705,14 @@ class AgentRuntime:
                     tts_call.audio_bytes = run.byte_count
                     tts_call.audio_duration_ms = duration_ms
 
-    async def _mark_generation_failed(self, generation_id: UUID | None, error_code: str) -> None:
+    async def _mark_generation_failed(
+        self,
+        generation_id: UUID | None,
+        error_code: str,
+        *,
+        llm_capture: ProviderCallCapture | None = None,
+        tts_capture: ProviderCallCapture | None = None,
+    ) -> None:
         if generation_id is None:
             return
         async with self._session_factory() as session:
@@ -1242,6 +1735,9 @@ class AgentRuntime:
                     ).all()
                 )
                 for call in calls:
+                    capture = llm_capture if call.call_kind == "LLM_SPEECH" else tts_capture
+                    if capture is not None:
+                        await persist_provider_capture(session, call, capture)
                     call.status = "FAILED"
                     call.error_code = error_code
                     call.completed_at = datetime.now(UTC)
@@ -1267,6 +1763,12 @@ class AgentRuntime:
         run.text_queue = None
 
     async def _cancel_run(self, run: AgentRun) -> None:
+        # Fence publication before awaiting any potentially stuck LiveKit/API cleanup.
+        # A cancelled generation must never enqueue another frame after reset commits.
+        async with self._media_lock:
+            run.media_fenced = True
+            if run.source is not None:
+                run.source.clear_queue()
         if run.task is not None and not run.task.done():
             await self._cancel_agent_task(run.task)
         try:
@@ -1325,6 +1827,7 @@ def _at_latency(started_at: datetime, latency_ms: int | None) -> datetime | None
 
 
 AGENT_SUBTITLE_LEAD_MS = 300
+AGENT_FINALIZATION_TIMEOUT_SECONDS = 15.0
 
 
 def _played_prefix(text: str, played_ms: int, chars_per_second: float) -> str:
@@ -1335,12 +1838,22 @@ def _played_prefix(text: str, played_ms: int, chars_per_second: float) -> str:
     return text[:count]
 
 
-def _side_label(action_key: str, rule_snapshot: dict[str, Any]) -> str:
+def _side_for_action(action_key: str, rule_snapshot: dict[str, Any]) -> str:
     for stage in rule_snapshot.get("stages", []):
         for action in stage.get("actions", []):
             if f"{stage.get('position')}:{action.get('position')}" == action_key:
-                return "正方" if action.get("side") == "AFFIRMATIVE" else "反方"
+                return str(action.get("side") or "")
     return ""
+
+
+def _prompt_side_values(
+    side: str, *, affirmative_position: str, negative_position: str
+) -> tuple[str, str]:
+    if side == "AFFIRMATIVE":
+        return "正方", affirmative_position
+    if side == "NEGATIVE":
+        return "反方", negative_position
+    raise LlmProviderError("agent_side_invalid")
 
 
 def _stage_name(stage: dict[str, Any]) -> str:
@@ -1354,6 +1867,23 @@ def _stage_name_for_action(action_key: str, rule_snapshot: dict[str, Any]) -> st
         if int(stage.get("position", 0)) == stage_position:
             return _stage_name(stage)
     return f"第 {stage_position} 阶段"
+
+
+def _stage_key_for_action(action_key: str, rule_snapshot: dict[str, Any]) -> str:
+    stage_position = int(action_key.split(":", 1)[0])
+    return f"stage-{stage_position}"
+
+
+def _stage_kind_for_action(action_key: str, rule_snapshot: dict[str, Any]) -> str:
+    stage_position = int(action_key.split(":", 1)[0])
+    for stage in rule_snapshot.get("stages", []):
+        if int(stage.get("position", 0)) == stage_position:
+            return f"stage-{stage_position}"
+    return ""
+
+
+def _seat_label(seat_no: int) -> str:
+    return {1: "一辩", 2: "二辩", 3: "三辩", 4: "四辩"}.get(seat_no, f"{seat_no}辩")
 
 
 def _current_and_next_stage(action_key: str, rule_snapshot: dict[str, Any]) -> tuple[str, str]:

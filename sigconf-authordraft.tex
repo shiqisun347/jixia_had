@@ -1,0 +1,595 @@
+\documentclass[manuscript,review,anonymous]{acmart}
+\AtBeginDocument{\providecommand\BibTeX{{Bib\TeX}}}
+\settopmatter{printacmref=false}
+\renewcommand\footnotetextcopyrightpermission[1]{}
+
+\usepackage{subcaption}   % paired interface and results panels
+\usepackage{listings}     % prompt listings in the appendix
+
+\lstset{
+  basicstyle=\ttfamily\footnotesize,
+  breaklines=true,
+  breakatwhitespace=false,
+  columns=fullflexible,
+  frame=single,
+  framesep=4pt,
+  captionpos=b,
+  showstringspaces=false,
+  extendedchars=false
+}
+
+\begin{document}
+
+\title{Alongside Us, but Not Yet With Us: Measuring AI Teammates' Implicit Coordination in Team Debate}
+% 中文注释：与我们并肩，却尚未与我们协同：测量团队辩论中 AI 队友的隐性协调
+\author{Anonymous Author(s)}
+\affiliation{\institution{Anonymized for review}}
+\renewcommand{\shortauthors}{Anonymous}
+% Add the real PCS submission ID here if the review instructions require it.
+% \acmSubmissionID{YOUR-SUBMISSION-ID}
+
+\begin{abstract}
+AI teammates can make persuasive contributions without coordinating with their team. Existing evaluations rarely identify what a team needed immediately before an AI acted. We introduce \emph{coordination demand--action alignment}, an event-level method comparing participant-grounded acceptable actions with an AI teammate's realized contribution. We applied it in \textsc{JX-Debate}, a synchronous spoken-debate platform. Eighteen participants formed six fixed teams and completed 15 matches with AI teammates, producing 165 focal AI contributions. Alignment was common for local-response demands but rare for demands requiring integration across the team's argument (66.7\% vs. 7.7\%). In exploratory analyses, greater mismatch was associated with more line continuation by the next human teammate (OR=1.52, Holm-adjusted $p=.028$). Twelve participants reported that the AI created extra work. These findings distinguish locally useful speech from team-state fit and show that task continuation can coexist with unresolved coordination demands.
+% 中文注释：AI 队友可以作出有说服力的贡献，却未必与团队形成协调。现有评价很少识别 AI 行动前一刻团队需要什么。我们提出“协调需求—行动匹配”，这是一种事件级方法，将参与者给出的可接受行动与 AI 队友的实际贡献进行比较。我们在同步语音辩论平台 JX-Debate 中应用该方法。18 名参与者组成 6 支固定团队，与 AI 队友完成 15 场比赛，共产生 165 次焦点 AI 贡献。局部回应需求的匹配较常见，而需要整合团队整体论证的需求很少匹配（66.7\% 对 7.7\%）。探索性分析表明，不匹配程度越高，下一位人类队友越可能继续既有论证线（OR=1.52，Holm 校正后 $p=.028$）。12 名参与者表示 AI 增加了额外工作。这些发现区分了局部有用的发言与团队状态适配，并表明任务继续推进时，协调需求仍可能没有得到解决。
+\end{abstract}
+
+\ccsdesc[500]{Human-centered computing~Collaborative and social computing}
+\ccsdesc[300]{Human-centered computing~Interaction design}
+\ccsdesc[100]{Computing methodologies~Artificial intelligence}
+\keywords{human--AI collaboration, human--AI teaming, implicit coordination, AI teammates, competitive debate}
+\maketitle
+
+\section{Introduction}
+
+A locally strong response can still be a poor team action. An AI teammate may produce an accurate and persuasive rebuttal yet repeat an issue that its human teammates have already resolved. It may address the debate topic while overlooking the argument that the team most needs to answer, or introduce a line of reasoning that leaves teammates to reconnect it to their ongoing strategy. These actions can look successful when judged as isolated responses. As team actions, their value depends on whether they fit what the team needs at that moment.
+% 中文注释：局部表现出色的回答，仍可能是糟糕的团队行动。AI 队友可能给出准确且有说服力的反驳，却重复人类队友已经解决的问题。它也可能回应了辩题，却忽略团队此刻最需要处理的论点；或另起一条论证，让队友不得不将其重新接回既有策略。若把这些发言视为孤立回答，它们看似成功；若把它们视为团队行动，其价值取决于是否符合团队当时的需要。
+
+This distinction has become more pressing as large language models (LLMs) move from isolated request--response use into activities organized around shared goals and interdependent actions~\cite{oneill2020hat, berretta2023defining}. In such settings, generating useful content is only one part of acting as a teammate. An agent must infer what others have covered, recognize what remains unresolved, and select a contribution that advances the team's joint activity without requiring teammates to direct every move.
+% 中文注释：随着大语言模型从孤立的请求—响应场景进入具有共同目标和行动依赖的活动，这一区分愈发重要~\cite{oneill2020hat, berretta2023defining}。在这类场景中，生成有用内容只是成为队友的一部分。AI 还需推断队友已经处理的内容，识别尚未解决的问题，并选择能够推进共同活动的贡献，而无需队友逐步发出明确指令。
+
+Human-team research describes this capacity as \emph{implicit coordination}: members anticipate what others are doing, infer what the team needs, and adjust their actions without continuous explicit negotiation~\cite{marks2001temporally, rico2008implicit}. Implicit coordination is central to time-sensitive, interdependent activities such as debate, emergency response, and team sports~\cite{cooke2013interactive, butchibabu2016implicit, ching2020extemporaneous}. We study it here as a behavioral capability: whether an AI teammate can infer the coordination demand expressed by the unfolding team state and act appropriately without explicit direction.
+% 中文注释：人类团队研究将这种能力称为\emph{隐性协调}：成员预判他人的行动，推断团队需要，并在无需持续明确协商的情况下调整自身行动~\cite{marks2001temporally, rico2008implicit}。隐性协调是辩论、应急响应和团队运动等时间敏感、行动互依活动的核心~\cite{cooke2013interactive, butchibabu2016implicit, ching2020extemporaneous}。本文将其作为一种行为能力来研究：AI 队友能否从持续展开的团队状态中推断协调需求，并在没有明确指令的情况下采取适当行动。
+
+Recent HCI studies show that AI can contribute information, reasoning, and task support to group work~\cite{zhang2023teammate, liu2025innerthoughts, zhang2025ladica}. They also document how AI participation can reshape the floor, interrupt workflows, or lead people to constrain an agent to a fixed role~\cite{houde2025controlling, chen2025balanced, mukhopadhyay2026roles, lim2026formation}. Existing evaluations commonly examine task performance, participation, workload, trust, perceived coordination, or interaction dynamics~\cite{zhang2023teammate, ma2025deliberation}. These measures characterize a team or session as a whole. They do not provide an event-level reference for determining what the team needed immediately before a particular AI action and whether that action met the need. This gap makes the behavioral success or failure of implicit coordination difficult to identify.
+% 中文注释：近期 HCI 研究表明，AI 可以为团队工作提供信息、推理和任务支持~\cite{zhang2023teammate, liu2025innerthoughts, zhang2025ladica}。相关研究也记录了 AI 如何重塑发言权、打断工作过程，或促使人们将智能体限制在固定角色中~\cite{houde2025controlling, chen2025balanced, mukhopadhyay2026roles, lim2026formation}。现有评价通常考察任务表现、参与度、工作负荷、信任、感知协调或互动过程~\cite{zhang2023teammate, ma2025deliberation}。这些指标刻画整个团队或完整会话，却没有提供事件级参照，用于判断某次 AI 行动之前团队需要什么，以及该行动是否满足了这一需求。这个缺口使隐性协调在行为层面的成功或失败难以被识别。
+
+We operationalize this construct through \textbf{coordination demand--action alignment}, an event-level method for evaluating the behavioral success of implicit coordination. A \emph{coordination demand} describes what the team needs from a contribution at a particular point in the interaction. For each realized AI speaking opportunity, participating debaters reconstruct the observable pre-action team state and identify a set of acceptable actions. We then compare that state-conditioned set with the AI's realized action. Alignment provides behavioral evidence of successful implicit coordination; mismatch identifies a failure to translate the available team state into an appropriate contribution. The method treats several actions as acceptable at each point. We ask:
+% 中文注释：我们通过\textbf{协调需求—行动匹配}来操作化这一构念。该方法在事件层面评价隐性协调的行为成败。\emph{协调需求}描述团队在互动某一时刻需要一次贡献完成什么。针对每次 AI 实际获得的发言机会，参赛辩手重建行动前可观察的团队状态，并识别一组可接受行动。随后，我们将这一状态条件集合与 AI 的实际行动进行比较。行动匹配为隐性协调成功提供行为证据；行动不匹配则表明 AI 未能把可见的团队状态转化为适当贡献。该方法允许多种行动同时成立。我们提出以下研究问题：
+
+\begin{itemize}
+\item \textbf{RQ1.} How do AI teammates succeed and fail at implicit coordination across different team states?
+% 中文注释：\textbf{RQ1.} 在不同团队状态下，AI 队友的隐性协调如何成功或失败？
+\item \textbf{RQ2.} What human coordination behaviors follow successful and failed implicit coordination by an AI teammate?
+% 中文注释：\textbf{RQ2.} AI 队友的隐性协调成功或失败之后，会出现哪些人类协调行为？
+\end{itemize}
+
+We examine these questions in real-time human--AI team debate. Debate requires teammates to prioritize attacks, avoid duplicating covered arguments, extend one another's reasoning, and connect each contribution to a shared strategy under time pressure. Each turn changes what the team needs next. Clear turn boundaries, attributable speakers, and traceable attack--response relations make both the changing demands and the actions taken in response observable.
+% 中文注释：我们在实时人机团队辩论中考察这些问题。辩论要求队友确定攻击重点、避免重复已处理的论点、延伸彼此的推理，并在时间压力下把每次贡献接入共同策略。每一回合都会改变团队下一步的需要。清晰的回合边界、可识别的发言者，以及可追踪的攻防关系，使不断变化的需求及其对应行动都能被观察。
+
+We built \textsc{JX-Debate}, a synchronous spoken-debate platform, and recruited 18 participants organized into six fixed three-person teams. In each match, three humans and one AI teammate argued on the same side. We study the free-debate phase, in which the AI contributes to the team's evolving line of argument. After the matches, the participating debaters annotate their own and the AI's contributions. For each realized AI speaking opportunity, they reconstruct the team state immediately before the AI spoke and identify the coordination demand or set of actions that would have fit that state. Their judgments are grounded in the shared history and strategy of the team that experienced the interaction. We connect these annotations to system logs and the subsequent sequence of human actions.
+% 中文注释：我们构建了同步语音辩论平台 \textsc{JX-Debate}，并招募 18 名参与者，组成 6 支固定的三人团队。每场比赛中，三名人类与一名 AI 队友共同持一方立场。我们研究自由辩论阶段；此时 AI 参与团队持续发展的论证。比赛结束后，参赛辩手标注自己和 AI 的发言。针对每次 AI 实际获得的发言机会，他们重建 AI 发言前一刻的团队状态，并识别符合该状态的协调需求或可接受行动集合。这些判断来自亲历互动的团队成员，因而建立在该团队共享的历史与策略之上。我们将标注结果与系统日志及后续人类行动序列相连接。
+
+Alignment depended sharply on what the team state required. The AI aligned in 84 of 126 local-response events (66.7\%), but in only 3 of 39 team-integration events (7.7\%). Exploratory sequential analyses further showed that greater mismatch was associated with more line continuation by the next human teammate. Evidence for a corresponding decline in corrective responses was weaker. The questionnaire complements this pattern: 12 of 18 participants agreed that the AI created extra work when its contributions were unclear, incomplete, or repetitive.
+% 中文注释：匹配程度明显取决于团队状态的需求。126 个局部回应事件中有 84 个实现匹配（66.7\%），而 39 个团队整合事件中仅有 3 个实现匹配（7.7\%）。探索性序列分析还显示，不匹配程度越高，下一位人类队友越可能继续既有论证线；纠正性回应相应下降的证据较弱。问卷结果与这一模式相呼应：18 名参与者中有 12 名认为，当 AI 的贡献不清晰、不完整或重复时，它会增加额外工作。
+
+This paper makes three contributions.
+% 中文注释：本文作出三项贡献。
+
+\begin{itemize}
+  \item We operationalize AI teammates' \textbf{implicit coordination} through coordination demand--action alignment. The method connects the pre-action team state, a participant-grounded acceptable-action set, and the AI's realized contribution.
+  % 中文注释：第一，我们通过协调需求—行动匹配来操作化 AI 队友的\textbf{隐性协调}。该方法连接行动前的团队状态、参与者给出的可接受行动集合，以及 AI 的实际贡献。
+
+  \item We provide event-level evidence from 165 AI contributions in live team debate. The results reveal a large gap between local responding and integration across the team's evolving argument.
+  % 中文注释：第二，我们基于现场团队辩论中的 165 次 AI 贡献提供事件级证据。结果揭示了局部回应与整合团队持续发展论证之间的巨大差距。
+
+  \item We relate AI mismatch to subsequent human action. The exploratory results show that line continuation was more likely after greater mismatch, indicating one observable pattern through which unresolved coordination demand can persist without explicit correction.
+  % 中文注释：第三，我们将 AI 的不匹配与后续人类行动联系起来。探索性结果表明，不匹配程度越高，之后越可能出现论证线延续，揭示了未解决的协调需求如何在没有明确纠正的情况下持续存在的一种可观察模式。
+\end{itemize}
+
+\section{Related Work}
+
+\subsection{Implicit Coordination as State-Conditioned Team Action}
+Team-process research defines coordination as the management of interdependent actions rather than the sum of individual abilities~\cite{marks2001temporally}. Coordination becomes implicit when members use task and team knowledge to anticipate needs and adjust their actions without continuous negotiation~\cite{rico2008implicit}. This process is sequential: members anticipate what will be needed, observe what has happened, and update their next action~\cite{rico2019adaptation}. Interactive team cognition similarly locates team cognition in interaction, making event order, local context, and functional complementarity central to measurement~\cite{cooke2013interactive}. Under this view, an utterance is not a good team action merely because it is coherent or relevant. Its value depends on the state that preceded it and the work it completes for the team.
+% 中文注释：团队过程研究把协调定义为对互依行动的管理，而非个体能力的简单相加~\cite{marks2001temporally}。当成员利用任务与团队知识预判需求，并在无需持续协商的情况下调整行动时，协调便成为隐性的~\cite{rico2008implicit}。这一过程具有序列性：成员预判需求、观察已发生的行动，再更新下一步行动~\cite{rico2019adaptation}。互动团队认知同样将团队认知置于互动之中，因此事件顺序、局部情境和功能互补成为测量核心~\cite{cooke2013interactive}。据此，一段话语并不会仅因连贯或相关就成为良好的团队行动；其价值取决于此前的团队状态，以及它为团队完成了什么工作。
+
+Human--autonomy teaming research extends this concern to artificial teammates. Effective teaming requires shared goals, mutual understanding, predictable behavior, appropriate initiative, and error management~\cite{klein2004challenges,oneill2020hat}. Research agendas for machines as teammates likewise treat AI as a participant in joint activity rather than a stand-alone tool~\cite{seeber2020machines,berretta2023defining}. Empirical work has examined how AI communication strategies affect teamwork and how team traits shape human--AI dynamics~\cite{zhang2023teammate,bendell2025asi}. These studies establish coordination as a property of interdependent activity. Our method supplies an event-level comparison between the demand visible before an AI acts and the action it contributes.
+% 中文注释：人—自主系统组队研究将这一关注扩展到人工队友。有效组队需要共同目标、相互理解、可预测行为、恰当主动性和错误管理~\cite{klein2004challenges,oneill2020hat}。机器作为队友的研究议程也把 AI 视为共同活动的参与者，而非独立工具~\cite{seeber2020machines,berretta2023defining}。实证研究考察了 AI 沟通策略如何影响团队合作，以及团队特征如何塑造人机互动~\cite{zhang2023teammate,bendell2025asi}。这些研究确立了协调是互依活动的一种属性。我们的方法提供事件级比较，将 AI 行动前可见的需求与其实际贡献的行动相对照。
+
+\subsection{AI Initiative in Group Work}
+Mixed-initiative interaction treats initiative as a resource that moves between people and systems~\cite{horvitz1999principles}. In joint activity, an autonomous contribution must remain responsive to the team's work and make its commitments legible~\cite{cila2022designing,cheng2025behalf}. Recent HCI studies show why this requirement is contextual. Proactive agents can support productive conflict and group reasoning~\cite{chen2025balanced,liu2025innerthoughts}, but the same initiative can disrupt a workflow when its timing, content, or information density is poorly calibrated~\cite{pu2025assistance,chen2025needhelp}. People therefore need mechanisms to regulate AI participation in group conversation~\cite{houde2025controlling}.
+% 中文注释：混合主动交互把主动权视为在人与系统之间流动的资源~\cite{horvitz1999principles}。在共同活动中，自主贡献必须回应团队的工作，并让其承诺清晰可见~\cite{cila2022designing,cheng2025behalf}。近期 HCI 研究说明了这一要求为何依赖情境。主动智能体能够支持建设性冲突和群体推理~\cite{chen2025balanced,liu2025innerthoughts}，但当时机、内容或信息密度校准不当时，同样的主动性也会扰乱工作流程~\cite{pu2025assistance,chen2025needhelp}。因此，人们需要调节 AI 参与群体对话的机制~\cite{houde2025controlling}。
+
+Group context can also ground more appropriate contributions. Social-RAG retrieves prior group interactions to support socially grounded generation, while shared-perspective systems expose information that can improve alignment between a person and an AI~\cite{wang2025socialrag,teng2026eye}. Co-located collaboration systems and proactive-role studies show that an AI's participation changes team process, role formation, and the work required to interpret agent behavior~\cite{zhang2025ladica,mukhopadhyay2026roles,lim2026formation,pareek2026sensemaking}. Existing evaluations commonly aggregate performance, participation, workload, trust, or perceived coordination over a task or session~\cite{ma2025deliberation}. Such measures reveal consequences of AI participation but do not identify whether one contribution addressed the team's immediate need. Coordination demand--action alignment makes that relation the unit of analysis.
+% 中文注释：群体情境也能为更合适的贡献提供依据。Social-RAG 检索既往群体互动以支持社会情境化生成，共享视角系统则呈现可改善人与 AI 匹配的信息~\cite{wang2025socialrag,teng2026eye}。共处协作系统和主动角色研究表明，AI 的参与会改变团队过程、角色形成，以及理解智能体行为所需的工作~\cite{zhang2025ladica,mukhopadhyay2026roles,lim2026formation,pareek2026sensemaking}。现有评价通常在任务或会话层面汇总表现、参与度、工作负荷、信任或感知协调~\cite{ma2025deliberation}。这些指标能够揭示 AI 参与的后果，却无法判断某一次贡献是否回应了团队的即时需求。协调需求—行动匹配将这一关系作为分析单位。
+
+\subsection{Debate and Argumentative Agents}
+Argumentative agents have largely been evaluated as systems for generating or supporting arguments~\cite{hadfi2021argumentative}. Recent classroom-debate research examines how learners divide preparation and reasoning with an LLM and how that collaboration affects learning and dependency~\cite{zhang2025debate}. Our setting instead places three humans and an AI on the same side of a live speaking competition. The AI selects each action from the unfolding debate and team history.
+% 中文注释：论辩智能体主要被作为生成或支持论证的系统加以评价~\cite{hadfi2021argumentative}。近期课堂辩论研究考察学习者如何与大语言模型分配准备和推理工作，以及这种协作如何影响学习与依赖~\cite{zhang2025debate}。我们的场景则让三名人类与一个 AI 在现场辩论中共同持一方立场。AI 依据持续展开的辩论和团队历史选择行动。
+
+Debate makes this selection problem observable: attacks, defenses, extensions, and handoffs appear in a traceable sequence under time pressure. We use that structure to reconstruct the pre-action demand, compare the AI's realized contribution with several participant-grounded acceptable actions, and examine the next human contribution. The resulting method distinguishes producing a plausible argument from choosing an argument that fits the team's current work.
+% 中文注释：辩论使这一选择问题可被观察：攻击、防守、延伸与交接在时间压力下形成可追踪的序列。我们利用这一结构重建行动前需求，将 AI 的实际贡献与多项由参与者给出的可接受行动比较，并考察下一次人类贡献。由此，该方法区分了“生成看似合理的论证”与“选择符合团队当前工作的论证”。
+
+\section{Methodology}
+
+\subsection{System Design}
+
+We developed \textsc{JX-Debate}, a web platform for synchronous spoken debate between mixed human--AI teams. The platform implements timed debate phases, competition for speaking opportunities, live transcription, and immediate spoken AI responses. These features create repeated, time-bounded opportunities in which humans and an AI must allocate the floor while responding to a shared debate history.
+% 中文注释：我们开发了 \textsc{JX-Debate}，一个支持人机混合团队开展同步语音辩论的网页平台。平台实现计时赛段、发言机会竞争、实时转写和即时 AI 语音回应。这些功能创造了重复出现且时间受限的机会，使人类与 AI 在回应共同辩论历史的同时分配发言权。
+
+\subsubsection{Debater Interface for Human Participants}
+
+\textsc{JX-Debate} connects streaming automatic speech recognition (ASR), LLM generation, and streaming text-to-speech synthesis (TTS) in one shared voice environment (Figure~\ref{fig:debate-interface}). Human speech is transmitted over WebRTC and transcribed into the debate history available to the AI. When the AI receives the floor, its generated response is synthesized and played in the same room. Humans and the AI share the debate transcript and timing state. The AI issues its floor request from this shared debate state, and the debater interface additionally displays peer request cues.
+% 中文注释：\textsc{JX-Debate} 将流式自动语音识别（ASR）、大语言模型生成与流式语音合成（TTS）接入同一共享语音环境（图~\ref{fig:debate-interface}）。人类语音通过 WebRTC 传输，并被转写进 AI 可访问的辩论历史。AI 获得发言权后，系统合成其回答并在同一房间播放。人与 AI 共享辩论文本和计时状态。AI 依据这一共享辩论状态提出发言申请，辩手界面则额外显示同伴的申请提示。
+
+The debater interface presents the current speaker, remaining time, live transcript, and floor-request status in one view. During free debate, human participants can raise a hand, cancel, or request again while listening to the opposing side. These controls make requesting, withdrawing, and yielding observable forms of human coordination. The allocation rule is described below.
+% 中文注释：辩手界面集中显示当前发言者、剩余时间、实时转写和发言申请状态。在自由辩论中，人类参与者可在聆听对方发言时举手、取消或再次申请。这些控件使申请、撤回和让出成为可观察的人类协调行为。下文介绍发言权分配规则。
+
+\begin{figure}[tbp]
+  \centering
+  \begin{subfigure}[t]{0.45\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/JXDebate Interface EN.png}
+    \caption{Public landing page.}
+    \label{fig:platform-home}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.52\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/debate_interface.png}
+    \caption{Debater interface during free debate.}
+    \label{fig:debate-interface}
+  \end{subfigure}
+  \caption{Participant-facing views of \textsc{JX-Debate}: \textbf{(a)} the platform entry page and \textbf{(b)} the live debate workspace, which combines (A) debate information, (B) team composition, (C) current debate status, (D) speaking requests, (E) timers, (F) real-time transcript, and (G) debate controls and status.}
+  % 中文注释：JX-Debate 面向参与者的界面：（a）平台入口主页；（b）实时辩论工作区，其中整合了比赛信息、团队构成、当前状态、举手请求、计时、转写文本和比赛控制。
+  % 新：JX-Debate 面向参与者的界面：(a) 平台入口主页；(b) 实时辩论工作区，包括A比赛信息、B团队构成、C比赛当前状态、D发言申请、E计时器、F实时转写文本，以及G比赛控制与状态。}
+  \Description{Two screenshots shown side by side. The left panel shows the JX-Debate public landing page with navigation and room-entry controls. The right panel shows a live free-debate match with the two teams, the current AI speaker, timers, floor-request controls, and a transcript column.the participant-facing workspace during a live free-debate match, with labeled regions for (A) debate information, (B) team composition, (C) current debate status, including the AI teammate currently speaking, (D) speaking requests, (E) timers, (F) the real-time transcript, and (G) debate controls and status.}
+  \label{fig:participant-interfaces}
+\end{figure}
+
+\subsubsection{Administration Interface}
+
+The administration interface configures debate rules and agent settings and manages match records (Figure~\ref{fig:admin-interface}). During each match, the platform records utterances, timestamps, request states, floor allocation, model decisions, and generated speech. After the matches, participating debaters use the replay interface to annotate their own and the AI's contributions. Researchers can inspect and export the resulting structured event sequence. For each AI contribution, this sequence connects the team state before the AI spoke, the contribution it produced, and the human coordination behavior that followed.
+% 中文注释：后台界面用于配置辩论规则与智能体设置，并管理比赛记录（图~\ref{fig:admin-interface}）。每场比赛中，平台记录发言内容、时间戳、申请状态、发言权分配、模型决策和生成语音。赛后，参赛辩手使用回放界面标注自己与 AI 的发言。研究者可检查并导出结构化事件序列。针对每次 AI 发言，该序列连接 AI 发言前的团队状态、AI 作出的贡献，以及随后的人类协调行为。
+
+\begin{figure}[tbp]
+  \centering
+  \begin{subfigure}[t]{0.59\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/admin_interface.png}
+    \caption{Administration interface.}
+    \label{fig:admin-interface}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.38\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/annotation_interface.png}
+    \caption{Participant annotation interface.}
+    \label{fig:annotation-interface}
+  \end{subfigure}
+  \caption{Research-facing views of \textsc{JX-Debate}: \textbf{(a)} the administration workspace for configuring resources and managing matches and \textbf{(b)} the staged annotation workspace used by participating debaters to inspect an event and record judgments.}
+  % 中文注释：JX-Debate 面向研究流程的界面：（a）用于配置资源和管理比赛的后台工作区；（b）参赛辩手用于查看事件并记录判断的分阶段标注工作区。
+  \Description{Two screenshots shown side by side. The left panel presents an administration dashboard with configuration resources, recent matches, and operational status. The right panel presents an annotation task with debate turns on the left and response options on the right.}
+  \label{fig:research-interfaces}
+\end{figure}
+
+\subsection{Study Design}
+
+This study examines AI teammates' implicit coordination during repeated team debates. We focus on the free-debate phase and treat each occasion on which the AI received the floor and contributed as the focal event. For each event, participating debaters reconstruct the observable team state immediately before the AI spoke and identify the coordination demand or set of acceptable actions arising from that state. We compare this reference with the functional action performed by the AI's contribution. We then link the resulting behavioral alignment or mismatch to the human coordination behavior that followed. Floor-request and allocation records establish how the AI came to speak, but the primary evaluation concerns what it did once it had the floor.
+% 中文注释：本研究考察重复团队辩论中 AI 队友的隐性协同。我们聚焦自由辩论阶段，并将 AI 实际获得发言权并作出贡献的每次事件作为核心分析单元。针对每个事件，参赛辩手重建 AI 发言前可观察的团队状态，并标注该状态产生的协调需求或可接受行动集合。我们将这一参照与 AI 发言实际执行的功能性行动进行比较，再把由此得到的行为匹配或不匹配与随后的人类协调行为连接起来。发言申请与发言权分配记录用于说明 AI 如何获得发言权；主要评价则关注 AI 获得发言权后做了什么。
+
+\subsubsection{Debate Task and Format}
+
+The 18 participants formed six fixed three-person teams. Each match paired two teams and added one AI teammate to each side, producing a $4$-versus-$4$ structure. Each team played five matches, yielding 15 matches in total. Debate topics came from ORCHID, a Chinese debate corpus~\cite{zhao2023orchid}. We selected value-based topics that did not require specialized domain knowledge. A pre-arranged schedule assigned one topic and one side to each team in each match.
+% 中文注释：18 名参与者组成 6 支固定的三人团队。每场比赛由两支团队对阵，双方各加入一名 AI 队友，形成 $4$ 对 $4$ 的结构。每队参加 5 场比赛，共计 15 场。辩题来自中文辩论语料库 ORCHID~\cite{zhao2023orchid}。我们选择不依赖专业领域知识的价值型辩题。预先编排的赛程为每支队伍在每场比赛中指定一个辩题和一方立场。
+
+The format adapts rules used by the International Chinese Debating Competition (ICDC). Each match included an opening-statement phase and a free-debate phase. Each side received two minutes for its opening statement. In free debate, each side shared six minutes of speaking time, with a maximum of 30 seconds per turn. Team members therefore had to allocate a limited speaking budget across a sustained exchange. The format makes responses, supplements, handoffs, and unresolved attacks visible in sequence.
+% 中文注释：赛制改编自国际华语辩论邀请赛（IChDIT）使用的规则。每场比赛包括开题立论和自由辩论。开题立论阶段双方各有两分钟。自由辩论阶段双方各共享六分钟发言时间，每回合最多 30 秒。因此，团队成员需在持续交锋中分配有限的发言预算。该赛制使回应、补充、交接和未解决攻击按序显现。
+
+\subsubsection{Rules for Competing over Speaking Opportunities}
+
+A potential speaking opportunity opens when the opposing side begins to speak. It remains open through a three-second request window after that turn ends. Human debaters can change their hand-raising state throughout this period. The AI independently returns a binary request decision from the debate transcript and timing state. When the request window closes, the platform allocates the next turn among active requests. If no request remains active, the match pauses.
+% 中文注释：一次潜在发言机会在对方开始发言时开启，并延续至该回合结束后的三秒申请窗口。人类辩手可在此期间改变举手状态。AI 根据辩论文本和计时状态独立返回二元申请决策。申请窗口关闭时，平台在仍有效的申请中分配下一回合。若不存在有效申请，比赛暂停。
+
+Allocation follows a human-priority rule. If at least one human request is active, the earliest active human request receives the floor. An AI request receives the floor only when no human request is active. Humans can therefore reserve the turn by requesting it or leave room for the AI by withholding or cancelling a request. This arrangement distinguishes the AI's \emph{request decision} from the \emph{realized floor outcome}: requesting does not guarantee that the AI speaks. It also exposes human requesting, withdrawal, and yielding as observable coordination behaviors. Prior work on group conversation likewise emphasizes that people need ways to regulate AI participation~\cite{houde2025controlling}.
+% 中文注释：发言权按照人类优先规则分配。只要存在人类有效申请，最早提交有效申请的人类便获得发言权。仅当没有人类有效申请时，AI 的申请才会获得发言权。因此，人类可以通过申请保留回合，也可以通过不申请或取消申请为 AI 留出空间。该设置区分 AI 的\emph{申请决策}与\emph{实际发言权结果}：提出申请不代表 AI 一定发言。它也使人类的申请、撤回和让出成为可观察的协调行为。群体对话研究同样强调，人们需要能够调节 AI 的参与~\cite{houde2025controlling}。
+
+\subsection{Participants}
+
+We recruited 18 master's students through social media. Participants represented several academic disciplines【, and all had prior debate experience, with approximately equal numbers reporting limited, moderate, and extensive experience.】 We randomly assigned them to six three-person teams and kept team membership fixed throughout the study. This structure allowed teammates to interact repeatedly across matches. Participants received US\$14 per hour and took part for approximately three hours on average. Winning teams and selected individual performers received additional competition bonuses. Table~\ref{tab:participants} reports participant-level demographics and prior experience using anonymous identifiers. All participants provided written consent for participation and anonymous data processing. The study followed our institution's ethics review requirements.
+% 中文注释：我们通过社交媒体招募了 18 名硕士研究生。参与者来自多个学科，既往辩论经验不一：4 人无经验、4 人经验有限、5 人经验中等、5 人经验丰富。【参与者来自多个学科，均具有既往辩论经验；经验水平分为有限、中等和丰富三个等级，各等级人数大致相当。】我们将其随机分为 6 支三人团队，并在研究期间保持团队成员不变，以便队友跨场次重复互动。参与者获得每小时 14 美元报酬，平均参与约 3 小时；获胜团队和部分表现突出的个人另有竞赛奖励。表~\ref{tab:participants} 使用匿名编号报告参与者人口统计信息和既往经验。所有参与者均书面同意参与研究及匿名处理数据。本研究遵循作者所在机构的伦理审查要求。
+
+\begin{table*}[htbp]
+\centering
+% 中文注释：参与者人口信息与相关经验，包括编号、年龄、性别、学科，以及辩论、协作任务和生成式 AI 使用经验。三类经验均按 None、Limited、Moderate 和 Extensive 四级报告。
+\caption{Participant demographics and related experience, including identifier, age, gender, academic discipline, and prior debate, collaborative-task, and generative AI experience. ``Exp. (Debate)'', ``Exp. (Collab. Tasks)'', and ``Exp. (GenAI)'' denote debate experience, collaborative-task experience, and generative AI experience, respectively; all three are rated on four levels: None, Limited, Moderate, and Extensive.}
+\Description{A table listing participant demographics and prior experience: for each participant, an identifier, age, gender, academic discipline, debate experience, collaborative-task experience, and generative AI experience. All three experience dimensions are rated as None, Limited, Moderate, or Extensive.}
+\label{tab:participants}
+\small
+\begin{tabular}{ccccccc}
+\toprule
+\textbf{ID} & \textbf{Age} & \textbf{Gender} & \textbf{Discipline} & \textbf{Exp. (Debate)} & \textbf{Exp. (GenAI)}\\ \midrule
+P1  & 24 & Female & Computer Science & Extensive &  Limited \\
+P2  & 23 & Female & Literature & Limited &  Extensive \\
+P3  & 24 & Male & Computer Science & Limited &  None \\
+P4  & 26 & Female & Business Administration & Extensive &  Limited \\
+P5  & 25 & Male & Communication & Extensive &  None \\
+P6  & 24 & Male & Computer Science & Limited &  Extensive \\
+P7  & 24 & Female & Data Science & Moderate & Extensive \\
+P8  & 24 & Male & Literature & Limited & Moderate \\
+P9  & 26 & Male & Literature & Moderate & None \\
+P10 & 23 & Female & Economics & Moderate & None \\
+P11 & 25 & Male & Sociology & Extensive & Extensive \\
+P12 & 27 & Male & Mathematics & Extensive & Limited \\
+P13 & 24 & Female & Business Administration & Limited & Extensive \\
+P14 & 23 & Female & Journalism & Moderate & Moderate \\
+P15 & 25 & Female & Journalism & Moderate & Extensive \\
+P16 & 24 & Male & Computer Science & Limited & Extensive \\
+P17 & 24 & Male & Sociology & Moderate & None \\
+P18 & 25 & Male & Computer Science & Extensive & Moderate \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\subsection{Procedure}
+
+The study comprised four stages.
+% 中文注释：研究包含四个阶段。
+
+\noindent\textbf{Stage 1: Informed consent and background collection.}
+% 中文注释：参与者阅读研究说明，签署书面知情同意书，并完成研究前问卷。问卷收集人口信息，以及辩论、生成式 AI 和协作任务经验。随后，研究者按照预先安排完成分组。
+Participants read the study description, provided written consent, and completed a pre-study questionnaire. The questionnaire collected demographics and prior experience with debate, generative AI, and collaborative tasks. Researchers then assigned participants to the pre-arranged teams.
+% 中文注释：参与者阅读研究说明，签署书面知情同意书，并完成研究前问卷。问卷收集人口信息，以及辩论、生成式 AI 和协作任务经验。随后，研究者按照预先安排完成分组。
+
+\noindent\textbf{Stage 2: Rule briefing and practice match.}
+% 中文注释：研究者介绍辩论赛制、平台操作、AI 队友、AI 可访问的信息，以及人类优先规则。随后，每支团队使用正式比赛之外的辩题完成一场练习赛。练习赛帮助参与者熟悉平台，不纳入研究数据。
+Researchers explained the debate format, platform controls, AI teammate, information available to the AI, and human-priority rule. Each team then completed one practice match on a topic excluded from the formal matches. Practice matches familiarized participants with the platform and were excluded from the study data.
+% 中文注释：研究者介绍辩论赛制、平台操作、AI 队友、AI 可访问的信息，以及人类优先规则。随后，每支团队使用正式比赛之外的辩题完成一场练习赛。练习赛帮助参与者熟悉平台，不纳入研究数据。
+
+\noindent\textbf{Stage 3: Formal matches.}
+Team composition remained fixed during the formal matches. Each match included preparation followed by debate under the same format. Match order, topics, sides, and opponents followed a pre-arranged schedule provided in the anonymized supplementary materials. \textsc{JX-Debate} recorded the interaction and system events throughout each match.
+% 中文注释：正式比赛期间，团队构成保持不变。每场比赛先准备，再按相同赛制开展辩论。比赛顺序、辩题、持方和对手遵循预先安排的赛程；该赛程放入匿名补充材料。\textsc{JX-Debate} 全程记录互动和系统事件。
+
+\noindent\textbf{Stage 4: Questionnaires.}
+% 中文注释：全部正式比赛结束后，参与者完成总结问卷，报告与 AI 队友合作的体验。
+After all formal matches, participants completed a summary questionnaire about their experience with the AI teammate.
+% 中文注释：全部正式比赛结束后，参与者完成总结问卷，报告与 AI 队友合作的体验。
+
+\subsubsection{AI Teammate Configuration}
+
+Each side ran a separate AI teammate instance. The two instances used identical prompts and model parameters while maintaining separate debate histories. We held the model, prompts, and autonomy settings constant throughout the study. Before the formal matches, we compared a range of candidate models and prompt formulations in pilot debates and selected the configuration best suited to live team debate. The AI entered free debate under the same conditions as its human teammates: it held no pre-assigned turn and decided at each opportunity whether to request the floor. If it received the floor, the system made a separate call to generate its spoken contribution. The model was \texttt{deepseek-v4-flash-0731}; Appendix~\ref{app:ai-prompt} reports the prompts.
+% 中文注释：比赛双方分别运行独立的 AI 队友实例。两个实例使用相同提示词和模型参数，但各自维护辩论历史。整个研究保持模型、提示词和自主设置不变。正式比赛前，我们在预试辩论中比较了大量候选模型与提示词方案，并选定最适合现场团队辩论的配置。AI 与人类队友在相同条件下参与自由辩论：它没有预设回合，每次机会中自行判断是否申请发言权。若获得发言权，系统再单独调用模型生成口头发言。所用模型为 \texttt{deepseek-v4-flash-0731}；Appendix~\ref{app:ai-prompt} 报告提示词。
+
+\subsection{Measures and Analysis}
+
+\subsubsection{Participant-Grounded Annotation Protocol}
+
+We analyzed all 165 occasions on which an AI teammate obtained the floor during free debate. The three human members of the same team independently annotated every focal event experienced by their team. Three third-member Stage A and B records were absent from the export; the corresponding events were scored from the remaining available records. Before formal annotation, participants completed training and a practice event excluded from analysis. The codebook was then held fixed.
+% 中文注释：我们分析了自由辩论中 AI 队友获得发言权的全部 165 次事件。同一团队的三名人类成员分别独立标注其团队经历的每个焦点事件。导出文件缺少三条第三位成员的 Stage A 和 B 记录，相应事件依据其余可用记录评分。正式标注前，参与者接受培训并完成一个不纳入分析的练习事件；此后编码手册保持不变。
+
+Annotation used a state-first, action-second workflow. In Stage A, the replay stopped immediately before the AI contribution and concealed that contribution and all later turns. Each annotator proposed one to three acceptable actions that the team could reasonably need at that moment. Each candidate specified a functional behavior, an argumentative target, an aspect of the argument, a short action description, a priority rating, and supporting evidence from the visible history. Targets helped locate the relevant argument but were not treated as separate theoretical constructs or required to match verbatim. After Stage A was submitted, Stage B revealed the AI contribution. Annotators described its realized action and rated how fully it realized each aggregated candidate. Stage C then revealed the subsequent interaction and asked annotators to code the primary function of the next same-team human contribution.
+% 中文注释：标注采用“先状态、后行动”的流程。Stage A 在 AI 贡献前一刻停止回放，并隐藏该贡献及所有后续回合。每名标注者提出 1 至 3 项团队当时可能合理需要的可接受行动。每个候选行动包含功能行为、论证目标、论点侧面、简短行动描述、优先级和来自可见历史的支持证据。目标用于定位相关论证，但不被视为独立理论构念，也不要求逐字一致。提交 Stage A 后，Stage B 显示 AI 贡献；标注者描述其实际行动，并评价其实现每项聚合候选行动的程度。Stage C 随后显示后续互动，并要求标注下一次同队人类贡献的主要功能。
+
+\subsubsection{Coordination Demands and Acceptable-Action Sets}
+
+We grouped candidate actions into two demand classes according to the scope of information that a fitting action had to integrate. \emph{Local-response demands} comprised rebutting a challenge, repairing a defense, and clarifying a distinction. \emph{Team-integration demands} comprised extending an existing team argument, comparing competing considerations, synthesizing or reframing the team's case, and filling a coordination gap. Extension counted as team integration only when it developed an existing team argument or a teammate's contribution, rather than adding an unrelated local example.
+% 中文注释：我们依据合适行动需要整合的信息范围，将候选行动分为两类需求。\emph{局部回应需求}包括反驳挑战、修补防守和澄清区分；\emph{团队整合需求}包括延伸现有团队论证、比较相互竞争的考量、综合或重构团队立场，以及填补协调缺口。只有在延展现有团队论证或队友贡献时，“延伸”才被计为团队整合，而不是加入无关的局部例子。
+
+Functionally equivalent candidates proposed by at least two of the three annotators entered the event's core set. Annotators rated candidates as essential or supportive in priority. Candidates meeting the predefined two-of-three consensus rule for essential priority formed the essential set used to score the event. The same priority rule applied to both demand classes; a candidate did not become essential merely because it was team-integrative. We classified an event as team-integration when its essential set contained at least one team-integration demand, and as local-response otherwise. Events without a stable core set were retained but marked indeterminate.
+% 中文注释：至少由三名标注者中的两名提出、且功能等价的候选行动进入事件核心集合。标注者将候选行动的优先级评为必要或支持性；满足预定义“三人中两人”必要性共识规则的候选行动组成事件评分所用的必要集合。两类需求使用相同的优先级规则，候选行动不会仅因属于团队整合而自动成为必要行动。当必要集合至少包含一项团队整合需求时，事件被归为团队整合，否则归为局部回应。没有稳定核心集合的事件仍予保留，但标记为不确定。
+
+\subsubsection{Demand--Action Alignment}
+
+Annotators rated realization of each essential candidate as complete, substantially complete, partial, absent, or contradictory. We aggregated these ratings into an event-level degree using a conjunctive rule. Degree 0 indicated that every essential demand was at least substantially complete and that complete realizations formed the majority. Degree 1 indicated that every essential demand was at least substantially complete, but complete realizations were not the majority. Degree 2 indicated that at least one essential demand was not substantially realized, although the AI made substantive progress on the essential set. Degree 3 indicated no substantive progress on any essential demand or direct contradiction of an essential demand. Degree U indicated that the annotators did not establish a stable reference or that the available evidence could not resolve the event. Degrees 0 and 1 constituted alignment; degrees 2 and 3 constituted mismatch. Degree U was not coded as mismatch.
+% 中文注释：标注者把每项必要候选行动的实现程度评为完全实现、基本实现、部分实现、未实现或相矛盾。我们使用合取规则把这些评价聚合为事件级程度。Degree 0 表示每项必要需求至少基本实现，且完全实现占多数；Degree 1 表示每项必要需求至少基本实现，但完全实现不占多数；Degree 2 表示至少一项必要需求未被基本实现，但 AI 对必要集合取得了实质进展；Degree 3 表示对任何必要需求均无实质进展，或直接违背某项必要需求；Degree U 表示标注者未建立稳定参照，或现有证据无法判定事件。Degree 0 和 1 构成匹配，Degree 2 和 3 构成不匹配；Degree U 不编码为不匹配。
+
+For mismatched events, we recorded the primary behavioral form: repeated work, disconnected extension, missed challenge, misplaced priority, incomplete repair, or other indeterminate mismatch. These labels describe the relation between the contribution and the pre-action demand, not the factual or rhetorical quality of the utterance in isolation.
+% 中文注释：对于不匹配事件，我们记录其主要行为形式：重复工作、脱节延伸、遗漏挑战、优先级错置、修补不完整，或其他不确定的不匹配。这些标签描述贡献与行动前需求之间的关系，而非孤立评价话语的事实质量或修辞质量。
+
+\subsubsection{Subsequent Human Coordination}
+
+For RQ2, the unit was the next contribution by a human on the AI's team. Annotators assigned its primary argumentative function using one common axis: \emph{corrective response}, \emph{line continuation}, \emph{restatement}, \emph{argument redirection}, or \emph{no discernible functional relation}. Events with no subsequent same-team human contribution were right-censored. Corrective response took precedence when a contribution repaired or completed a gap in the AI's action. Line continuation described continued development of the team's argument without requiring an inference that the speaker accepted, rejected, or deliberately bypassed the AI. The remaining precedence was restatement, argument redirection, and no discernible relation.
+% 中文注释：RQ2 的分析单位是 AI 所在团队下一次由人类做出的贡献。标注者沿同一维度指定其主要论证功能：\emph{纠正性回应}、\emph{论证线延续}、\emph{重述}、\emph{论证重定向}或\emph{无可辨识的功能关系}。没有后续同队人类贡献的事件按右删失处理。当贡献修补或补全 AI 行动的缺口时，纠正性回应优先；论证线延续指继续发展团队论证，而无需推断发言者接受、拒绝或有意绕过 AI。其余类别的优先顺序依次为重述、论证重定向和无可辨识关系。
+
+\subsubsection{Local Response Quality and Questionnaire Measures}
+
+We separately measured local response quality using three five-point items: clarity, argumentative completeness, and understandability. We averaged available item ratings within each event. This index evaluates the contribution as a response, whereas demand--action alignment evaluates its fit with the preceding team state.
+% 中文注释：我们使用三个五点题项单独测量局部回应质量：清晰度、论证完整性和可理解性，并在事件内对可用题项评分取平均。该指标把贡献作为一次回应来评价，而需求—行动匹配评价其与先前团队状态的适配。
+
+After all matches, participants rated five statements about the AI teammate on scales from 1 (strongly disagree) to 5 (strongly agree). The items concerned helpfulness, perceived coordination, awareness of the match state, added burden, and willingness to continue teaming. Because they address distinct experiences, we report them separately rather than as one scale.
+% 中文注释：全部比赛结束后，参与者使用从 1（非常不同意）到 5（非常同意）的量表评价五项关于 AI 队友的陈述。题项涉及帮助程度、感知协调、对赛况的把握、额外负担和继续组队的意愿。由于它们反映不同体验，我们分别报告，而不合并为单一量表。
+
+\subsubsection{Statistical Analysis}
+
+RQ1 compares alignment across local-response and team-integration demands. We report event counts, Wilson 95\% confidence intervals, and a Fisher exact contrast. Our conservative denominator includes Degree U events but does not count them as aligned. We also report the decidable-event denominator as a sensitivity analysis. Because events are nested within matches, we repeated the contrast with match as the clustering unit, using a logistic generalized estimating equation and a cluster bootstrap over matches. We additionally report the number of essential demands per demand class and the realization of individual essential components within team-integration events.
+% 中文注释：RQ1 比较局部回应需求与团队整合需求之间的匹配情况。我们报告事件数、Wilson 95\% 置信区间和 Fisher 精确检验。保守分母包含 Degree U 事件，但不将其计为匹配；同时报告仅含可判定事件的分母作为敏感性分析。由于事件嵌套于比赛，我们以比赛为聚类单位，使用逻辑广义估计方程和以整场比赛为单位的聚类自助法重复该对比，并报告各需求类别的必要需求数量，以及团队整合事件内部各项必要成分的实现程度。
+
+RQ2 is a theory-guided exploratory analysis. We estimated separate logistic generalized estimating equations for corrective response and line continuation, with degree as an ordinal predictor. Models used a binomial family, exchangeable working correlation, and match as the clustering unit. Events marked U or right-censored for the relevant outcome were excluded, leaving 135 observations across 15 matches (165 focal events, less 16 Degree U events and 15 right-censored events, with one event in both groups). We controlled the two-model family using Holm correction. Coefficients are reported as odds ratios. These models estimate sequential associations and do not identify causal effects.
+% 中文注释：RQ2 是理论引导的探索性分析。我们分别针对纠正性回应和论证线延续估计逻辑广义估计方程，以程度作为有序预测变量。模型使用二项分布、可交换工作相关结构，并以比赛为聚类单位。标记为 U 或在相关结局上右删失的事件被排除，最终包含 15 场比赛中的 135 个观测（165 个焦点事件减去 16 个 Degree U 事件和 15 个右删失事件，其中 1 个事件同时属于两类）。两模型族采用 Holm 校正，系数以优势比报告。这些模型估计序列关联，不识别因果效应。
+
+For reliability, the primary unit was an event--candidate pair and the primary judgment was whether the demand was substantially achieved. Across 205 candidate units with three available coder judgments, Krippendorff's $\alpha$ was .692 and percent agreement was 78.5\%. The nominal reliability of the subsequent-human function was $\alpha=.798$.
+% 中文注释：信度分析的主要单位是“事件—候选行动”对，主要判断为需求是否得到基本实现。在 205 个拥有三名编码者判断的候选单位中，Krippendorff's $\alpha$ 为 .692，一致率为 78.5\%；后续人类功能的名义变量信度为 $\alpha=.798$。
+
+\section{Results}
+
+The 15 formal matches contained 440 free-debate turns. The AI requested 415 of those opportunities and obtained the floor 165 times; these 165 realized contributions form the focal-event dataset. The participant-grounded procedure produced a stable core set for 149 events. Sixteen local-response events had no stable reference and received Degree U.
+% 中文注释：15 场正式比赛共包含 440 个自由辩论回合。AI 在其中 415 次机会中申请发言，并有 165 次获得发言权；这 165 次实际贡献构成焦点事件数据集。参与者导向的流程为 149 个事件形成稳定核心集合；另有 16 个局部回应事件没有稳定参照，被标为 Degree U。
+
+\subsection{RQ1: Alignment Depended on the Scope of Coordination Demand}
+
+Figure~\ref{fig:rq1-alignment} shows a pronounced difference between demand classes. The AI aligned with 84 of 126 local-response demands (66.7\%, 95\% CI [58.1\%, 74.3\%]). It aligned with only 3 of 39 team-integration demands (7.7\%, 95\% CI [2.7\%, 20.3\%]). The odds of alignment were 24 times higher for local-response than team-integration demands (Fisher exact $p<.001$). The corresponding rate ratio was 8.67.
+% 中文注释：图~\ref{fig:rq1-alignment} 显示两类需求之间存在明显差异。126 个局部回应需求中有 84 个实现匹配（66.7\%，95\% CI [58.1\%, 74.3\%]），而 39 个团队整合需求中仅有 3 个实现匹配（7.7\%，95\% CI [2.7\%, 20.3\%]）。局部回应需求的匹配优势是团队整合需求的 24 倍（Fisher 精确检验 $p<.001$），相应率比为 8.67。
+
+The degree distribution clarifies the difference (Figure~\ref{fig:rq1-degrees}). Local-response events comprised 55 Degree 0, 29 Degree 1, 23 Degree 2, 3 Degree 3, and 16 Degree U events. Team-integration events comprised 3 Degree 0, no Degree 1, 31 Degree 2, and 5 Degree 3 events. Thus, most team-integration failures still made some progress, but failed to realize at least one essential demand. Restricting the denominator to the 149 decidable events increased local-response alignment to 76.4\% while team-integration alignment remained 7.7\%. The demand-class gap therefore persisted under the alternative denominator.
+% 中文注释：程度分布进一步说明这一差异（图~\ref{fig:rq1-degrees}）。局部回应事件包括 55 个 Degree 0、29 个 Degree 1、23 个 Degree 2、3 个 Degree 3 和 16 个 Degree U；团队整合事件包括 3 个 Degree 0、0 个 Degree 1、31 个 Degree 2 和 5 个 Degree 3。因此，多数团队整合失败仍取得了一些进展，却未实现至少一项必要需求。若仅以 149 个可判定事件为分母，局部回应匹配率升至 76.4\%，团队整合匹配率仍为 7.7\%；需求类别差距在替代分母下依然存在。
+
+\begin{figure}[tbp]
+  \centering
+  \begin{subfigure}[t]{0.485\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/rq1_alignment.pdf}
+    \caption{Alignment rates with Wilson 95\% confidence intervals.}
+    \label{fig:rq1-alignment}
+  \end{subfigure}\hfill
+  \begin{subfigure}[t]{0.485\linewidth}
+    \centering
+    \includegraphics[width=\linewidth]{figures/rq1_degree_composition.pdf}
+    \caption{Alignment-degree composition within each demand class.}
+    \label{fig:rq1-degrees}
+  \end{subfigure}
+  \caption{Demand--action alignment by demand scope. \textbf{(a)} Observed alignment rates; the conservative denominator retains Degree U events but does not count them as aligned. \textbf{(b)} Degree 0 and Degree 1 constitute alignment, Degree 2 and Degree 3 constitute mismatch, and Degree U marks an indeterminate reference.}
+  % 中文注释：按协调需求范围划分的需求—行动匹配结果。（a）观察到的匹配率；保守分母保留 Degree U 事件，但不将其计为匹配。（b）Degree 0 和 Degree 1 构成匹配，Degree 2 和 Degree 3 构成不匹配，Degree U 表示参照不确定。
+  \Description{Two charts shown side by side. The left chart compares alignment rates: 84 of 126 local-response events, or 66.7 percent, and 3 of 39 team-integration events, or 7.7 percent, with Wilson 95 percent confidence intervals. The right chart shows the degree composition: local-response events include 55 Degree 0, 29 Degree 1, 23 Degree 2, 3 Degree 3, and 16 Degree U events; team-integration events include 3 Degree 0, 31 Degree 2, and 5 Degree 3 events.}
+  \label{fig:rq1-results}
+\end{figure}
+
+Two events illustrate why local quality and team-state fit diverge. In a Degree 0 local-response event about whether money is the root of evil, the essential demand was to challenge the opposing causal claim. The AI answered that giving evil a price does not create its source and used a knife analogy: a knife can harm, but the hand using it remains responsible. Annotators judged this rebuttal complete. In a Degree 2 team-integration event about whether process or outcome better reflects the value of striving, the essential set required both rebutting the opponent's causal claim and synthesizing the team's broader framework. The AI clearly distinguished what an outcome can \emph{test} from what a process can \emph{express}, then contrasted success through skill with success through luck. The response made partial progress on the local challenge but did not perform the required synthesis. It was persuasive as an isolated turn while remaining incomplete as a team action.
+% 中文注释：两个事件说明了局部质量为何会与团队状态适配分离。在一个讨论金钱是否为万恶之源的 Degree 0 局部回应事件中，必要需求是挑战对方的因果主张。AI 回应说，给罪恶标价不会创造其根源，并以刀作类比：刀可以伤人，但责任仍在持刀之手。标注者判断该反驳完整。在一个讨论过程或结果何者更能体现奋斗价值的 Degree 2 团队整合事件中，必要集合既要求反驳对方的因果主张，也要求综合团队的整体框架。AI 清晰区分了结果能够“检验”什么与过程能够“表达”什么，并比较了凭技能成功与凭运气成功。该回应对局部挑战有所推进，却没有完成所需综合；作为孤立回合具有说服力，作为团队行动仍不完整。
+
+Two features of the scoring rule bear on this comparison. Team-integration events carried more essential demands than local-response events (1.92 versus 0.98 on average), and the conjunctive rule requires every essential demand to be at least substantially realized. A demand class with more essential demands therefore faces a stricter threshold. To separate this threshold effect from the AI's behavior, we examined realization within team-integration events, where 34 of 39 events carried both a local and an integrative essential component. Table~\ref{tab:component-realization} reports the result. Local components inside these events were completely realized in 21 of 36 ratings, a rate slightly above that of local components in local-response events. Integrative components were completely realized in none of 39 ratings. Because this comparison holds the event, the annotators, the 30-second turn budget, and the rating scale constant, the difference cannot be attributed to the number of essential demands or to the conjunctive aggregation rule.
+% 中文注释：评分规则的两个特征与该比较相关。团队整合事件的必要需求数量多于局部回应事件（平均 1.92 对 0.98），而合取规则要求每项必要需求至少基本实现，因此必要需求更多的类别面临更严格的阈值。为把阈值效应与 AI 行为区分开，我们在团队整合事件内部考察实现程度；39 个事件中有 34 个同时包含局部与整合两类必要成分。表~\ref{tab:component-realization} 报告结果：这些事件内部的局部成分在 36 次评分中有 21 次完全实现，略高于局部回应事件中的局部成分；整合成分在 39 次评分中没有一次完全实现。由于该比较固定了事件、标注者、30 秒回合预算和评分量表，这一差异无法由必要需求数量或合取聚合规则解释。
+
+\begin{table}[tbp]
+\centering
+\caption{Realization of essential components within team-integration events, compared with local components in local-response events. Ratings are counted per essential component. ``Complete'' counts fully realized components; ``$\geq$ substantial'' additionally counts substantially complete ones.}
+% 中文注释：团队整合事件内部各必要成分的实现程度，并与局部回应事件中的局部成分对照。计数单位为必要成分。“Complete”统计完全实现的成分；“$\geq$ substantial”额外计入基本实现的成分。
+\Description{A table with three rows comparing component realization. Local components within team-integration events: 36 ratings, 21 complete or 58.3 percent, 28 at least substantial or 77.8 percent. Integrative components within team-integration events: 39 ratings, 0 complete or 0.0 percent, 3 at least substantial or 7.7 percent. Local components within local-response events: 123 ratings, 59 complete or 48.0 percent, 95 at least substantial or 77.2 percent.}
+\label{tab:component-realization}
+\small
+\begin{tabular}{lrrr}
+\toprule
+\textbf{Essential component} & \textbf{Ratings} & \textbf{Complete} & \textbf{$\geq$ substantial} \\
+\midrule
+\multicolumn{4}{l}{\emph{Within team-integration events}} \\
+\quad Local components & 36 & 21 (58.3\%) & 28 (77.8\%) \\
+\quad Integrative components & 39 & 0 (0.0\%) & 3 (7.7\%) \\
+\midrule
+\multicolumn{4}{l}{\emph{Reference}} \\
+\quad Local components in local-response events & 123 & 59 (48.0\%) & 95 (77.2\%) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+Because focal events are nested within matches, we repeated the demand-class contrast with match as the clustering unit. A logistic generalized estimating equation with an exchangeable working correlation estimated the odds of alignment for team-integration relative to local-response demands at 0.04 (95\% CI [0.01, 0.21], $p<.001$). A cluster bootstrap that resampled whole matches placed the alignment-rate difference between 40.9\% and 72.4\% (95\% CI), and no bootstrap replicate reversed the direction of the difference.
+% 中文注释：由于焦点事件嵌套于比赛，我们以比赛为聚类单位重复了需求类别对比。采用可交换工作相关结构的逻辑广义估计方程估计，团队整合需求相对局部回应需求的匹配优势比为 0.04（95\% CI [0.01, 0.21]，$p<.001$）。以整场比赛为单位的聚类自助法给出匹配率差异的 95\% 置信区间为 40.9\% 至 72.4\%，且没有任何一次重抽改变差异方向。
+
+Among the 62 Degree 2 or 3 events, the most frequent primary mismatch forms were missed challenges ($n=18$), disconnected extensions ($n=16$), and misplaced priorities ($n=12$). Incomplete repair ($n=7$), other indeterminate mismatch ($n=5$), and repeated work ($n=4$) were less frequent. These patterns show that mismatch usually involved selection and integration failures rather than the absence of relevant content.
+% 中文注释：在 62 个 Degree 2 或 3 事件中，最常见的主要不匹配形式是遗漏挑战（$n=18$）、脱节延伸（$n=16$）和优先级错置（$n=12$）；修补不完整（$n=7$）、其他不确定不匹配（$n=5$）和重复工作（$n=4$）较少。这些模式说明，不匹配通常涉及选择与整合失败，而不是完全缺少相关内容。
+
+Local response quality was high across the dataset ($M=4.38$, $SD=0.23$ on a five-point scale). Among the 149 decidable events, quality averaged 4.35. Ratings were concentrated near the top of the scale, so the measure has limited range with which to separate events and does not support a test of association with alignment degree.
+% 中文注释：整个数据集的局部回应质量较高（五点量表上 $M=4.38$，$SD=0.23$）；149 个可判定事件的平均质量为 4.35。评分集中在量表顶端，因此该指标区分事件的范围有限，不支持与匹配程度的关联性检验。
+
+\subsection{RQ2: Human Action Following AI Alignment and Mismatch}
+
+The next same-team human contribution was right-censored for 15 focal events. Across all focal events, line continuation was the most common observed function ($n=100$), followed by corrective response ($n=25$), restatement ($n=18$), and argument redirection ($n=7$). No contribution was classified as having no discernible functional relation.
+% 中文注释：15 个焦点事件的下一次同队人类贡献被右删失。在全部焦点事件中，论证线延续是最常见的观察功能（$n=100$），其后依次为纠正性回应（$n=25$）、重述（$n=18$）和论证重定向（$n=7$）；没有贡献被归为无可辨识的功能关系。
+
+The exploratory models used 135 decidable, non-censored events (165 focal events, less 16 Degree U events and 15 right-censored events, with one event in both groups). Each one-step increase in mismatch degree was associated with higher odds of line continuation (OR=1.52, raw $p=.014$, Holm-adjusted $p=.028$). Descriptively, line continuation occurred after 32 of 53 Degree 0 events (60.4\%), 16 of 25 Degree 1 events (64.0\%), and 44 of 57 Degree 2--3 events (77.2\%). Corrective responses occurred after 11 of 53 Degree 0 events (20.8\%), 5 of 25 Degree 1 events (20.0\%), and 7 of 57 Degree 2--3 events (12.3\%). With 25 corrective responses in total, the design had little power to detect a change in this outcome, and the model did not detect one (OR=0.72, raw and Holm-adjusted $p=.062$). These associations describe what followed the AI contribution; they do not establish that mismatch caused the human action.
+% 中文注释：探索性模型使用 135 个可判定且未删失的事件（165 个焦点事件减去 16 个 Degree U 事件和 15 个右删失事件，其中 1 个事件同时属于两类）。不匹配程度每增加一级，论证线延续的优势升高（OR=1.52，原始 $p=.014$，Holm 校正后 $p=.028$）。描述性来看，53 个 Degree 0 事件中有 32 个（25 个 Degree 1 事件中有 16 个，57 个 Degree 2--3 事件中有 44 个）之后出现论证线延续（60.4\%、64.0\%、77.2\%）；纠正性回应分别出现于 11 个（20.8\%）、5 个（20.0\%）和 7 个（12.3\%）事件之后。纠正性回应全样本仅 25 例，本设计几乎没有功效检出该结局的变化，模型也未检出（OR=0.72，原始及 Holm 校正后 $p=.062$）。这些关联描述 AI 贡献之后发生了什么，并不证明不匹配导致了人类行动。
+
+\subsection{Participants' Experience with the AI Teammate}
+
+Table~\ref{tab:questionnaire-results} reports the five questionnaire items separately. Participants' ratings centered near the scale midpoint for helpfulness, perceived coordination, awareness of the match state, and willingness to continue teaming. Added burden was the clearest pattern: 12 of 18 participants agreed or strongly agreed that the AI created extra work when its contribution was unclear, incomplete, or repetitive ($M=3.56$, $SD=0.70$).
+% 中文注释：表~\ref{tab:questionnaire-results} 分别报告五个问卷题项。参与者对帮助程度、感知协调、赛况理解和继续组队意愿的评分集中在量表中点附近。额外负担是最清晰的模式：18 名参与者中有 12 名同意或非常同意，当 AI 的贡献不清晰、不完整或重复时，它会增加额外工作（$M=3.56$，$SD=0.70$）。
+
+\begin{table*}[tbp]
+\centering
+\caption{Post-study ratings of the AI teammate ($N=18$; 1=strongly disagree, 5=strongly agree). ``Agree'' combines ratings of 4 and 5.}
+% 中文注释：参与者对 AI 队友的研究后评分（$N=18$；1=非常不同意，5=非常同意）。“Agree”合并评分 4 和 5。
+\label{tab:questionnaire-results}
+\small
+\begin{tabular}{lrrrr}
+\toprule
+\textbf{Item} & \textbf{$M$} & \textbf{$SD$} & \textbf{Median} & \textbf{Agree} \\
+\midrule
+Helped the team & 3.22 & 0.88 & 3 & 7/18 \\
+Coordinated with teammates & 3.11 & 0.90 & 3 & 8/18 \\
+Understood the match state & 3.44 & 0.86 & 3 & 8/18 \\
+Created extra burden & 3.56 & 0.70 & 4 & 12/18 \\
+Willing to continue teaming & 3.22 & 0.94 & 3 & 6/18 \\
+\bottomrule
+\end{tabular}
+\end{table*}
+
+\section{Discussion}
+
+Our findings expose a consequential gap between responding within a debate and coordinating within a team. The AI often met demands that could be resolved through a local rebuttal, defense, or distinction. It rarely met demands that required integrating information across teammates, arguments, and the evolving strategy. A contribution can therefore be coherent, relevant, and rhetorically useful while still imposing coordination costs on the team.
+% 中文注释：我们的发现揭示了“在辩论中作出回应”与“在团队中形成协调”之间的重要差距。AI 经常满足可通过局部反驳、防守或区分解决的需求，却很少满足需要跨队友、论证和持续发展策略整合信息的需求。因此，一项贡献可以连贯、相关且具有修辞作用，同时仍给团队带来协调成本。
+
+\subsection{From Local Response Quality to Team-State Fit}
+
+Local quality and team-state fit capture different properties of an AI contribution. Both demand classes received high local-quality ratings, yet their alignment rates differed sharply. The component-level pattern locates the divergence precisely: within the same team-integration events, the AI realized local components as well as it did elsewhere, while realizing no integrative component completely. Local response quality and coordination fit therefore require separate measurement.
+% 中文注释：局部质量和团队状态适配刻画 AI 贡献的不同属性。两类需求的局部质量评分都很高，但匹配率差异显著。成分级模式精确定位了这一分化：在同一批团队整合事件内部，AI 实现局部成分的水平与其他场合相当，却没有一项整合成分完全实现。因此，局部回应质量与协调适配需要分别测量。
+
+The three most common mismatch forms further locate the problem. Missed challenges indicate failures to prioritize an unresolved threat. Disconnected extensions indicate relevant contributions that did not connect to the team's current line. Misplaced priorities indicate attention to a defensible but less urgent action. These are failures of state-conditioned action selection. Improving factuality or eloquence alone may not address them.
+% 中文注释：三种最常见的不匹配形式进一步定位了问题。遗漏挑战表示未能优先处理尚未解决的威胁；脱节延伸表示相关贡献没有接入团队当前论证线；优先级错置表示关注了合理但不够紧迫的行动。这些都是状态条件下行动选择的失败，仅改善事实准确性或表达流畅性未必能够解决。
+
+\subsection{Residual Coordination Work}
+
+RQ2 suggests that unresolved coordination demand does not always appear as explicit correction. As degree increased, the next human teammate more often continued the team's argument. Corrective responses were too infrequent for this design to detect a change in their rate. Line continuation does not reveal whether a participant trusted, ignored, accepted, or strategically avoided the AI. It shows that the team moved forward without making correction the primary function of its next contribution.
+% 中文注释：RQ2 表明，未解决的协调需求并不总以明确纠正的形式出现。随着程度升高，下一位人类队友更常继续团队论证；纠正性回应数量过少，本设计无法检出其比例变化。论证线延续无法说明参与者是信任、忽略、接受还是策略性避开 AI；它只表明团队继续前进，而没有把纠正作为下一次贡献的主要功能。
+
+We use \emph{residual coordination work} to describe the integration work left when an AI contribution does not fully satisfy the pre-action demand. Teammates can encounter this work while developing their own argument, restoring priorities, or reconnecting the exchange to the team strategy. The observed increase in line continuation is consistent with such work remaining embedded in ongoing participation, but the sequence alone does not show that a teammate performed it. The questionnaire establishes its practical relevance at the participant level: two thirds reported extra burden from understanding, supplementing, or correcting the AI. Together, the measures show why uninterrupted progress should not be equated with effortless coordination while keeping the behavioral association distinct from participants' reported experience.
+% 中文注释：我们用\emph{残余协调工作}描述 AI 贡献未完全满足行动前需求时遗留的整合工作。队友可能在发展自身论证、恢复优先级或把交锋重新接回团队策略时遇到这些工作。观察到的论证线延续增加，与这些工作仍嵌入持续参与相一致，但仅凭序列无法判断某位队友是否实际完成了它。问卷在参与者层面说明了其实践相关性：三分之二的参与者报告，理解、补充或纠正 AI 带来了额外负担。综合这些测量可见，不间断的任务推进不应等同于毫不费力的协调，同时行为关联仍需与参与者报告的体验区分开来。
+
+\subsection{Designing AI Teammates for Integrative Action}
+
+The results favor systems that represent team state as more than the latest opponent turn. An AI teammate should track which attacks remain unresolved, which arguments teammates have completed, what commitments the team has established, and which contribution would best complement current work. This representation should support several acceptable next actions rather than one presumed gold response.
+% 中文注释：结果支持让系统用超越“对手最新回合”的方式表征团队状态。AI 队友应追踪哪些攻击仍未解决、队友已经完成哪些论证、团队建立了哪些承诺，以及哪种贡献最能补充当前工作。这种表征应支持多种可接受的下一步行动，而不是假设只有一个标准答案。
+
+Interfaces can also make coordination demand legible without requiring continuous explicit instruction. A system could expose its inferred priority, indicate which prior contribution it intends to extend, or yield when its proposed action duplicates covered work. These mechanisms would make initiative more accountable while preserving the speed required by live collaboration.
+% 中文注释：界面也可以在无需持续明确指令的情况下，让协调需求更清晰可见。系统可以呈现其推断的优先事项，指出它准备延伸哪项先前贡献，或在拟议行动重复已完成工作时主动让出机会。这些机制能够在保留实时协作所需速度的同时，使主动性更可问责。
+
+\subsection{Methodological Implications}
+
+Participant-grounded acceptable-action sets make team members' situated understanding part of the construct. Participants experienced the shared history, strategy, and time pressure that made an action appropriate, giving them access to context that an external evaluator may not reconstruct from transcript content alone. Aggregating several acceptable actions makes these expectations explicit, while indeterminate classifications preserve disagreement instead of forcing one retrospective answer.
+% 中文注释：参与者导向的可接受行动集合把团队成员的情境化理解纳入构念。参与者亲历了使某项行动合适的共享历史、策略和时间压力，因此能接触到外部评价者仅凭文本记录可能无法重建的情境。聚合多项可接受行动使这些期望显性化，而不确定分类则保留分歧，避免强行给出唯一的回顾性答案。
+
+The same logic can extend beyond debate. In collaborative writing, software development, emergency response, or design work, an AI action can be evaluated against the unresolved demands visible immediately before it acted. The functional categories will differ by domain, but the measurement relation remains: pre-action state, acceptable-action set, realized contribution, and subsequent team response.
+% 中文注释：同一逻辑可以扩展到辩论之外。在协作写作、软件开发、应急响应或设计工作中，可以将 AI 行动与其行动前一刻可见的未解决需求相比较。不同领域的功能类别会有所不同，但测量关系保持不变：行动前状态、可接受行动集合、实际贡献和后续团队回应。
+
+\subsection{Limitations}
+Our design trades breadth for depth. Six fixed teams playing 15 matches let teammates accumulate the shared history that implicit coordination depends on, which repeated ad-hoc grouping cannot supply; the estimates therefore describe sustained interaction in this setting rather than AI teammates generally. We held the AI configuration constant for a related reason: each match required four participants speaking synchronously in real time, so adding a configuration factor would have multiplied participant hours without sharpening the event-level comparison. Team-integration demands arose in 39 events, and their confidence interval remains wide despite the large observed gap.
+% 中文注释：本研究的设计以广度换深度。6 支固定团队完成 15 场比赛，使队友能够积累隐性协调所依赖的共享历史，而反复临时组队无法提供这一条件；因此这些估计描述的是该场景中的持续互动，而非所有 AI 队友的一般表现。基于相关考虑，我们保持 AI 配置不变：每场比赛需要四名参与者实时同步发言，引入配置因子会成倍增加参与者时间，却无助于锐化事件级比较。团队整合需求出现于 39 个事件，尽管观察差距很大，其置信区间仍较宽。
+
+Grounding the acceptable-action set in participants gives the construct access to situated team expectations that a transcript alone does not carry, at the cost of admitting team-specific strategy and retrospective interpretation; staged revelation limits the latter by eliciting demands before the AI action is shown. Sixteen events lacked a stable reference, and we retained them in the conservative RQ1 denominator rather than dropping them. Right-censoring concentrated in late free-debate turns where the speaking budget ran out, so the censored events are not a random subset. The RQ2 models are exploratory, rest on 15 match clusters, and identify the function of the next human contribution rather than the speaker's intention. Debate makes timing, opposition, and argument dependencies unusually visible, which is what makes this measurement tractable; extending the method to cooperative tasks with other forms of interdependence is the natural next step.
+% 中文注释：将可接受行动集合根植于参与者，使构念能够获取仅凭文本记录无法承载的情境化团队期望，代价是引入团队特定策略与回顾性解释；分阶段呈现通过在展示 AI 行动前先提取需求来限制后者。有 16 个事件缺少稳定参照，我们将其保留在 RQ1 的保守分母中而非剔除。右删失集中于自由辩论末段、发言预算耗尽之处，因此删失事件并非随机子集。RQ2 模型属于探索性分析，基于 15 个比赛聚类，其结局识别下一次人类贡献的功能，而非发言者的意图。辩论使时机、对抗关系和论证依赖异常清晰，这正是本测量在此可行的原因；将其扩展到具有其他互依形式的合作任务，是自然的下一步。
+
+\section{Conclusion}
+
+AI teammates must do more than generate strong isolated responses. They must select actions that fit what the team currently needs. Coordination demand--action alignment makes that fit measurable by linking the pre-action team state, participant-grounded acceptable actions, and the AI's realized contribution. In live team debate, the AI aligned frequently with local-response demands but rarely with team-integration demands. Human teammates often continued the task after mismatch rather than explicitly correcting the AI, leaving coordination work embedded in ongoing participation. Evaluating AI as a teammate therefore requires measuring not only what it says, but whether its action belongs in the team's unfolding work.
+% 中文注释：AI 队友不能只生成出色的孤立回答，还必须选择符合团队当前需求的行动。协调需求—行动匹配通过连接行动前团队状态、参与者给出的可接受行动和 AI 实际贡献，使这种适配可被测量。在现场团队辩论中，AI 经常匹配局部回应需求，却很少匹配团队整合需求。发生不匹配后，人类队友往往继续任务而非明确纠正 AI，使协调工作仍嵌入持续参与。因此，把 AI 作为队友进行评价时，不仅要衡量它说了什么，还要判断其行动是否属于团队正在展开的工作。
+
+\section*{Ethics and Privacy Statement}
+Participants provided written informed consent before taking part and consented to anonymous processing of their study data. The manuscript uses anonymous participant and team identifiers and reports no direct identifiers. The study followed the ethics-review requirements of the authors' institution; identifying institutional details are withheld during anonymous review.
+% 中文注释：参与者在参加前提供书面知情同意，并同意匿名处理其研究数据。稿件使用匿名的参与者和团队编号，不报告直接身份信息。本研究遵循作者所在机构的伦理审查要求；匿名评审期间隐去可识别机构的信息。
+
+\section*{Generative AI Use Disclosure}
+Generative AI tools were used to support language editing and manuscript drafting. The authors determined the study design, verified the source data and reported analyses, reviewed the manuscript, and take responsibility for the submitted content. The AI teammate evaluated in the study is described separately as part of the research method.
+% 中文注释：生成式 AI 工具用于辅助语言编辑和稿件起草。作者确定研究设计，核验源数据与报告的分析，审阅稿件，并对提交内容承担责任。研究中接受评价的 AI 队友作为研究方法的一部分另行说明。
+
+\appendix
+
+\section{Questionnaires}
+\label{app:questionnaires}
+
+\subsection{Summary Questionnaire}
+\label{app:summary-quiz}
+
+Drawing on artificial social intelligence measures from \citet{bendell2025asi} and perceived-teammate measures from \citet{mukhopadhyay2026roles}, we designed five items that capture complementary aspects of participants' experience with the AI teammate. The items cover perceived coordination, awareness of the debate state, helpfulness, added burden, and willingness to continue teaming with the AI. Participants rated each item on a five-point scale from 1 (``strongly disagree'') to 5 (``strongly agree''). We treat the items as separate descriptive measures because they address distinct aspects of the experience.
+% 中文注释：参考 \citet{bendell2025asi} 的人工社会智能测量，以及 \citet{mukhopadhyay2026roles} 的感知队友测量，我们设计了五个题项，分别描述参与者与 AI 队友互动体验的不同方面。题项覆盖感知协调、对赛况的把握、帮助程度、额外负担，以及继续与 AI 组队的意愿。参与者使用五点量表作答，其中 1 表示“非常不同意”，5 表示“非常同意”。由于这些题项涉及不同体验，我们将其作为独立描述性指标。
+
+\begin{itemize}
+  \item The AI teammate felt like a debater that coordinates with its teammates.
+  % 中文注释：AI 队友给人的感觉像是一位会与队友协调的辩手。
+  \item The AI teammate was usually able to pick up on what was happening in the match.
+  % 中文注释：AI 队友通常能够理解比赛中正在发生什么。
+  \item The AI teammate was of great help to our team.
+  % 中文注释：AI 队友对我们团队很有帮助。
+  \item The AI teammate created extra burden for me---for example, when it spoke unclearly, left gaps in its argument, or duplicated a teammate, and I then had to spend effort understanding, supplementing, or correcting it.
+  % 中文注释：AI 队友给我增加了额外负担，例如它表达不清、论证留有缺口或重复队友内容，使我不得不花精力理解、补充或纠正它。
+  \item I would be willing to keep it as a teammate.
+  % 中文注释：我愿意继续让它作为队友。
+\end{itemize}
+
+\section{AI Teammate Prompts}
+\label{app:ai-prompt}
+
+The AI teammate used two prompts. Both were written in Chinese, matching the language of the debate. The listings below provide English translations for readability; the Chinese originals are included as plain-text files in the supplementary material.
+% 中文注释：AI 队友使用两个提示词，均以中文编写，与辩论语言一致。为便于阅读，下方代码清单给出英文译文；中文原文作为纯文本文件包含在补充材料中。
+
+\subsection{Floor-Request Prompt}
+\label{app:decision-prompt}
+
+At each potential speaking opportunity, the model first returned a request decision. The platform subsequently appended the final three lines of Listing~\ref{lst:decision-prompt}; the parser accepted exactly \texttt{should\_speak} and \texttt{decision\_reason}. A valid AI request competed with human requests, which retained priority.
+% 中文注释：在每次潜在发言机会中，模型先返回申请决策。平台在运行时追加 Listing~\ref{lst:decision-prompt} 的最后三行；解析器只接受 \texttt{should\_speak} 和 \texttt{decision\_reason} 两个字段。有效的 AI 申请与人类申请共同参与分配，但人类保留优先权。
+
+\begin{lstlisting}[label={lst:decision-prompt},caption={Floor-request prompt (translated from the Chinese original).}]
+# Role
+You are a debater in a Chinese-language debate. You and three other teammates
+form one team and share responsibility for the outcome of this debate.
+You and your three teammates represent {POSITION}; you are the {SEAT} of the
+{STANCE} {POSITION}.
+
+Motion: {TOPIC}
+Affirmative position: {AFFIRMATIVE_STANCE}
+Negative position: {NEGATIVE_STANCE}
+Your side: {POSITION} -- {STANCE}
+Your seat: {SEAT}
+
+# Current phase
+The current phase is free debate.
+The two sides take the floor in alternation. Each side has 6 minutes of total
+speaking time, with at most 30 seconds per turn.
+After the opposing side finishes speaking, your human teammates and you may all
+contest the next speaking opportunity.
+Once a human teammate raises a hand, that teammate always receives the floor
+first; a human may cancel a raised hand before the deadline.
+You will not be told whether any human has currently raised a hand. Judge for
+yourself, based only on the state of the debate and the needs of the whole team.
+
+# Current state
+Time remaining for your side: {SIDE_REMAINING_MS}
+Time remaining for the opposing side: {OPPONENT_REMAINING_MS}
+
+Full debate transcript (JSON array, grouped by phase):
+{DEBATE_HISTORY}
+
+# Task
+Consider the whole team when deciding on your own action.
+Judge whether you should contest the next speaking opportunity at this moment.
+
+Output only the following JSON. Do not output explanations, Markdown, or any
+other fields:
+{"should_speak": true|false}
+
+This is a fast decision during free debate. Output JSON only, no Markdown:
+{"should_speak": true or false, "decision_reason": "reason, 20 characters max"}
+decision_reason is required and must not exceed 20 characters. Judge whether
+speaking is worthwhile given the current debate context.
+\end{lstlisting}
+
+\subsection{Speech Prompt}
+\label{app:speech-prompt}
+
+The system called the speech prompt only after allocating the floor to the AI. It required a directly playable Chinese utterance rather than an explanation or a planning trace.
+% 中文注释：系统只在 AI 获得发言权后调用发言提示词。提示词要求模型输出可直接播放的中文发言，而非解释或规划过程。
+
+\begin{lstlisting}[label={lst:speech-prompt},caption={Speech prompt (translated from the Chinese original).}]
+# Role
+You are a debater in a Chinese-language debate. You and three other teammates
+form one team and share responsibility for the outcome of this debate.
+You and your three teammates represent {POSITION}; you are the {SEAT} of the
+{STANCE} {POSITION}.
+
+Motion: {TOPIC}
+Affirmative position: {AFFIRMATIVE_STANCE}
+Negative position: {NEGATIVE_STANCE}
+Your side: {POSITION} -- {STANCE}
+Your seat: {SEAT}
+
+# Current phase
+The current phase is free debate, and you have won this turn for your side.
+This turn lasts at most {MAX_SPEECH_SECONDS} seconds.
+
+# Current state
+Time remaining for your side: {SIDE_REMAINING_MS}
+Time remaining for the opposing side: {OPPONENT_REMAINING_MS}
+
+Full debate transcript (JSON array, grouped by phase):
+{DEBATE_HISTORY}
+
+# Task
+Consider the whole team and the current state of the debate when deciding what
+to say.
+Hold your side's position, respond directly to the issue that most needs to be
+addressed right now, and advance your side's argument.
+Use natural, plain, spoken Chinese suitable for reading aloud on the spot. Do
+not fabricate facts or sources.
+Keep the utterance within the dynamic target character count supplied by the
+system, so that it can be played in full within the time limit.
+
+Output only the utterance to be read aloud. Do not output explanations,
+Markdown, headings, or stage directions.
+\end{lstlisting}
+
+\bibliographystyle{ACM-Reference-Format}
+\bibliography{chi2027_refs}
+\end{document}

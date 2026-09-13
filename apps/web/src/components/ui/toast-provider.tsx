@@ -14,6 +14,8 @@ import {
 import { createPortal } from 'react-dom';
 import type { ReactNode } from 'react';
 
+import { useAppTranslations } from '@/i18n';
+
 type ToastTone = 'success' | 'error' | 'info';
 
 type ToastInput = {
@@ -56,6 +58,7 @@ export function ToastProvider({
   children,
   pathnameOverride,
 }: Readonly<{ children: ReactNode; pathnameOverride?: string }>) {
+  const t = useAppTranslations('Common');
   const currentPathname = usePathname() || '/';
   const pathname = pathnameOverride ?? currentPathname;
   const [items, setItems] = useState<ToastItem[]>([]);
@@ -132,7 +135,7 @@ export function ToastProvider({
 
   const viewport = (
     <div
-      aria-label="操作提示"
+      aria-label={t('connectionError')}
       className={
         inModal
           ? `pointer-events-none sticky top-0 z-[200] flex flex-col items-stretch gap-3 ${items.length ? 'mb-3' : ''}`
@@ -161,7 +164,7 @@ export function ToastProvider({
             <Icon aria-hidden="true" className="mt-0.5 size-4 shrink-0" />
             <span className="min-w-0 flex-1 leading-6">{item.message}</span>
             <button
-              aria-label="关闭提示"
+              aria-label={t('close')}
               className="pointer-events-auto -mr-1 rounded-lg p-1 transition hover:bg-black/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-current"
               onClick={() => dismissToast(item.id)}
               type="button"

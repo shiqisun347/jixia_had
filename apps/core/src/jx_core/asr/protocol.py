@@ -11,6 +11,8 @@ from uuid import UUID, uuid4
 
 from websockets.asyncio.client import connect
 
+from ..data_capture.provider import ProviderCallCapture
+
 
 class FunAsrError(RuntimeError):
     def __init__(self, code: str) -> None:
@@ -62,6 +64,8 @@ async def _default_socket_factory(url: str, headers: dict[str, str]) -> WebSocke
 class FunAsrConnection:
     """One reusable provider connection with sequential task execution."""
 
+    _MAX_PENDING_CAPTURES = 16
+
     def __init__(
         self,
         *,
@@ -83,11 +87,21 @@ class FunAsrConnection:
         self._final_timeout_seconds = final_timeout_seconds
         self._socket: WebSocketLike | None = None
         self._lock = asyncio.Lock()
+        self._captures: dict[UUID, ProviderCallCapture] = {}
+
+    def take_capture(self, task_id: UUID) -> ProviderCallCapture | None:
+        return self._captures.pop(task_id, None)
 
     async def close(self) -> None:
         socket, self._socket = self._socket, None
+        self._captures.clear()
         if socket is not None:
             await socket.close()
+
+    def _store_capture(self, task_id: UUID, capture: ProviderCallCapture) -> None:
+        self._captures[task_id] = capture
+        while len(self._captures) > self._MAX_PENDING_CAPTURES:
+            self._captures.pop(next(iter(self._captures)))
 
     async def _ensure_socket(self) -> WebSocketLike:
         if self._socket is None:
@@ -107,11 +121,17 @@ class FunAsrConnection:
     ) -> SegmentResult:
         async with self._lock:
             current_task_id = task_id or uuid4()
+            capture = ProviderCallCapture(provider_request_id=str(current_task_id))
+            sent_events = [self._run_task(current_task_id)]
+            received_events: list[dict[str, Any]] = []
+            audio_frames = 0
+            audio_bytes = 0
             socket = await self._ensure_socket()
             sender: asyncio.Task[None] | None = None
             try:
-                await socket.send(json.dumps(self._run_task(current_task_id), ensure_ascii=False))
-                await self._wait_started(socket, current_task_id)
+                await socket.send(json.dumps(sent_events[0], ensure_ascii=False))
+                started_event = await self._wait_started(socket, current_task_id)
+                received_events.append(started_event)
                 if on_started is not None:
                     on_started()
                 started_at = asyncio.get_running_loop().time()
@@ -120,22 +140,22 @@ class FunAsrConnection:
                 finish_sent_at: float | None = None
 
                 async def send_audio() -> None:
-                    nonlocal finish_sent_at
+                    nonlocal audio_bytes, audio_frames, finish_sent_at
                     try:
                         async for chunk in chunks:
+                            audio_frames += 1
+                            audio_bytes += len(chunk)
                             await socket.send(chunk)
-                        await socket.send(
-                            json.dumps(
-                                {
-                                    "header": {
-                                        "action": "finish-task",
-                                        "task_id": str(current_task_id),
-                                        "streaming": "duplex",
-                                    },
-                                    "payload": {"input": {}},
-                                }
-                            )
-                        )
+                        finish_event: dict[str, Any] = {
+                            "header": {
+                                "action": "finish-task",
+                                "task_id": str(current_task_id),
+                                "streaming": "duplex",
+                            },
+                            "payload": {"input": {}},
+                        }
+                        sent_events.append(finish_event)
+                        await socket.send(json.dumps(finish_event))
                         finish_sent_at = asyncio.get_running_loop().time()
                     except Exception as error:
                         raise FunAsrError("asr_stream_failed") from error
@@ -155,6 +175,7 @@ class FunAsrConnection:
                         continue
                     event = header.get("event")
                     if event == "task-failed":
+                        received_events.append(message)
                         self._socket = None
                         await socket.close()
                         raise FunAsrError("asr_task_failed")
@@ -162,30 +183,65 @@ class FunAsrConnection:
                         sentence = self._sentence(message, current_task_id)
                         if sentence.heartbeat:
                             continue
+                        if not any(
+                            self._header(item).get("event") == "result-generated"
+                            for item in received_events
+                        ):
+                            received_events.append(message)
                         latency_ms = int((asyncio.get_running_loop().time() - started_at) * 1000)
                         if first_interim_ms is None:
                             first_interim_ms = latency_ms
                         if sentence.sentence_end:
                             stable_sentences[sentence.sentence_id] = sentence.text
+                            if (
+                                received_events
+                                and self._header(received_events[-1]).get("event")
+                                == "result-generated"
+                            ):
+                                received_events[-1] = message
                         await on_sentence(sentence)
                     elif event == "task-finished":
+                        received_events.append(message)
                         finish_seen_at = asyncio.get_running_loop().time()
                         break
                 await sender
                 assert finish_seen_at is not None
                 if finish_sent_at is None:
                     raise FunAsrError("asr_protocol_invalid")
-                return SegmentResult(
+                result = SegmentResult(
                     task_id=current_task_id,
                     final_text="".join(stable_sentences[key] for key in sorted(stable_sentences)),
                     first_interim_latency_ms=first_interim_ms,
                     final_latency_ms=int((finish_seen_at - finish_sent_at) * 1000),
                 )
+                self._store_capture(
+                    current_task_id,
+                    _capture_asr(
+                        capture,
+                        self._url,
+                        sent_events,
+                        received_events,
+                        audio_frames,
+                        audio_bytes,
+                    ),
+                )
+                return result
             except BaseException:
                 if sender is not None:
                     sender.cancel()
                     await asyncio.gather(sender, return_exceptions=True)
                 await self._invalidate_socket(socket)
+                self._store_capture(
+                    current_task_id,
+                    _capture_asr(
+                        capture,
+                        self._url,
+                        sent_events,
+                        received_events,
+                        audio_frames,
+                        audio_bytes,
+                    ),
+                )
                 raise
 
     async def _invalidate_socket(self, socket: WebSocketLike) -> None:
@@ -196,7 +252,7 @@ class FunAsrConnection:
         except Exception:
             pass
 
-    async def _wait_started(self, socket: WebSocketLike, task_id: UUID) -> None:
+    async def _wait_started(self, socket: WebSocketLike, task_id: UUID) -> dict[str, Any]:
         try:
             while True:
                 raw = await asyncio.wait_for(socket.recv(), timeout=self._start_timeout_seconds)
@@ -205,7 +261,7 @@ class FunAsrConnection:
                 if header.get("task_id") != str(task_id):
                     continue
                 if header.get("event") == "task-started":
-                    return
+                    return message
                 if header.get("event") == "task-failed":
                     self._socket = None
                     await socket.close()
@@ -276,3 +332,32 @@ class FunAsrConnection:
             )
         except (KeyError, TypeError, ValueError) as error:
             raise FunAsrError("asr_protocol_invalid") from error
+
+
+def _capture_asr(
+    capture: ProviderCallCapture,
+    url: str,
+    sent_events: list[dict[str, Any]],
+    received_events: list[dict[str, Any]],
+    audio_frames: int,
+    audio_bytes: int,
+) -> ProviderCallCapture:
+    capture.capture_request(
+        transport="WEBSOCKET",
+        url=url,
+        body={"messages": sent_events},
+        binary_summary={
+            "direction": "platform_to_provider",
+            "format": "pcm_s16le_16000_mono",
+            "frame_count": audio_frames,
+            "total_bytes": audio_bytes,
+            "audio_duration_ms": audio_bytes // 32,
+        },
+    )
+    capture.capture_response(
+        transport="WEBSOCKET",
+        url=url,
+        body={"task_id": capture.provider_request_id},
+        events=received_events,
+    )
+    return capture

@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from jx_core.config import Settings
 from jx_core.database import Database
-from jx_core.models import HostAudioAsset, Rule, RuleStage, User, VoiceProfile
+from jx_core.models import HostAudioAsset, ModelProfile, Rule, RuleStage, User, VoiceProfile
 from jx_core.rules.formal_4v4 import (
     build_formal_4v4_draft,
     expected_formal_4v4_host_copy,
@@ -62,7 +62,13 @@ async def _run(finalize: bool) -> None:
                 )
                 if host_voice is None:
                     raise RuntimeError("host_voice_unavailable")
+                default_model = await session.scalar(
+                    select(ModelProfile).where(ModelProfile.status == "ENABLED")
+                )
+                if default_model is None:
+                    raise RuntimeError("model_profile_unavailable")
                 host_voice_id = host_voice.id
+                default_model_id = default_model.id
                 await session.rollback()
                 rule = await RuleService().create_rule(
                     session,
@@ -70,6 +76,7 @@ async def _run(finalize: bool) -> None:
                     payload=RuleCreate(
                         rule_key=RULE_KEY,
                         host_voice_profile_id=host_voice_id,
+                        default_agent_model_profile_id=default_model_id,
                         draft=build_formal_4v4_draft(),
                     ),
                 )

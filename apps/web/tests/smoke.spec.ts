@@ -1,4 +1,4 @@
-import { expect, test, type Page } from '@playwright/test';
+import { expect, test, type Page } from './fixtures';
 
 test.beforeEach(async ({ page }) => {
   await page.route('**/api/users/*/avatar*', (route) =>
@@ -49,6 +49,9 @@ test('home prototype is usable at the target desktop viewport', async ({ page })
   ).toBeVisible();
   await expect(page.getByRole('heading', { name: '正在进行' })).toBeVisible();
   await expect(page.getByRole('navigation', { name: '主导航' })).toBeVisible();
+  await expect(
+    page.getByRole('navigation', { name: '主导航' }).getByRole('link', { name: '实验安排' }),
+  ).toHaveCount(0);
   await expect(page.getByRole('button', { name: '重试登录状态' })).toHaveCount(0);
   await expect(page.getByRole('link', { name: '登录' })).toBeVisible();
   await expect(page.getByRole('link', { name: '注册' })).toBeVisible();

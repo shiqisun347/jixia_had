@@ -5,7 +5,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from dataclasses import dataclass
+import re
+from dataclasses import dataclass, replace
 from datetime import timedelta
 from pathlib import Path
 from typing import BinaryIO, Protocol
@@ -14,10 +15,21 @@ from uuid import UUID
 from livekit import api, rtc
 
 from ..config import Settings
+from ..data_capture.provider import ProviderCallCapture
+from ..runtime_identity import CallbackEnvelope
 from .protocol import FunAsrConnection, FunAsrError, SegmentResult
 from .session import AsrQueueFull, AsrSpeechSession
 
 logger = logging.getLogger("jx-core.asr")
+
+_LIVEKIT_HUMAN_IDENTITY_RE = re.compile(
+    r"^jx-human-[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+    r"-(?P<user_id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})"
+    r"-(?P<epoch>[1-9][0-9]*)-[^-]+$"
+)
+_LEGACY_USER_IDENTITY_RE = re.compile(
+    r"^user-(?P<user_id>[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})(?:-|$)"
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,16 +39,18 @@ class PausedSpeech:
     audio_duration_ms: int
     last_segment_no: int
     first_interim_latency_ms: int | None
+    callback_envelope: CallbackEnvelope
 
 
 class AsrRuntimeCallbacks(Protocol):
     async def publish_asr_interim(
-        self, match_id: UUID, speech_id: UUID, segment_no: int, text: str
+        self, *, envelope: CallbackEnvelope, segment_no: int, text: str
     ) -> None: ...
 
     async def persist_asr_segment(
         self,
         *,
+        envelope: CallbackEnvelope,
         speech_id: UUID,
         segment_no: int,
         task_id: UUID,
@@ -47,18 +61,21 @@ class AsrRuntimeCallbacks(Protocol):
     ) -> None: ...
 
     async def start_asr_segment(
-        self, *, speech_id: UUID, segment_no: int, task_id: UUID
+        self, *, envelope: CallbackEnvelope, segment_no: int, task_id: UUID
     ) -> None: ...
 
     async def fail_asr_segment(
-        self, *, speech_id: UUID, segment_no: int, task_id: UUID, error_code: str
+        self, *, envelope: CallbackEnvelope, segment_no: int, task_id: UUID, error_code: str
+    ) -> None: ...
+
+    async def persist_asr_capture(
+        self, *, envelope: CallbackEnvelope, task_id: UUID, provider_capture: ProviderCallCapture
     ) -> None: ...
 
     async def finalize_asr_speech(
         self,
         *,
-        match_id: UUID,
-        speech_id: UUID,
+        envelope: CallbackEnvelope,
         final_text: str,
         first_interim_latency_ms: int | None,
         final_latency_ms: int,
@@ -67,7 +84,7 @@ class AsrRuntimeCallbacks(Protocol):
         audio_recording_error: str | None,
     ) -> object: ...
 
-    async def handle_asr_failure(self, match_id: UUID, speech_id: UUID, code: str) -> None: ...
+    async def handle_asr_failure(self, *, envelope: CallbackEnvelope, code: str) -> None: ...
 
 
 class MatchAudioReceiver:
@@ -94,6 +111,7 @@ class MatchAudioReceiver:
         self._recording_spool_path: Path | None = None
         self._recording_storage_path: Path | None = None
         self._recording_error: str | None = None
+        self._speech_envelope: CallbackEnvelope | None = None
         self._lock = asyncio.Lock()
 
     async def start(self) -> None:
@@ -169,7 +187,12 @@ class MatchAudioReceiver:
                 ):
                     on_track_subscribed(publication.track, publication, participant)
 
-    async def start_speech(self, speech_id: UUID, speaker_user_id: UUID) -> None:
+    async def start_speech(
+        self, speech_id: UUID, speaker_user_id: UUID, envelope: CallbackEnvelope
+    ) -> None:
+        envelope.require("speech_id", "connection_epoch")
+        if envelope.match_id != self.match_id or envelope.speech_id != speech_id:
+            raise FunAsrError("asr_callback_identity_mismatch")
         async with self._lock:
             if self._room is None or self._connection is None:
                 await self.start()
@@ -188,6 +211,7 @@ class MatchAudioReceiver:
                 on_segment=self._on_segment,
                 on_segment_started=self._on_segment_started,
                 on_segment_failed=self._on_segment_failed,
+                on_capture=self._on_capture,
                 start_segment_no=paused.last_segment_no if paused else 0,
                 initial_text=paused.final_text if paused else "",
                 initial_sample_count=(paused.audio_duration_ms * 16 if paused else 0),
@@ -197,21 +221,21 @@ class MatchAudioReceiver:
             )
             self._speech = session
             self._speaker_user_id = speaker_user_id
+            self._speech_envelope = (
+                replace(
+                    paused.callback_envelope,
+                    connection_epoch=envelope.connection_epoch,
+                    context_version=envelope.context_version,
+                )
+                if paused
+                else envelope
+            )
             if paused is None:
                 self._start_recording(speech_id, speaker_user_id)
             self._speech_task = asyncio.create_task(
                 self._run_speech(session), name=f"asr-speech-{speech_id}"
             )
-        try:
-            await session.wait_ready()
             self._paused_speech = None
-        except Exception:
-            task, self._speech_task = self._speech_task, None
-            self._speech = None
-            self._speaker_user_id = None
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-            raise FunAsrError("asr_start_timeout") from None
 
     async def finish_speech(self, speech_id: UUID) -> None:
         session = self._speech
@@ -226,6 +250,7 @@ class MatchAudioReceiver:
         self._speech = None
         self._speaker_user_id = None
         self._paused_speech = None
+        self._speech_envelope = None
         self._discard_recording()
         if task is not None:
             task.cancel()
@@ -263,12 +288,32 @@ class MatchAudioReceiver:
                     audio_duration_ms=result.audio_duration_ms,
                     last_segment_no=result.last_segment_no,
                     first_interim_latency_ms=result.first_interim_latency_ms,
+                    callback_envelope=self._speech_envelope
+                    or CallbackEnvelope(
+                        match_id=self.match_id,
+                        speech_id=session.speech_id,
+                        attempt_no=1,
+                        generation_id=None,
+                        connection_epoch=None,
+                        context_version=0,
+                        opportunity_id=None,
+                        opportunity_generation=None,
+                    ),
                 )
             else:
                 audio_storage_path = self._publish_recording()
                 await self._callbacks.finalize_asr_speech(
-                    match_id=self.match_id,
-                    speech_id=session.speech_id,
+                    envelope=self._speech_envelope
+                    or CallbackEnvelope(
+                        match_id=self.match_id,
+                        speech_id=session.speech_id,
+                        attempt_no=1,
+                        generation_id=None,
+                        connection_epoch=None,
+                        context_version=0,
+                        opportunity_id=None,
+                        opportunity_generation=None,
+                    ),
                     final_text=result.final_text,
                     first_interim_latency_ms=result.first_interim_latency_ms,
                     final_latency_ms=max(
@@ -281,10 +326,48 @@ class MatchAudioReceiver:
         except asyncio.CancelledError:
             raise
         except Exception as error:
-            if self._recording_storage_path is not None:
-                self._recording_storage_path.unlink(missing_ok=True)
-            code = error.code if isinstance(error, FunAsrError) else "asr_stream_failed"
-            await self._callbacks.handle_asr_failure(self.match_id, session.speech_id, code)
+            if self._pause_requested:
+                checkpoint = session.checkpoint()
+                self._paused_speech = PausedSpeech(
+                    speech_id=session.speech_id,
+                    final_text=checkpoint.final_text,
+                    audio_duration_ms=checkpoint.audio_duration_ms,
+                    last_segment_no=checkpoint.last_segment_no,
+                    first_interim_latency_ms=checkpoint.first_interim_latency_ms,
+                    callback_envelope=self._speech_envelope
+                    or CallbackEnvelope(
+                        match_id=self.match_id,
+                        speech_id=session.speech_id,
+                        attempt_no=1,
+                        generation_id=None,
+                        connection_epoch=None,
+                        context_version=0,
+                        opportunity_id=None,
+                        opportunity_generation=None,
+                    ),
+                )
+                logger.info(
+                    "asr pause retained checkpoint after provider close failure",
+                    extra={"match_id": str(self.match_id), "speech_id": str(session.speech_id)},
+                )
+            else:
+                if self._recording_storage_path is not None:
+                    self._recording_storage_path.unlink(missing_ok=True)
+                code = error.code if isinstance(error, FunAsrError) else "asr_stream_failed"
+                await self._callbacks.handle_asr_failure(
+                    envelope=self._speech_envelope
+                    or CallbackEnvelope(
+                        match_id=self.match_id,
+                        speech_id=session.speech_id,
+                        attempt_no=1,
+                        generation_id=None,
+                        connection_epoch=None,
+                        context_version=0,
+                        opportunity_id=None,
+                        opportunity_generation=None,
+                    ),
+                    code=code,
+                )
         finally:
             self._pause_requested = False
             if self._speech is session:
@@ -293,12 +376,32 @@ class MatchAudioReceiver:
                 self._speaker_user_id = None
 
     async def _on_interim(self, speech_id: UUID, segment_no: int, text: str) -> None:
-        await self._callbacks.publish_asr_interim(self.match_id, speech_id, segment_no, text)
+        envelope = self._speech_envelope
+        if envelope is None:
+            return
+        await self._callbacks.publish_asr_interim(
+            envelope=envelope, segment_no=segment_no, text=text
+        )
 
     async def _on_segment(
-        self, speech_id: UUID, segment_no: int, result: SegmentResult, pcm_sample_count: int
+        self,
+        speech_id: UUID,
+        segment_no: int,
+        result: SegmentResult,
+        pcm_sample_count: int,
     ) -> None:
         await self._callbacks.persist_asr_segment(
+            envelope=self._speech_envelope
+            or CallbackEnvelope(
+                match_id=self.match_id,
+                speech_id=speech_id,
+                attempt_no=1,
+                generation_id=None,
+                connection_epoch=None,
+                context_version=0,
+                opportunity_id=None,
+                opportunity_generation=None,
+            ),
             speech_id=speech_id,
             segment_no=segment_no,
             task_id=result.task_id,
@@ -308,10 +411,19 @@ class MatchAudioReceiver:
             pcm_sample_count=pcm_sample_count,
         )
 
+    async def _on_capture(self, task_id: UUID, capture: ProviderCallCapture) -> None:
+        callback = getattr(self._callbacks, "persist_asr_capture", None)
+        if callback is not None:
+            envelope = self._speech_envelope
+            if envelope is not None:
+                await callback(envelope=envelope, task_id=task_id, provider_capture=capture)
+
     async def _on_segment_started(self, speech_id: UUID, segment_no: int, task_id: UUID) -> None:
         callback = getattr(self._callbacks, "start_asr_segment", None)
         if callback is not None:
-            await callback(speech_id=speech_id, segment_no=segment_no, task_id=task_id)
+            envelope = self._speech_envelope
+            if envelope is not None:
+                await callback(envelope=envelope, segment_no=segment_no, task_id=task_id)
 
     async def _on_segment_failed(
         self,
@@ -322,8 +434,11 @@ class MatchAudioReceiver:
     ) -> None:
         callback = getattr(self._callbacks, "fail_asr_segment", None)
         if callback is not None:
+            envelope = self._speech_envelope
+            if envelope is None:
+                return
             await callback(
-                speech_id=speech_id,
+                envelope=envelope,
                 segment_no=segment_no,
                 task_id=task_id,
                 error_code=error_code,
@@ -363,9 +478,11 @@ class MatchAudioReceiver:
                     self._write_recording(pcm)
                     session.feed_pcm(pcm)
                 except AsrQueueFull:
-                    await self._callbacks.handle_asr_failure(
-                        self.match_id, session.speech_id, "asr_pcm_queue_full"
-                    )
+                    envelope = self._speech_envelope
+                    if envelope is not None:
+                        await self._callbacks.handle_asr_failure(
+                            envelope=envelope, code="asr_pcm_queue_full"
+                        )
                     return
         finally:
             logger.info(
@@ -451,10 +568,13 @@ class MatchAudioReceiver:
 
 
 def _user_id_from_identity(identity: str) -> UUID | None:
-    if not identity.startswith("user-") or len(identity) < 41:
+    match = _LIVEKIT_HUMAN_IDENTITY_RE.fullmatch(identity) or _LEGACY_USER_IDENTITY_RE.match(
+        identity
+    )
+    if match is None:
         return None
     try:
-        return UUID(identity[5:41])
+        return UUID(match.group("user_id"))
     except ValueError:
         return None
 
@@ -482,10 +602,16 @@ class AsrRuntime:
             await receiver.close()
             raise
 
-    async def start_speech(self, match_id: UUID, speech_id: UUID, user_id: UUID) -> None:
+    async def start_speech(
+        self,
+        match_id: UUID,
+        speech_id: UUID,
+        user_id: UUID,
+        envelope: CallbackEnvelope,
+    ) -> None:
         await self.ensure_match(match_id)
         receiver = self._receivers[match_id]
-        await receiver.start_speech(speech_id, user_id)
+        await receiver.start_speech(speech_id, user_id, envelope)
 
     async def finish_speech(self, match_id: UUID, speech_id: UUID) -> None:
         receiver = self._receivers.get(match_id)

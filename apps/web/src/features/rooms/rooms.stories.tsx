@@ -149,6 +149,25 @@ const mixed4v4Room = {
   ),
 };
 
+const formalExperimentRoom = {
+  ...mixed4v4Room,
+  title: '论文实验正式场',
+  experiment_mode: true,
+  scheduled_match_kind: 'FORMAL',
+  viewer_is_experiment_controller: true,
+};
+
+const trainingExperimentRoom = {
+  ...formalExperimentRoom,
+  title: '论文实验训练房间',
+  organizer_user_id: '10000000-0000-4000-8000-000000000099',
+  experiment_mode: true,
+  scheduled_match_kind: 'TRAINING',
+  viewer_is_experiment_controller: false,
+  viewer_member_role: 'DEBATER',
+  members: room.members,
+};
+
 const authenticated = http.get('*/api/auth/me', () => HttpResponse.json({ user }));
 const userAvatar = http.get('*/api/users/:userId/avatar', ({ request }) =>
   HttpResponse.redirect(new URL('/assets/avatars/human-01.webp', request.url).toString(), 302),
@@ -315,6 +334,54 @@ export const Mixed4v4Preparation: Story = {
     await expect(await canvas.findByRole('button', { name: /开始设备检测/ })).toBeVisible();
     await expect(canvas.getByRole('button', { name: '开始比赛' })).toBeDisabled();
     await expect(canvas.getByText('林知行尚未完成设备检测与准备')).toBeVisible();
+  },
+};
+
+export const FormalExperimentPreparation: Story = {
+  render: () => <RoomPage roomId={roomId} />,
+  parameters: {
+    toastPath: '/rooms/story',
+    msw: {
+      handlers: [
+        authenticated,
+        terms,
+        userAvatar,
+        noSeatSwapRequests,
+        http.get('*/api/rooms/:roomId/snapshot', () => HttpResponse.json(formalExperimentRoom)),
+      ],
+    },
+  },
+  async play({ canvasElement }) {
+    const canvas = within(canvasElement);
+    await expect(await canvas.findByText('论文实验 · 固定席位')).toBeVisible();
+    await expect(canvas.queryByRole('button', { name: '切换为观众' })).not.toBeInTheDocument();
+    await expect(canvas.queryByRole('button', { name: '退出房间' })).not.toBeInTheDocument();
+  },
+};
+
+export const TrainingExperimentPreparation: Story = {
+  render: () => <RoomPage roomId={roomId} />,
+  parameters: {
+    toastPath: '/rooms/story',
+    msw: {
+      handlers: [
+        authenticated,
+        terms,
+        userAvatar,
+        noSeatSwapRequests,
+        http.get('*/api/rooms/:roomId/snapshot', () => HttpResponse.json(trainingExperimentRoom)),
+      ],
+    },
+  },
+  async play({ canvasElement }) {
+    const canvas = within(canvasElement);
+    await expect(await canvas.findByText('论文实验 · 训练房间')).toBeVisible();
+    await expect(await canvas.findByRole('button', { name: '切换为观众' })).toBeVisible();
+    await expect(await canvas.findByRole('button', { name: '退出房间' })).toBeVisible();
+    await userEvent.click(await canvas.findByRole('button', { name: '邀请加入' }));
+    await expect(
+      await canvas.findByText('房间公开可见，打开链接后由对方选择加入身份。'),
+    ).toBeVisible();
   },
 };
 

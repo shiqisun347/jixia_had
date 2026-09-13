@@ -7,12 +7,14 @@ from pathlib import Path
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.sql.elements import ColumnElement
 
+from .audit.service import AuditService
 from .auth.dependencies import get_admin_auth, get_database_session, require_browser_origin
 from .auth.errors import APIError
 from .auth.session import AuthContext
@@ -20,6 +22,7 @@ from .data_capture.content import load_content_blob
 from .models import (
     AuditLog,
     BackgroundTask,
+    ExperimentMatchAttempt,
     ExternalCall,
     Match,
     MatchEvent,
@@ -28,6 +31,8 @@ from .models import (
     MatchFile,
     MatchParticipant,
     Room,
+    RoomConnectionLease,
+    ScheduledMatch,
     Seat,
     Speech,
     User,
@@ -116,6 +121,21 @@ def _call_view(item: ExternalCall) -> dict[str, Any]:
         "status": item.status,
         "status_label": CALL_STATUS_LABELS.get(item.status, item.status),
         "match_id": str(item.match_id) if item.match_id else None,
+        "capture_version": item.capture_version,
+        "captured_at": item.captured_at,
+        "source_kind": item.source_kind,
+        "source_resource_id": item.source_resource_id,
+        "logical_call_id": str(item.logical_call_id) if item.logical_call_id else None,
+        "provider_request_id": item.provider_request_id,
+        "request_capture_status": item.request_capture_status,
+        "response_capture_status": item.response_capture_status,
+        "request_original_bytes": item.request_original_bytes,
+        "response_original_bytes": item.response_original_bytes,
+        "request_stored_bytes": item.request_stored_bytes,
+        "response_stored_bytes": item.response_stored_bytes,
+        "request_sha256": item.request_sha256,
+        "response_sha256": item.response_sha256,
+        "capture_error_code": item.capture_error_code,
         "speech_id": str(item.speech_id) if item.speech_id else None,
         "generation_id": str(item.agent_generation_id or item.generation_id)
         if item.agent_generation_id or item.generation_id
@@ -189,11 +209,33 @@ async def workbench_overview(
             await session.scalar(select(func.count()).select_from(model).where(column == match_id))
             or 0
         )
+    counts["active_tasks"] = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(BackgroundTask)
+            .where(
+                BackgroundTask.status.in_(("PENDING", "RUNNING")),
+                func.jsonb_extract_path_text(BackgroundTask.payload, "match_id") == str(match_id),
+            )
+        )
+        or 0
+    )
+    counts["connection_leases"] = int(
+        await session.scalar(
+            select(func.count())
+            .select_from(RoomConnectionLease)
+            .where(RoomConnectionLease.room_id == match.room_id)
+        )
+        or 0
+    )
     return {
         "match": {
             "id": str(match.id),
             "room_id": str(match.room_id),
             "status": match.status,
+            "action_state": str(match.runtime_snapshot.get("action_state", "")),
+            "error_code": match.runtime_snapshot.get("error_code"),
+            "current_speech_id": match.runtime_snapshot.get("current_speech_id"),
             "sequence": match.sequence,
             "context_version": match.context_version,
             "created_at": match.created_at,
@@ -368,10 +410,91 @@ async def workbench_calls(
     return _paged([_call_view(item) for item in rows], page, page_size, total)
 
 
+@router.get("/external-calls")
+async def list_external_calls(
+    _: Annotated[AuthContext, Depends(get_admin_auth)],
+    session: Annotated[AsyncSession, Depends(get_database_session)],
+    page: int = Query(1),
+    page_size: int = Query(50),
+    call_kind: str = Query(""),
+    source_kind: str = Query(""),
+    status: str = Query(""),
+    provider: str = Query(""),
+    operation: str = Query(""),
+    model: str = Query(""),
+    voice: str = Query(""),
+    match_id: UUID | None = None,
+    rule_id: UUID | None = None,
+    batch_id: UUID | None = None,
+    logical_call_id: UUID | None = None,
+    provider_request_id: str = Query("", max_length=256),
+    since: datetime | None = None,
+    until: datetime | None = None,
+    sort: str = Query("started_at"),
+    order: str = Query("desc"),
+) -> dict[str, Any]:
+    page, page_size = _page(page, page_size)
+    filters: list[ColumnElement[bool]] = [ExternalCall.capture_version.is_not(None)]
+    if call_kind:
+        filters.append(ExternalCall.call_kind == call_kind.upper())
+    if source_kind:
+        filters.append(ExternalCall.source_kind == source_kind.upper())
+    if status:
+        filters.append(ExternalCall.status == status.upper())
+    if provider:
+        filters.append(ExternalCall.provider == provider)
+    if operation:
+        filters.append(ExternalCall.operation == operation)
+    if model:
+        filters.append(ExternalCall.model == model)
+    if voice:
+        filters.append(ExternalCall.voice == voice)
+    if match_id is not None:
+        filters.append(ExternalCall.match_id == match_id)
+    if rule_id is not None:
+        filters.append(Room.rule_id == rule_id)
+    if batch_id is not None:
+        filters.append(ScheduledMatch.batch_id == batch_id)
+    if logical_call_id is not None:
+        filters.append(ExternalCall.logical_call_id == logical_call_id)
+    if provider_request_id:
+        filters.append(ExternalCall.provider_request_id == provider_request_id)
+    if since is not None:
+        filters.append(ExternalCall.started_at >= since)
+    if until is not None:
+        filters.append(ExternalCall.started_at <= until)
+    sort_columns = {
+        "started_at": ExternalCall.started_at,
+        "completed_latency_ms": ExternalCall.completed_latency_ms,
+    }
+    if sort not in sort_columns or order not in {"asc", "desc"}:
+        raise APIError("admin_query_invalid")
+    base = (
+        select(ExternalCall)
+        .outerjoin(Match, Match.id == ExternalCall.match_id)
+        .outerjoin(Room, Room.id == Match.room_id)
+        .outerjoin(ExperimentMatchAttempt, ExperimentMatchAttempt.match_id == Match.id)
+        .outerjoin(ScheduledMatch, ScheduledMatch.id == ExperimentMatchAttempt.scheduled_match_id)
+        .where(*filters)
+    )
+    total = int(await session.scalar(select(func.count()).select_from(base.subquery())) or 0)
+    ordered = sort_columns[sort].asc() if order == "asc" else sort_columns[sort].desc()
+    rows = list(
+        (
+            await session.scalars(
+                base.order_by(ordered, ExternalCall.id.desc())
+                .offset((page - 1) * page_size)
+                .limit(page_size)
+            )
+        ).all()
+    )
+    return _paged([_call_view(item) for item in rows], page, page_size, total)
+
+
 @router.get("/external-calls/{call_id}")
 async def external_call_detail(
     call_id: UUID,
-    _: Annotated[AuthContext, Depends(get_admin_auth)],
+    auth: Annotated[AuthContext, Depends(get_admin_auth)],
     session: Annotated[AsyncSession, Depends(get_database_session)],
 ) -> dict[str, Any]:
     call = await session.get(ExternalCall, call_id)
@@ -412,6 +535,15 @@ async def external_call_detail(
             },
         }
     )
+    AuditService().record(
+        session,
+        actor_user_id=auth.user_id,
+        action="admin.external_call.viewed",
+        target_type="external_call",
+        target_id=str(call.id),
+        details={"capture_version": call.capture_version},
+    )
+    await session.commit()
     return detail
 
 
@@ -456,11 +588,14 @@ async def workbench_timeline(
     )
     items: list[dict[str, Any]] = [
         {
-            "id": f"event:{item.id}", "type": "EVENT", "type_label": "比赛事件",
+            "id": f"event:{item.id}",
+            "type": "EVENT",
+            "type_label": "比赛事件",
             "at": _timeline_at(item.created_at),
             "sequence": item.sequence,
             "title": item.event_type,
-            "description": "比赛状态或队列发生了权威变化。", "status": "RECORDED",
+            "description": "比赛状态或队列发生了权威变化。",
+            "status": "RECORDED",
             "related_id": str(item.id),
         }
         for item in events
@@ -468,11 +603,15 @@ async def workbench_timeline(
     items.extend(_timeline_call_view(item) for item in calls)
     items.extend(
         {
-            "id": f"speech:{item.id}", "type": "SPEECH", "type_label": "正式发言",
-            "at": _timeline_at(item.created_at), "sequence": None,
+            "id": f"speech:{item.id}",
+            "type": "SPEECH",
+            "type_label": "正式发言",
+            "at": _timeline_at(item.created_at),
+            "sequence": None,
             "title": f"{'正方' if item.side == 'AFFIRMATIVE' else '反方'}{item.seat_no}辩发言",
             "description": "文字记录中的一条发言，可继续查看关联调用。",
-            "status": item.status, "related_id": str(item.id),
+            "status": item.status,
+            "related_id": str(item.id),
         }
         for item in speeches
     )

@@ -6,14 +6,14 @@ import asyncio
 import os
 import shutil
 from contextlib import suppress
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Literal, NoReturn, cast
 from uuid import UUID, uuid4
 
 from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 from sqlalchemy import String, case, delete, func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
@@ -26,6 +26,9 @@ from .auth.dependencies import get_admin_auth, get_database_session, require_bro
 from .auth.session import AuthContext
 from .config import Settings
 from .data_capture.content import load_content_blob
+from .data_capture.diagnostics import DiagnosticWriter
+from .data_capture.provider import PROVIDER_CAPTURE_VERSION, ProviderCallCapture
+from .data_capture.provider_persistence import persist_provider_capture
 from .matches.domain import MatchCommand, MatchDomainError
 from .matches.service import MatchRuntimeManager
 from .models import (
@@ -36,19 +39,32 @@ from .models import (
     BackgroundTask,
     CallContentBlob,
     DeviceCheck,
+    ExperimentMatchAttempt,
+    ExperimentResultOverride,
+    ExpertAnnotationAnswer,
     ExternalCall,
+    FreeDebateOpportunity,
+    HumanHandEvent,
     JudgeProfile,
     JudgeResult,
     LeaderboardSnapshot,
     Match,
     MatchFile,
     MatchParticipant,
+    MatchQuestionnaire,
     ModelProfile,
+    ParticipantAnnotationAnswer,
+    ParticipantAnnotationItem,
+    ParticipantAnnotationTask,
+    PostmatchSurveyTask,
     Room,
     RoomMember,
     Rule,
+    ScheduledMatch,
     Seat,
+    SpeakerAllocation,
     Speech,
+    SystemSetting,
     Topic,
     TranscriptSubmission,
     User,
@@ -66,6 +82,10 @@ class UserPatch(BaseModel):
     real_name: str | None = Field(default=None, min_length=2, max_length=30)
     role: str | None = None
     status: str | None = None
+
+
+class MatchControlRequest(BaseModel):
+    action: Literal["terminate", "resume", "recover", "reset_speech"]
 
 
 class AgentGenerationView(BaseModel):
@@ -99,6 +119,7 @@ class AgentFreeDebateDecisionView(BaseModel):
     seat_no: int
     status: str
     should_speak: bool | None
+    decision_reason: str | None
     willingness: float | None
     attempt_no: int
     duration_ms: int | None
@@ -161,6 +182,46 @@ class MatchMetadataPatch(BaseModel):
     label: str = Field(min_length=1, max_length=32)
     display_topic: str = Field(min_length=1, max_length=500)
     admin_note: str = Field(default="", max_length=2000)
+
+
+class SystemSettingsPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    log_retention_days: int = Field(default=30, ge=1, le=3650)
+    debug_enabled: bool = False
+    debug_expires_at: datetime | None = None
+    max_upload_bytes: int = Field(default=2 * 1024 * 1024, ge=256 * 1024, le=50 * 1024 * 1024)
+
+    @model_validator(mode="after")
+    def validate_debug_window(self) -> SystemSettingsPatch:
+        if self.debug_enabled and self.debug_expires_at is None:
+            raise ValueError("debug expiry is required when DEBUG is enabled")
+        if not self.debug_enabled and self.debug_expires_at is not None:
+            raise ValueError("debug expiry must be empty when DEBUG is disabled")
+        if self.debug_expires_at is not None:
+            if self.debug_expires_at.tzinfo is None:
+                raise ValueError("debug expiry must include a timezone")
+            now = datetime.now(UTC)
+            if not now < self.debug_expires_at <= now + timedelta(hours=24):
+                raise ValueError("debug expiry must be within the next 24 hours")
+        return self
+
+    @classmethod
+    def defaults(cls) -> SystemSettingsPatch:
+        return cls()
+
+    @classmethod
+    def from_rows(cls, rows: list[SystemSetting]) -> SystemSettingsPatch:
+        values = cls.defaults().model_dump()
+        for row in rows:
+            if row.key in values and "value" in row.value:
+                values[row.key] = row.value["value"]
+        expiry = values.get("debug_expires_at")
+        if isinstance(expiry, str):
+            expiry = datetime.fromisoformat(expiry.replace("Z", "+00:00"))
+        if isinstance(expiry, datetime) and expiry <= datetime.now(UTC):
+            values["debug_enabled"] = False
+            values["debug_expires_at"] = None
+        return cls.model_validate(values)
 
 
 PAGE_SIZES = {10, 25, 50, 100}
@@ -490,6 +551,8 @@ async def list_matches(
     status: str = Query(default=""),
     sort: str = Query(default="created_at"),
     order: str = Query(default="desc"),
+    format_version_id: UUID | None = None,
+    batch_id: UUID | None = None,
 ) -> dict[str, Any]:
     page, page_size = _page_args(page, page_size)
     statuses = {
@@ -500,6 +563,7 @@ async def list_matches(
         "START_PENDING_RUNTIME",
         "START_COUNTDOWN",
         "SYSTEM_RECOVERY",
+        "ERROR",
     }
     if status and status not in statuses:
         _api_error("admin_query_invalid")
@@ -529,11 +593,20 @@ async def list_matches(
         )
     if status:
         filters.append(Match.status == status)
+    if format_version_id is not None:
+        filters.append(Room.format_version_id == format_version_id)
+    if batch_id is not None:
+        filters.append(ScheduledMatch.batch_id == batch_id)
     total = int(
         await session.scalar(
             select(func.count())
             .select_from(Match)
             .join(Room, Room.id == Match.room_id)
+            .outerjoin(ExperimentMatchAttempt, ExperimentMatchAttempt.match_id == Match.id)
+            .outerjoin(
+                ScheduledMatch,
+                ScheduledMatch.id == ExperimentMatchAttempt.scheduled_match_id,
+            )
             .where(*filters)
         )
         or 0
@@ -546,8 +619,14 @@ async def list_matches(
                 Room,
                 func.coalesce(file_counts.c.file_count, 0),
                 func.coalesce(file_counts.c.permanent_count, 0),
+                ScheduledMatch,
             )
             .join(Room, Room.id == Match.room_id)
+            .outerjoin(ExperimentMatchAttempt, ExperimentMatchAttempt.match_id == Match.id)
+            .outerjoin(
+                ScheduledMatch,
+                ScheduledMatch.id == ExperimentMatchAttempt.scheduled_match_id,
+            )
             .outerjoin(file_counts, file_counts.c.match_id == Match.id)
             .where(*filters)
             .order_by(ordered, Match.id)
@@ -569,10 +648,62 @@ async def list_matches(
             "label": room.label,
             "display_topic": str(room.topic_snapshot.get("title", "")),
             "admin_note": match.admin_note,
+            "format_version_id": str(room.format_version_id) if room.format_version_id else None,
+            "batch_id": str(scheduled_match.batch_id) if scheduled_match else None,
+            "scheduled_match_id": str(scheduled_match.id) if scheduled_match else None,
         }
-        for match, room, file_count, permanent_count in rows
+        for match, room, file_count, permanent_count, scheduled_match in rows
     ]
     return _page_result(items, page=page, page_size=page_size, total=total)
+
+
+@router.get("/matches/ids")
+async def list_match_ids(
+    _: Annotated[AuthContext, Depends(get_admin_auth)],
+    session: Annotated[AsyncSession, Depends(get_database_session)],
+    q: str = Query(default=""),
+    status: str = Query(default=""),
+    format_version_id: UUID | None = None,
+    batch_id: UUID | None = None,
+    limit: int = Query(default=5000, ge=1, le=10000),
+) -> dict[str, Any]:
+    statuses = {
+        "RUNNING", "PAUSED", "FINISHED", "TERMINATED", "START_PENDING_RUNTIME",
+        "START_COUNTDOWN", "SYSTEM_RECOVERY", "ERROR",
+    }
+    if status and status not in statuses:
+        _api_error("admin_query_invalid")
+    filters: list[ColumnElement[bool]] = []
+    needle = q.strip()
+    if needle:
+        filters.append(
+            (Room.label.ilike(f"%{needle}%"))
+            | (func.coalesce(Room.topic_snapshot["title"].astext, "").ilike(f"%{needle}%"))
+            | (Match.id.cast(String).ilike(f"%{needle}%"))
+        )
+    if status:
+        filters.append(Match.status == status)
+    if format_version_id is not None:
+        filters.append(Room.format_version_id == format_version_id)
+    if batch_id is not None:
+        filters.append(ScheduledMatch.batch_id == batch_id)
+    ids = list(
+        (
+            await session.scalars(
+                select(Match.id)
+                .join(Room, Room.id == Match.room_id)
+                .outerjoin(ExperimentMatchAttempt, ExperimentMatchAttempt.match_id == Match.id)
+                .outerjoin(
+                    ScheduledMatch,
+                    ScheduledMatch.id == ExperimentMatchAttempt.scheduled_match_id,
+                )
+                .where(*filters)
+                .order_by(Match.created_at.desc(), Match.id)
+                .limit(limit)
+            )
+        ).all()
+    )
+    return {"ids": [str(item) for item in ids], "total": len(ids), "truncated": len(ids) == limit}
 
 
 @router.get(
@@ -634,6 +765,7 @@ async def list_match_free_debate_decisions(
             seat_no=decision.seat_no,
             status=decision.status,
             should_speak=decision.should_speak,
+            decision_reason=decision.decision_reason,
             willingness=decision.willingness,
             attempt_no=decision.attempt_no,
             duration_ms=decision.duration_ms,
@@ -750,6 +882,7 @@ async def terminate_match(
         _api_error("match_runtime_unavailable")
     try:
         state = await manager.snapshot(session, match_id)
+        await manager.ensure_actor(session, match_id)
         result = await manager.submit(
             match_id,
             MatchCommand(
@@ -761,6 +894,7 @@ async def terminate_match(
         )
     except MatchDomainError as error:
         _api_error(error.code)
+    await session.rollback()
     async with session.begin():
         AuditService().record(
             session,
@@ -771,6 +905,63 @@ async def terminate_match(
             details={"previous_sequence": state.sequence},
         )
     return {"status": result.state.status, "sequence": result.state.sequence}
+
+
+@router.post(
+    "/matches/{match_id}/control",
+    dependencies=[Depends(require_browser_origin)],
+)
+async def control_match(
+    match_id: UUID,
+    payload: MatchControlRequest,
+    request: Request,
+    context: Annotated[AuthContext, Depends(get_admin_auth)],
+    session: Annotated[AsyncSession, Depends(get_database_session)],
+) -> dict[str, Any]:
+    """Perform an explicit operator recovery action through the MatchActor."""
+    manager = cast(MatchRuntimeManager | None, request.app.state.match_runtime_manager)
+    if manager is None:
+        _api_error("match_runtime_unavailable")
+    match = await session.get(Match, match_id)
+    if match is None:
+        _api_error("match_not_found")
+    if payload.action == "terminate" and match.status in {"FINISHED", "TERMINATED"}:
+        _api_error("match_not_running")
+    await session.commit()
+    try:
+        actor = await manager.ensure_actor(session, match_id)
+        previous_sequence = actor.state.sequence
+        result = await manager.submit(
+            match_id,
+            MatchCommand(
+                type={
+                    "terminate": "match.terminate",
+                    "resume": "match.resume",
+                    "recover": "system.recover",
+                    "reset_speech": "speech.reset",
+                }[payload.action],
+                message_id=f"admin-control:{payload.action}:{match_id}:{uuid4().hex}",
+                actor_user_id=context.user_id,
+                payload={"privileged": True, "authorized": True, "preserve_failed": False},
+            ),
+        )
+    except MatchDomainError as error:
+        _api_error(error.code)
+    await session.rollback()
+    async with session.begin():
+        AuditService().record(
+            session,
+            actor_user_id=context.user_id,
+            action=f"admin.match.{payload.action}",
+            target_type="match",
+            target_id=str(match_id),
+            details={"previous_sequence": previous_sequence},
+        )
+    return {
+        "status": result.state.status,
+        "action_state": result.state.action_state,
+        "sequence": result.state.sequence,
+    }
 
 
 @router.post(
@@ -979,8 +1170,6 @@ async def delete_match(
     match = await session.get(Match, match_id)
     if match is None:
         _api_error("match_not_found")
-    if match.status not in {"FINISHED", "TERMINATED"}:
-        _api_error("match_delete_forbidden")
     room_id = match.room_id
     files = list(
         (
@@ -1038,9 +1227,22 @@ async def delete_match(
     if manager is None:
         _api_error("match_runtime_unavailable")
     try:
+        runtime_state = await manager.snapshot(session, match_id)
+        if runtime_state.status not in {"FINISHED", "TERMINATED"}:
+            await manager.ensure_actor(session, match_id)
+            await manager.submit(
+                match_id,
+                MatchCommand(
+                    type="match.terminate",
+                    message_id=f"admin-delete-terminate:{match_id}:{uuid4().hex}",
+                    actor_user_id=context.user_id,
+                    payload={"privileged": True, "authorized": True},
+                ),
+            )
         await manager.remove_terminal(match_id)
     except MatchDomainError as error:
         _api_error(error.code)
+    await session.rollback()
 
     staged = _stage_file_deletions(
         storage_paths,
@@ -1052,10 +1254,91 @@ async def delete_match(
     )
     try:
         async with session.begin():
+            await session.execute(
+                delete(PostmatchSurveyTask).where(PostmatchSurveyTask.match_id == match_id)
+            )
+            attempts = list(
+                (
+                    await session.scalars(
+                        select(ExperimentMatchAttempt).where(
+                            ExperimentMatchAttempt.match_id == match_id
+                        )
+                    )
+                ).all()
+            )
+            if attempts:
+                attempt_ids = [item.id for item in attempts]
+                opportunity_ids = list(
+                    (
+                        await session.scalars(
+                            select(FreeDebateOpportunity.id).where(
+                                FreeDebateOpportunity.experiment_attempt_id.in_(attempt_ids)
+                            )
+                        )
+                    ).all()
+                )
+                task_ids = list(
+                    (
+                        await session.scalars(
+                            select(ParticipantAnnotationTask.id).where(
+                                ParticipantAnnotationTask.experiment_attempt_id.in_(attempt_ids)
+                            )
+                        )
+                    ).all()
+                )
+                if task_ids:
+                    await session.execute(
+                        delete(MatchQuestionnaire).where(MatchQuestionnaire.task_id.in_(task_ids))
+                    )
+                    await session.execute(
+                        delete(ParticipantAnnotationAnswer).where(
+                            ParticipantAnnotationAnswer.task_id.in_(task_ids)
+                        )
+                    )
+                    await session.execute(
+                        delete(ParticipantAnnotationItem).where(
+                            ParticipantAnnotationItem.task_id.in_(task_ids)
+                        )
+                    )
+                    await session.execute(
+                        delete(ParticipantAnnotationTask).where(
+                            ParticipantAnnotationTask.id.in_(task_ids)
+                        )
+                    )
+                if opportunity_ids:
+                    await session.execute(
+                        delete(ExpertAnnotationAnswer).where(
+                            ExpertAnnotationAnswer.opportunity_id.in_(opportunity_ids)
+                        )
+                    )
+                    await session.execute(
+                        delete(SpeakerAllocation).where(
+                            SpeakerAllocation.opportunity_id.in_(opportunity_ids)
+                        )
+                    )
+                    await session.execute(
+                        delete(HumanHandEvent).where(
+                            HumanHandEvent.opportunity_id.in_(opportunity_ids)
+                        )
+                    )
+                await session.execute(
+                    delete(ExperimentResultOverride).where(
+                        ExperimentResultOverride.experiment_attempt_id.in_(attempt_ids)
+                    )
+                )
+                await session.execute(
+                    delete(FreeDebateOpportunity).where(
+                        FreeDebateOpportunity.experiment_attempt_id.in_(attempt_ids)
+                    )
+                )
+                for attempt in attempts:
+                    attempt.match_id = None
+                    attempt.room_id = None
+                    attempt.status = "INCOMPLETE"
             locked_match = await session.get(Match, match_id, with_for_update=True)
             if locked_match is None:
                 _api_error("match_not_found")
-            if locked_match.status not in {"FINISHED", "TERMINATED"}:
+            if locked_match.status not in {"FINISHED", "TERMINATED", "ERROR"}:
                 _api_error("match_delete_forbidden")
             await session.execute(
                 delete(BackgroundTask).where(
@@ -1173,12 +1456,40 @@ async def list_logs(
             "target_type": log.target_type,
             "target_id": log.target_id,
             "result": log.result,
-            "details": log.details,
             "created_at": log.created_at,
         }
         for log in logs
     ]
     return _page_result(items, page=page, page_size=page_size, total=total)
+
+
+@router.get("/audit-logs/{log_id}")
+async def get_audit_log_detail(
+    log_id: UUID,
+    context: Annotated[AuthContext, Depends(get_admin_auth)],
+    session: Annotated[AsyncSession, Depends(get_database_session)],
+) -> dict[str, Any]:
+    log = await session.get(AuditLog, log_id)
+    if log is None:
+        _api_error("admin_not_found")
+    AuditService().record(
+        session,
+        actor_user_id=context.user_id,
+        action="admin.audit_log.detail_viewed",
+        target_type="audit_log",
+        target_id=str(log.id),
+    )
+    await session.commit()
+    return {
+        "id": str(log.id),
+        "action": log.action,
+        "target_type": log.target_type,
+        "target_id": log.target_id,
+        "result": log.result,
+        "request_id": log.request_id,
+        "details": log.details,
+        "created_at": log.created_at,
+    }
 
 
 @router.get("/storage")
@@ -1207,6 +1518,56 @@ async def get_storage_status(
         else None,
         "automatic_backup": False,
     }
+
+
+@router.get("/settings", response_model=SystemSettingsPatch)
+async def get_system_settings(
+    _: Annotated[AuthContext, Depends(get_admin_auth)],
+    session: Annotated[AsyncSession, Depends(get_database_session)],
+) -> SystemSettingsPatch:
+    rows = list((await session.scalars(select(SystemSetting))).all())
+    return SystemSettingsPatch.from_rows(rows)
+
+
+@router.patch(
+    "/settings",
+    response_model=SystemSettingsPatch,
+    dependencies=[Depends(require_browser_origin)],
+)
+async def update_system_settings(
+    request: Request,
+    payload: SystemSettingsPatch,
+    context: Annotated[AuthContext, Depends(get_admin_auth)],
+    session: Annotated[AsyncSession, Depends(get_database_session)],
+) -> SystemSettingsPatch:
+    values = payload.model_dump(mode="json")
+    async with session.begin():
+        for key, value in values.items():
+            row = await session.get(SystemSetting, key, with_for_update=True)
+            if row is None:
+                row = SystemSetting(
+                    key=key,
+                    value={"value": value},
+                    updated_by_user_id=context.user_id,
+                )
+                session.add(row)
+            else:
+                row.value = {"value": value}
+                row.updated_by_user_id = context.user_id
+        AuditService().record(
+            session,
+            actor_user_id=context.user_id,
+            action="admin.system_settings.updated",
+            target_type="system_settings",
+            target_id="global",
+            details={"keys": sorted(values)},
+        )
+    diagnostic_writer = cast(DiagnosticWriter | None, request.app.state.diagnostic_writer)
+    if diagnostic_writer is not None:
+        diagnostic_writer.configure_debug(
+            payload.debug_expires_at if payload.debug_enabled else None
+        )
+    return payload
 
 
 @router.patch(
@@ -1328,6 +1689,26 @@ async def test_model_connection(
         model.api_key_nonce,
         settings.llm_key_encryption_key.get_secret_value(),
     )
+    call_id = uuid4()
+    logical_call_id = uuid4()
+    capture = ProviderCallCapture()
+    session.add(
+        ExternalCall(
+            id=call_id,
+            call_kind="LLM_SPEECH",
+            provider="OPENAI_COMPATIBLE",
+            operation="chat.completions.stream",
+            model=model.model_id,
+            attempt_no=1,
+            status="STARTED",
+            capture_version=PROVIDER_CAPTURE_VERSION,
+            captured_at=datetime.now(UTC),
+            source_kind="CONFIG_TEST",
+            source_resource_id=str(model_id),
+            logical_call_id=logical_call_id,
+            started_at=datetime.now(UTC),
+        )
+    )
     await session.commit()
     client = OpenAIStreamingClient(
         base_url=model.base_url,
@@ -1340,9 +1721,16 @@ async def test_model_connection(
             max_tokens=16,
             generation_params={"temperature": 0},
             on_delta=_ignore_delta,
+            capture=capture,
         )
     except LlmProviderError as error:
         async with session.begin():
+            call = await session.get(ExternalCall, call_id, with_for_update=True)
+            if call is not None:
+                await persist_provider_capture(session, call, capture)
+                call.status = "FAILED"
+                call.error_code = error.code
+                call.completed_at = datetime.now(UTC)
             AuditService().record(
                 session,
                 actor_user_id=context.user_id,
@@ -1356,6 +1744,17 @@ async def test_model_connection(
     finally:
         await client.close()
     async with session.begin():
+        call = await session.get(ExternalCall, call_id, with_for_update=True)
+        if call is not None:
+            await persist_provider_capture(session, call, capture)
+            call.status = "SUCCEEDED"
+            call.first_result_latency_ms = result.first_token_latency_ms
+            call.completed_latency_ms = result.completed_latency_ms
+            call.completion_tokens = result.completion_tokens
+            call.first_result_at = call.started_at + timedelta(
+                milliseconds=result.first_token_latency_ms
+            )
+            call.completed_at = datetime.now(UTC)
         AuditService().record(
             session,
             actor_user_id=context.user_id,
@@ -1418,7 +1817,29 @@ async def regenerate_voice_preview(
     path = _preview_path(settings, voice_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     last_error = "voice_preview_failed"
+    logical_call_id = uuid4()
     for attempt in (1, 2):
+        call_id = uuid4()
+        capture = ProviderCallCapture()
+        session.add(
+            ExternalCall(
+                id=call_id,
+                call_kind="TTS",
+                provider="BAILIAN",
+                operation="duplex.server_commit",
+                model=settings.tts_model,
+                voice=voice.provider_voice,
+                attempt_no=attempt,
+                status="STARTED",
+                capture_version=PROVIDER_CAPTURE_VERSION,
+                captured_at=datetime.now(UTC),
+                source_kind="CONFIG_TEST",
+                source_resource_id=str(voice_id),
+                logical_call_id=logical_call_id,
+                started_at=datetime.now(UTC),
+            )
+        )
+        await session.commit()
         connection = QwenTtsConnection(
             url=settings.tts_ws_url,
             api_key=key.get_secret_value(),
@@ -1435,7 +1856,11 @@ async def regenerate_voice_preview(
 
         try:
             result = await connection.synthesize(
-                chunks(), voice=voice.provider_voice, rate=voice.rate, on_audio=on_audio
+                chunks(),
+                voice=voice.provider_voice,
+                rate=voice.rate,
+                on_audio=on_audio,
+                capture=capture,
             )
             preview_audio = await asyncio.to_thread(
                 apply_ogg_opus_gain, bytes(audio), voice.playback_gain
@@ -1445,6 +1870,19 @@ async def regenerate_voice_preview(
             os.replace(temporary, path)
             await session.commit()
             async with session.begin():
+                call = await session.get(ExternalCall, call_id, with_for_update=True)
+                if call is not None:
+                    await persist_provider_capture(session, call, capture)
+                    call.status = "SUCCEEDED"
+                    call.first_result_latency_ms = result.first_audio_latency_ms
+                    call.completed_latency_ms = result.completed_latency_ms
+                    call.audio_bytes = result.byte_count
+                    call.first_result_at = call.started_at + timedelta(
+                        milliseconds=result.first_audio_latency_ms
+                    )
+                    call.completed_at = datetime.now(UTC)
+                voice.calibration_status = "READY"
+                voice.calibrated_at = datetime.now(UTC)
                 AuditService().record(
                     session,
                     actor_user_id=context.user_id,
@@ -1460,8 +1898,20 @@ async def regenerate_voice_preview(
             }
         except Exception as error:
             last_error = str(getattr(error, "code", "voice_preview_failed"))
+            async with session.begin():
+                call = await session.get(ExternalCall, call_id, with_for_update=True)
+                if call is not None:
+                    await persist_provider_capture(session, call, capture)
+                    call.status = "FAILED"
+                    call.error_code = last_error
+                    call.completed_at = datetime.now(UTC)
         finally:
             await connection.close()
+    await session.rollback()
+    async with session.begin():
+        current_voice = await session.get(VoiceProfile, voice_id, with_for_update=True)
+        if current_voice is not None:
+            current_voice.calibration_status = "FAILED"
     from .auth.errors import APIError
 
     raise APIError(last_error)

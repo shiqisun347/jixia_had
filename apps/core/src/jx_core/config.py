@@ -77,6 +77,7 @@ class Settings(BaseSettings):
     diagnostic_queue_size: int = 1024
     diagnostic_batch_size: int = 50
     diagnostic_flush_interval_ms: int = 250
+    paper_experiment_enabled: bool = False
 
     @field_validator("database_url", mode="before")
     @classmethod

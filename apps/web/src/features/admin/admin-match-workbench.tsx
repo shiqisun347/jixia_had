@@ -1,8 +1,19 @@
 'use client';
 
-import { CheckCircle2, Download, FileArchive, RefreshCcw, XCircle } from 'lucide-react';
+import {
+  CheckCircle2,
+  Download,
+  FileArchive,
+  Play,
+  RefreshCcw,
+  RotateCcw,
+  Square,
+  XCircle,
+} from 'lucide-react';
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
+
+import { useOptionalToast } from '@/components/ui/toast-provider';
 
 import { AdminButton, AdminConfirmDialog, StatusBadge } from './admin-controls';
 import { AdminEmpty, AdminFeedback, AdminPageHeader, AdminPanel } from './admin-ui';
@@ -12,6 +23,7 @@ import { adminApi, readableAdminError } from './admin-api';
 type Tab = 'overview' | 'participants' | 'transcript' | 'timeline' | 'events' | 'calls' | 'export';
 
 export function AdminMatchWorkbench({ matchId }: Readonly<{ matchId: string }>) {
+  const toast = useOptionalToast();
   const [tab, setTab] = useState<Tab>('overview');
   const [includeAudio, setIncludeAudio] = useState(false);
   const [exportId, setExportId] = useState<string | null>(null);
@@ -68,17 +80,52 @@ export function AdminMatchWorkbench({ matchId }: Readonly<{ matchId: string }>) 
     ['calls', '请求日志'],
     ['export', '导出'],
   ];
+  const control = async (action: 'terminate' | 'resume' | 'recover' | 'reset_speech') => {
+    try {
+      await adminApi.controlMatch(matchId, action);
+      await overview.refetch();
+    } catch (error) {
+      toast?.showToast({ message: readableAdminError(error), tone: 'error' });
+    }
+  };
   return (
     <div className="space-y-6">
       <AdminPageHeader
         eyebrow="MATCH WORKBENCH"
         title={match.label || '比赛工作台'}
-        description={`${match.status} · sequence ${match.sequence} · context v${match.context_version}`}
+        description={`${match.status} / ${match.action_state} · sequence ${match.sequence} · context v${match.context_version}${match.error_code ? ` · ${match.error_code}` : ''}`}
         actions={
-          <AdminButton onClick={() => void overview.refetch()}>
-            <RefreshCcw className="size-4" />
-            刷新
-          </AdminButton>
+          <div className="flex flex-wrap gap-2">
+            <AdminButton onClick={() => void overview.refetch()}>
+              <RefreshCcw className="size-4" />
+              刷新
+            </AdminButton>
+            {['PAUSED', 'SYSTEM_RECOVERY', 'ERROR'].includes(match.status) ? (
+              <AdminButton onClick={() => void control('resume')} tone="secondary">
+                <Play className="size-4" />
+                恢复比赛
+              </AdminButton>
+            ) : null}
+            {[
+              'RUNNING',
+              'PAUSED',
+              'SYSTEM_RECOVERY',
+              'ERROR',
+              'START_PENDING_RUNTIME',
+              'START_COUNTDOWN',
+            ].includes(match.status) ? (
+              <AdminButton onClick={() => void control('terminate')} tone="danger">
+                <Square className="size-4" />
+                强制终止
+              </AdminButton>
+            ) : null}
+            {match.status === 'RUNNING' ? (
+              <AdminButton onClick={() => void control('reset_speech')} tone="secondary">
+                <RotateCcw className="size-4" />
+                重置当前发言
+              </AdminButton>
+            ) : null}
+          </div>
         }
       />
       <div className="flex flex-wrap gap-2 border-b border-slate-200 pb-2">
@@ -351,6 +398,9 @@ function Overview({
       <div className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
         {Object.entries({
           状态: match.status,
+          动作状态: match.action_state || '未记录',
+          错误码: match.error_code || '无',
+          当前发言: match.current_speech_id || '无',
           辩题: (match.topic as { title?: string })?.title ?? '未记录',
           sequence: match.sequence,
           'context 版本': match.context_version,

@@ -1,134 +1,96 @@
-import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { cleanup, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-import { ToastProvider } from '@/components/ui/toast-provider';
-
 const { requestJson } = vi.hoisted(() => ({ requestJson: vi.fn() }));
-
 vi.mock('@/lib/auth-api', () => ({ requestJson }));
 
 import AdminAgentsPage from './page';
 
+const rule = {
+  id: 'rule-1',
+  name: '论文实验规则',
+  description: '',
+  side_size: 4,
+  estimated_seconds: 900,
+  status: 'DISABLED',
+  config_revision: 1,
+  historical_read_only: false,
+};
 const catalog = {
-  models: [
-    {
-      id: '11111111-1111-4111-8111-111111111111',
-      name: 'Qwen',
-      status: 'ENABLED',
-      model_id: 'qwen',
-    },
-  ],
+  models: [{ id: 'model-1', name: 'Qwen', status: 'ENABLED' }],
   voices: [
     {
-      id: '22222222-2222-4222-8222-222222222222',
+      id: 'voice-1',
       name: '龙安灵希',
       kind: 'AGENT',
-      provider_voice: 'voice-1',
+      provider_voice: 'voice',
       rate: 1,
       chars_per_second: 4,
       avatar_key: 'agent-07',
       status: 'ENABLED',
     },
   ],
-  agents: [
-    {
-      id: '33333333-3333-4333-8333-333333333333',
-      name: '乾元',
-      model_profile_id: '11111111-1111-4111-8111-111111111111',
-      voice_profile_id: '22222222-2222-4222-8222-222222222222',
-      system_prompt: '系统提示',
-      debater_prompt: '辩手提示',
-      generation_params: { temperature: 0.8 },
-      avatar_key: 'agent-08',
-      status: 'ENABLED',
-    },
-  ],
+  agents: [],
   topics: [],
   rules: [],
 };
+const agent = {
+  id: 'agent-1',
+  rule_id: 'rule-1',
+  name: '龙安灵希',
+  model_profile_id: 'model-1',
+  voice_profile_id: 'voice-1',
+  generation_params: {},
+  status: 'ENABLED',
+  prompt_override_count: 0,
+};
+const workspace = {
+  stages: [{ id: 'stage-1', name: '正方立论', prompts: [{ purpose: 'SPEECH' }] }],
+};
 
-function renderPage() {
-  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-  return render(
-    <QueryClientProvider client={client}>
-      <ToastProvider>
-        <AdminAgentsPage />
-      </ToastProvider>
-    </QueryClientProvider>,
-  );
-}
-
-describe('admin Agent catalog', () => {
+describe('rule-scoped Agent management', () => {
   afterEach(cleanup);
-
   beforeEach(() => {
+    window.localStorage.clear();
     requestJson.mockReset();
-    requestJson.mockImplementation((path: string, options?: RequestInit) => {
+    requestJson.mockImplementation((path: string) => {
       if (path === '/api/admin/catalog') return Promise.resolve(catalog);
-      if (path === '/api/admin/catalog/agents' && options?.method === 'POST') {
-        return Promise.reject(new Error('Agent 名称已存在，请换一个名称'));
-      }
-      if (
-        path === '/api/admin/catalog/agents/33333333-3333-4333-8333-333333333333' &&
-        options?.method === 'PATCH'
-      ) {
-        return Promise.resolve({ ...catalog.agents[0], name: '乾元·改' });
-      }
-      return Promise.reject(new Error(`unexpected request: ${path}`));
+      if (path === '/api/admin/rules') return Promise.resolve([rule]);
+      if (path === '/api/admin/rules/rule-1/agents') return Promise.resolve([agent]);
+      if (path === '/api/admin/rules/rule-1/workspace') return Promise.resolve(workspace);
+      if (path.includes('/prompts/SPEECH'))
+        return Promise.resolve({
+          uses_default: true,
+          template_text: '默认',
+          default_template_text: '默认',
+        });
+      return Promise.resolve({});
     });
   });
 
-  it('shows duplicate create failures as a floating toast', async () => {
-    renderPage();
-    await screen.findByText('乾元');
-    fireEvent.click(screen.getByRole('button', { name: '创建 Agent' }));
-    fireEvent.change(screen.getByLabelText('Agent 名称'), { target: { value: '乾元' } });
-    fireEvent.change(screen.getByLabelText('LLM 模型'), {
-      target: { value: '11111111-1111-4111-8111-111111111111' },
-    });
-    fireEvent.change(screen.getByLabelText('TTS 音色'), {
-      target: { value: '22222222-2222-4222-8222-222222222222' },
-    });
-    expect(screen.queryByRole('radiogroup')).not.toBeInTheDocument();
-    expect(screen.getByText('头像由 TTS 音色决定')).toBeVisible();
-    fireEvent.click(screen.getByRole('button', { name: '保存配置' }));
-
-    expect(await screen.findByRole('alert')).toHaveTextContent('Agent 名称已存在');
-    expect(requestJson).toHaveBeenCalledWith(
-      '/api/admin/catalog/agents',
-      expect.objectContaining({ method: 'POST' }),
-    );
+  it('does not mix Agents before a rule is selected', async () => {
+    render(<AdminAgentsPage />);
+    expect(await screen.findByText('先选择一套赛制规则，再管理它的 Agent 池。')).toBeVisible();
+    expect(screen.queryByText('龙安灵希')).not.toBeInTheDocument();
+    expect(requestJson).not.toHaveBeenCalledWith(expect.stringContaining('/agents'));
   });
 
-  it('prefills an Agent and persists edits through PATCH', async () => {
-    renderPage();
-    fireEvent.pointerDown(await screen.findByRole('button', { name: '更多操作' }));
-    fireEvent.click(await screen.findByText('编辑配置'));
+  it('loads only the selected rule pool and keeps identity read-only', async () => {
+    render(<AdminAgentsPage />);
+    fireEvent.change(await screen.findByLabelText('赛制规则'), { target: { value: 'rule-1' } });
+    expect(await screen.findByText('使用赛制默认')).toBeVisible();
+    expect(requestJson).toHaveBeenCalledWith('/api/admin/rules/rule-1/agents');
 
-    expect(screen.getByLabelText('Agent 名称')).toHaveValue('乾元');
-    expect(screen.getByLabelText('生成温度')).toHaveValue(0.8);
-    expect(screen.queryByRole('radiogroup')).not.toBeInTheDocument();
-    fireEvent.change(screen.getByLabelText('Agent 名称'), { target: { value: '乾元·改' } });
-    fireEvent.click(screen.getByRole('button', { name: '保存配置' }));
-
+    fireEvent.click(screen.getByRole('button', { name: '编辑' }));
+    expect(
+      await screen.findByText('基础身份跟随全局音色；这里只编辑规则内运行配置。'),
+    ).toBeVisible();
+    expect(screen.queryByLabelText('名称')).not.toBeInTheDocument();
+    expect(screen.queryByLabelText('音色')).not.toBeInTheDocument();
     await waitFor(() =>
       expect(requestJson).toHaveBeenCalledWith(
-        '/api/admin/catalog/agents/33333333-3333-4333-8333-333333333333',
-        expect.objectContaining({
-          method: 'PATCH',
-          body: expect.stringContaining('乾元·改'),
-        }),
+        expect.stringContaining('/agents/agent-1/stages/stage-1/prompts/SPEECH'),
       ),
     );
-    const requestBody = JSON.parse(
-      requestJson.mock.calls.find(
-        ([path, options]) =>
-          path === '/api/admin/catalog/agents/33333333-3333-4333-8333-333333333333' &&
-          options?.method === 'PATCH',
-      )?.[1]?.body as string,
-    ) as Record<string, unknown>;
-    expect(requestBody).not.toHaveProperty('avatar_key');
-    expect(await screen.findByRole('status')).toHaveTextContent('Agent 配置已更新');
   });
 });

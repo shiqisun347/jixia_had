@@ -402,7 +402,7 @@ wheels = [
 
 [[package]]
 name = "jx-core"
-version = "1.0.0"
+version = "2.1.0"
 source = { editable = "apps/core" }
 dependencies = [
     { name = "alembic" },
@@ -447,7 +447,7 @@ requires-dist = [
 
 [[package]]
 name = "jx-debate-workspace"
-version = "1.0.0"
+version = "2.1.0"
 source = { virtual = "." }
 
 [package.dev-dependencies]
@@ -470,10 +470,12 @@ dev = [
 
 [[package]]
 name = "jx-jobs"
-version = "1.0.0"
+version = "2.1.0"
 source = { editable = "apps/jobs" }
 dependencies = [
+    { name = "av" },
     { name = "greenlet" },
+    { name = "jx-core" },
     { name = "psycopg", extra = ["binary", "pool"] },
     { name = "pydantic" },
     { name = "pydantic-settings" },
@@ -483,7 +485,9 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "av", specifier = ">=15,<17" },
     { name = "greenlet", specifier = "==3.2.4" },
+    { name = "jx-core", editable = "apps/core" },
     { name = "psycopg", extras = ["binary", "pool"], specifier = "==3.3.4" },
     { name = "pydantic", specifier = "==2.13.4" },
     { name = "pydantic-settings", specifier = "==2.14.2" },

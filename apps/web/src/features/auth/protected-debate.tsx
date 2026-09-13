@@ -30,7 +30,7 @@ export function ProtectedDebate() {
   if (query.isLoading || !query.data || query.data.user.must_change_password)
     return <AuthLoading />;
   const matchId = searchParams.get('match_id');
-  if (matchId) return <LiveMatchPage matchId={matchId} />;
+  if (matchId) return <LiveMatchPage key={matchId} matchId={matchId} />;
   return (
     <main className="jx-page-grid jx-page-viewport grid place-items-center px-6">
       <section className="max-w-md rounded-[1.75rem] border border-blue-100 bg-white/90 p-8 text-center shadow-[0_24px_70px_rgba(40,76,142,0.12)]">

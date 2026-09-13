@@ -7,7 +7,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
-from .protocol import FunAsrConnection, FunAsrSentence, SegmentResult
+from ..data_capture.provider import ProviderCallCapture
+from .protocol import FunAsrConnection, FunAsrError, FunAsrSentence, SegmentResult
 
 PCM_FRAME_BYTES = 3200
 PCM_SAMPLES_PER_FRAME = 1600
@@ -34,6 +35,7 @@ InterimCallback = Callable[[UUID, int, str], Awaitable[None]]
 SegmentCallback = Callable[[UUID, int, SegmentResult, int], Awaitable[None]]
 SegmentStartedCallback = Callable[[UUID, int, UUID], Awaitable[None]]
 SegmentFailedCallback = Callable[[UUID, int, UUID, str], Awaitable[None]]
+CaptureCallback = Callable[[UUID, ProviderCallCapture], Awaitable[None]]
 
 
 class AsrSpeechSession:
@@ -46,6 +48,7 @@ class AsrSpeechSession:
         on_segment: SegmentCallback,
         on_segment_started: SegmentStartedCallback | None = None,
         on_segment_failed: SegmentFailedCallback | None = None,
+        on_capture: CaptureCallback | None = None,
         start_segment_no: int = 0,
         initial_text: str = "",
         initial_sample_count: int = 0,
@@ -57,6 +60,7 @@ class AsrSpeechSession:
         self._on_segment = on_segment
         self._on_segment_started = on_segment_started
         self._on_segment_failed = on_segment_failed
+        self._on_capture = on_capture
         self._queue: asyncio.Queue[bytes | None] = asyncio.Queue(maxsize=QUEUE_FRAMES)
         self._pending = bytearray()
         self._closed = False
@@ -65,6 +69,8 @@ class AsrSpeechSession:
         self._initial_text = initial_text
         self._initial_first_interim_latency_ms = initial_first_interim_latency_ms
         self._ready = asyncio.Event()
+        self._current_segment_no = start_segment_no
+        self._completed_results: list[SegmentResult] = []
 
     async def wait_ready(self, timeout_seconds: float = 10.0) -> None:
         await asyncio.wait_for(self._ready.wait(), timeout=timeout_seconds)
@@ -93,10 +99,18 @@ class AsrSpeechSession:
 
     async def run(self) -> AsrSpeechResult:
         segment_no = self._start_segment_no
-        results: list[SegmentResult] = []
+        results = self._completed_results
         speech_finished = False
         while not speech_finished:
+            first_item = await self._queue.get()
+            if first_item is None:
+                self._queue.task_done()
+                if not results:
+                    raise FunAsrError("asr_empty_audio")
+                speech_finished = True
+                break
             segment_no += 1
+            self._current_segment_no = segment_no
             segment_state = {"frames_sent": 0, "last_sentence_end_frame": 0}
             stable_prefix = self._initial_text + "".join(item.final_text for item in results)
             segment_stable: dict[int, str] = {}
@@ -121,10 +135,13 @@ class AsrSpeechSession:
                     f"{prefix}{stable_current}{sentence.text}",
                 )
 
-            async def chunks(state: dict[str, int] = segment_state):
+            async def chunks(
+                state: dict[str, int] = segment_state,
+                initial_item: bytes = first_item,
+            ):
                 nonlocal speech_finished
+                item: bytes | None = initial_item
                 while True:
-                    item = await self._queue.get()
                     try:
                         if item is None:
                             speech_finished = True
@@ -139,6 +156,7 @@ class AsrSpeechSession:
                             return
                     finally:
                         self._queue.task_done()
+                    item = await self._queue.get()
 
             task_id = uuid4()
             if self._on_segment_started is not None:
@@ -151,10 +169,16 @@ class AsrSpeechSession:
                     task_id=task_id,
                 )
             except Exception as error:
+                capture = self._connection.take_capture(task_id)
+                if capture is not None and self._on_capture is not None:
+                    await self._on_capture(task_id, capture)
                 if self._on_segment_failed is not None:
                     code = getattr(error, "code", "asr_stream_failed")
                     await self._on_segment_failed(self.speech_id, segment_no, task_id, str(code))
                 raise
+            capture = self._connection.take_capture(task_id)
+            if capture is not None and self._on_capture is not None:
+                await self._on_capture(task_id, capture)
             results.append(result)
             await self._on_segment(
                 self.speech_id,
@@ -173,6 +197,25 @@ class AsrSpeechSession:
             audio_duration_ms=self._sample_count // 16,
             first_interim_latency_ms=first_interim,
             last_segment_no=segment_no,
+        )
+
+    def checkpoint(self) -> AsrSpeechResult:
+        results = tuple(self._completed_results)
+        return AsrSpeechResult(
+            speech_id=self.speech_id,
+            final_text=self._initial_text + "".join(item.final_text for item in results),
+            segments=results,
+            audio_duration_ms=self._sample_count // 16,
+            first_interim_latency_ms=self._initial_first_interim_latency_ms
+            or next(
+                (
+                    item.first_interim_latency_ms
+                    for item in results
+                    if item.first_interim_latency_ms
+                ),
+                None,
+            ),
+            last_segment_no=self._current_segment_no,
         )
 
 

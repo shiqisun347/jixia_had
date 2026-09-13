@@ -19,8 +19,10 @@ import type { ComponentType } from 'react';
 import { adminApi, readableAdminError } from '@/features/admin/admin-api';
 import { AdminNotice, AdminRefreshButton, StatusBadge } from '@/features/admin/admin-controls';
 import { AdminEmpty, AdminFeedback, AdminPageHeader, AdminPanel } from '@/features/admin/admin-ui';
+import { useAppTranslations } from '@/i18n';
 
 export default function AdminPage() {
+  const t = useAppTranslations('Admin');
   const query = useQuery({
     queryKey: ['admin', 'overview'],
     queryFn: adminApi.overview,
@@ -43,19 +45,19 @@ export default function AdminPage() {
               className="inline-flex min-h-10 items-center gap-2 rounded-xl border border-slate-200 bg-white px-3.5 text-sm font-bold text-slate-700 shadow-sm transition hover:border-blue-300 hover:text-blue-700 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-blue-100"
               href="/admin/matches"
             >
-              查看比赛 <ArrowUpRight className="size-4" aria-hidden="true" />
+              {t('overviewPage.viewMatches')} <ArrowUpRight className="size-4" aria-hidden="true" />
             </Link>
             <Link
               className="inline-flex min-h-10 items-center gap-2 rounded-xl border border-blue-600 bg-blue-600 px-3.5 text-sm font-bold text-white shadow-[0_10px_24px_rgba(37,99,235,0.2)] transition hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-blue-100"
-              href="/admin/agents"
+              href="/admin/rules"
             >
-              <Plus className="size-4" aria-hidden="true" /> 配置 Agent
+              <Plus className="size-4" aria-hidden="true" /> {t('overviewPage.openRules')}
             </Link>
           </div>
         }
-        description="集中查看比赛容量、智能体目录、后台异常和存储风险，再进入对应模块处理。"
-        eyebrow="OPERATIONS OVERVIEW"
-        title="运行总览"
+        description={t('overviewPage.description')}
+        eyebrow={t('overviewPage.eyebrow')}
+        title={t('overviewPage.title')}
       />
 
       {query.error ? (
@@ -75,15 +77,15 @@ export default function AdminPage() {
         <>
           <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <MetricCard
-              detail={`${Math.max(0, 5 - activeMatches)} 个剩余名额`}
+              detail={t('overviewPage.remainingSlots', { count: Math.max(0, 5 - activeMatches) })}
               href="/admin/matches"
               icon={Activity}
-              label="活动比赛"
+              label={t('overviewPage.activeMatches')}
               tone={activeMatches >= 5 ? 'danger' : activeMatches >= 4 ? 'warning' : 'blue'}
               value={`${activeMatches} / 5`}
             />
             <MetricCard
-              detail={`${enabledAgents} 个启用配置`}
+              detail={t('overviewPage.enabledConfigs', { count: enabledAgents })}
               href="/admin/agents"
               icon={Bot}
               label="启用 Agent"
@@ -91,10 +93,10 @@ export default function AdminPage() {
               value={String(enabledAgents)}
             />
             <MetricCard
-              detail={`${enabledVoices} 个启用音色`}
+              detail={t('overviewPage.enabledVoices', { count: enabledVoices })}
               href="/admin/models"
               icon={BrainCircuit}
-              label="启用模型"
+              label={t('overviewPage.enabledModelLabel')}
               tone="blue"
               value={String(enabledModels)}
             />
@@ -102,7 +104,7 @@ export default function AdminPage() {
               detail={`${(data.storage.free_bytes / 1024 ** 3).toFixed(1)} GB 可用`}
               href="/admin/settings"
               icon={HardDrive}
-              label="磁盘已用"
+              label={t('overviewPage.diskUsed')}
               tone={storagePercent >= 90 ? 'danger' : storagePercent >= 80 ? 'warning' : 'blue'}
               value={`${storagePercent.toFixed(1)}%`}
             />
@@ -114,8 +116,8 @@ export default function AdminPage() {
                 {activeMatches} / 5
               </span>
             }
-            description="运行中和暂停中的比赛均占用容量；状态轨道是当前实时资源占用的快速视图。"
-            title="实时比赛容量"
+            description={t('overviewPage.capacityDescription')}
+            title={t('overviewPage.capacity')}
           >
             <div className="relative overflow-hidden rounded-xl border border-slate-200 bg-slate-50 px-4 py-5">
               <div
@@ -137,14 +139,14 @@ export default function AdminPage() {
               <div className="mt-4 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-500">
                 <span>
                   {activeMatches
-                    ? '当前有实时比赛，后台重任务应保持低优先级。'
-                    : '当前没有活动比赛。'}
+                    ? t('overviewPage.activeMatchesHint')
+                    : t('overviewPage.noActiveMatches')}
                 </span>
                 <Link
                   className="inline-flex items-center gap-1 font-bold text-blue-700"
                   href="/admin/matches"
                 >
-                  查看比赛状态 <ArrowRight className="size-3.5" aria-hidden="true" />
+                  {t('overviewPage.viewStatus')} <ArrowRight className="size-3.5" aria-hidden="true" />
                 </Link>
               </div>
             </div>
@@ -152,8 +154,8 @@ export default function AdminPage() {
 
           <div className="grid gap-5 xl:grid-cols-[1.35fr_0.65fr]">
             <AdminPanel
-              description="按创建时间显示最近六场，状态和入口保持可扫描。"
-              title="最近比赛"
+              description={t('overviewPage.recentDescription')}
+              title={t('overviewPage.recentMatches')}
             >
               {data.recent_matches.length ? (
                 <div className="overflow-hidden rounded-xl border border-slate-200">
@@ -188,12 +190,12 @@ export default function AdminPage() {
                   </div>
                 </div>
               ) : (
-                <AdminEmpty>暂无比赛记录，可从用户端创建房间。</AdminEmpty>
+              <AdminEmpty>{t('overviewPage.noMatches')}</AdminEmpty>
               )}
             </AdminPanel>
 
             <div className="space-y-5">
-              <AdminPanel description="需要优先确认的异常和资源风险。" title="待处理事项">
+              <AdminPanel description={t('overviewPage.pendingDescription')} title={t('overviewPage.pending')}>
                 <div className="space-y-3">
                   {storagePercent >= 80 ? (
                     <AdminNotice tone="warning">
@@ -219,13 +221,13 @@ export default function AdminPage() {
                     </Link>
                   ))}
                   {!recentFailures.length && storagePercent < 80 ? (
-                    <AdminNotice tone="success">当前没有需要立即处理的后台异常。</AdminNotice>
+                    <AdminNotice tone="success">{t('overviewPage.noImmediateIssues')}</AdminNotice>
                   ) : null}
                 </div>
               </AdminPanel>
-              <AdminPanel description="进入最常用的配置与诊断页面。" title="快捷入口">
+              <AdminPanel description={t('overviewPage.quickLinksDescription')} title={t('overviewPage.quickLinks')}>
                 <div className="grid grid-cols-2 gap-2">
-                  <QuickLink href="/admin/agents" icon={Bot} label="Agent" />
+                  <QuickLink href="/admin/rules" icon={Bot} label="赛制" />
                   <QuickLink href="/admin/models" icon={BrainCircuit} label="模型" />
                   <QuickLink href="/admin/voices" icon={Volume2} label="音色" />
                   <QuickLink href="/admin/settings" icon={Settings2} label="系统" />
@@ -312,7 +314,7 @@ function QuickLink({
 
 function OverviewSkeleton() {
   return (
-    <div aria-label="正在加载运行总览" className="space-y-5" role="status">
+    <div aria-label="正在加载运营概览" className="space-y-5" role="status">
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         {Array.from({ length: 4 }, (_, index) => (
           <div

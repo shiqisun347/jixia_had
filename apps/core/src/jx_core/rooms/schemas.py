@@ -9,17 +9,6 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
-class AgentSeatAssignment(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    side: Literal["AFFIRMATIVE", "NEGATIVE"]
-    seat_no: int = Field(ge=1, le=5)
-    agent_profile_id: UUID
-
-
-def _empty_agent_assignments() -> list[AgentSeatAssignment]:
-    return []
-
-
 class RoomCreateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     title: str = Field(min_length=1, max_length=200)
@@ -31,9 +20,6 @@ class RoomCreateRequest(BaseModel):
     negative_text: str | None = Field(default=None, max_length=1000)
     is_all_agent: bool = False
     human_participation_terms_version: str | None = Field(default=None, max_length=128)
-    agent_assignments: list[AgentSeatAssignment] = Field(
-        default_factory=_empty_agent_assignments, max_length=10
-    )
 
     @model_validator(mode="after")
     def validate_topic_source(self) -> RoomCreateRequest:
@@ -147,6 +133,9 @@ class RoomSnapshotResponse(BaseModel):
     organizer_user_id: UUID
     is_all_agent: bool
     auto_fill_agents: bool
+    experiment_mode: bool = False
+    scheduled_match_kind: Literal["FORMAL", "TRAINING"] | None = None
+    viewer_is_experiment_controller: bool = False
     sequence: int
     topic: dict[str, Any]
     rule: dict[str, Any]
@@ -188,7 +177,6 @@ class RoomCodeLookupResponse(BaseModel):
 
 
 __all__ = [
-    "AgentSeatAssignment",
     "DeviceCheckRequest",
     "DeviceCheckSummaryResponse",
     "LobbyRoomResponse",

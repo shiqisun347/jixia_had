@@ -1,0 +1,12 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="1600" height="2100" viewBox="0 0 1600 2100" role="img" aria-labelledby="title desc">
+  <title id="title">JX-Debate experiment administration and post-match annotation interfaces</title>
+  <desc id="desc">Two vertically arranged screenshots show the experiment administration workspace and the opportunity-level post-match annotation interface.</desc>
+  <rect width="1600" height="2100" fill="#ffffff"/>
+  <g font-family="Arial, Helvetica, sans-serif" font-size="30" font-weight="700" fill="#0f172a">
+    <text x="24" y="40">(a) Experiment administration</text>
+    <text x="24" y="1090">(b) Opportunity-level post-match annotation</text>
+  </g>
+  <image x="0" y="50" width="1600" height="1000" xlink:href="jx-admin-experiment-progress-raw.png"/>
+  <line x1="0" y1="1062" x2="1600" y2="1062" stroke="#cbd5e1" stroke-width="2"/>
+  <image x="0" y="1100" width="1600" height="1000" xlink:href="jx-postmatch-annotation-raw.png"/>
+</svg>

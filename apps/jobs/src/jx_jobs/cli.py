@@ -13,15 +13,22 @@ from typing import cast
 from .audio_worker import process_one_file_cleanup, process_one_postmatch_audio
 from .config import Settings, load_settings
 from .database import Database
+from .experiment_worker import (
+    process_one_experiment_export,
+    process_one_experiment_postmatch,
+    process_one_experiment_retention,
+)
 from .export_worker import process_one_match_export
 from .host_tts_worker import process_one_host_tts
 from .leaderboard_worker import (
     ensure_daily_tasks,
     process_one_leaderboard,
+    process_one_runtime_log_retention,
     process_one_transcript_archive,
 )
 from .logging import configure_logging
 from .runner import DatabaseProbe, run_jobs
+from .runtime_logs import RuntimeLogWriter
 from .tts import DashScopeTTSClient
 
 SettingsFactory = Callable[[], Settings]
@@ -80,10 +87,14 @@ def main(
         raise SystemExit(1) from None
 
     async def execute() -> int:
+        concrete_database = cast(Database, database)
+        runtime_log_writer: RuntimeLogWriter | None = None
+        if isinstance(database, Database):
+            runtime_log_writer = RuntimeLogWriter(concrete_database.session_factory)
+            await runtime_log_writer.start()
         tts_client: DashScopeTTSClient | None = None
         task_processor = None
         if settings.tts_ws_url and settings.dashscope_api_key is not None:
-            concrete_database = cast(Database, database)
             tts_client = DashScopeTTSClient(
                 websocket_url=settings.tts_ws_url,
                 api_key=settings.dashscope_api_key.get_secret_value(),
@@ -102,6 +113,8 @@ def main(
                     return True
                 if await process_one_transcript_archive(concrete_database.session_factory):
                     return True
+                if await process_one_runtime_log_retention(concrete_database.session_factory):
+                    return True
                 if await process_one_postmatch_audio(
                     concrete_database.session_factory,
                     storage_root=Path(settings.match_audio_storage_dir),
@@ -116,6 +129,19 @@ def main(
                         Path(settings.human_audio_storage_dir),
                         Path(settings.host_audio_storage_dir),
                     ],
+                ):
+                    return True
+                if await process_one_experiment_postmatch(
+                    concrete_database.session_factory
+                ):
+                    return True
+                if await process_one_experiment_export(
+                    concrete_database.session_factory,
+                    storage_root=Path(settings.export_storage_dir),
+                ):
+                    return True
+                if await process_one_experiment_retention(
+                    concrete_database.session_factory
                 ):
                     return True
                 return await process_one_file_cleanup(
@@ -136,6 +162,8 @@ def main(
                     return True
                 if await process_one_transcript_archive(concrete_database.session_factory):
                     return True
+                if await process_one_runtime_log_retention(concrete_database.session_factory):
+                    return True
                 if await process_one_postmatch_audio(
                     concrete_database.session_factory,
                     storage_root=Path(settings.match_audio_storage_dir),
@@ -150,6 +178,19 @@ def main(
                         Path(settings.human_audio_storage_dir),
                         Path(settings.host_audio_storage_dir),
                     ],
+                ):
+                    return True
+                if await process_one_experiment_postmatch(
+                    concrete_database.session_factory
+                ):
+                    return True
+                if await process_one_experiment_export(
+                    concrete_database.session_factory,
+                    storage_root=Path(settings.export_storage_dir),
+                ):
+                    return True
+                if await process_one_experiment_retention(
+                    concrete_database.session_factory
                 ):
                     return True
                 return await process_one_file_cleanup(
@@ -172,6 +213,8 @@ def main(
         finally:
             if tts_client is not None:
                 await tts_client.close()
+            if runtime_log_writer is not None:
+                await runtime_log_writer.stop()
 
     try:
         exit_code = asyncio.run(execute())

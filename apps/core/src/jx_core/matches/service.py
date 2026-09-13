@@ -15,22 +15,33 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..agent.runtime import AgentRuntime, AgentRuntimeCallbacks
 from ..auth.errors import AuthError
+from ..data_capture.provider import PROVIDER_CAPTURE_VERSION, ProviderCallCapture
+from ..data_capture.provider_persistence import persist_provider_capture
+from ..experiments.permissions import is_experiment_side_controller, resolve_room_link
 from ..models import (
     AgentFreeDebateDecision,
     AgentGeneration,
     AgentProfile,
     AsrSegment,
     BackgroundTask,
+    ExperimentMatchAttempt,
     ExternalCall,
+    FreeDebateOpportunity,
+    HumanHandEvent,
     Match,
     MatchFile,
     MatchParticipant,
+    PostmatchSurveyTask,
     Room,
+    ScheduledMatch,
     Seat,
+    SpeakerAllocation,
     Speech,
     User,
 )
 from ..models import MatchEvent as MatchEventRow
+from ..runtime_identity import CallbackEnvelope
+from ..survey_definitions import POSTMATCH_QUESTIONNAIRE_VERSION
 from .domain import (
     AgentDecisionState,
     DebateParticipant,
@@ -46,6 +57,47 @@ from .domain import (
 )
 
 logger = logging.getLogger("jx-core.matches")
+HUMAN_SPEECH_START_TIMEOUT_SECONDS = 10.0
+_SPEECH_START_ERROR_CODES = frozenset(
+    {
+        "asr_not_configured",
+        "asr_start_timeout",
+        "asr_task_failed",
+        "asr_stream_failed",
+        "livekit_not_configured",
+    }
+)
+
+_ASR_AUDIO_ERROR_CODES = frozenset(
+    {"asr_empty_audio", "asr_pcm_queue_full", "asr_no_first_frame", "asr_audio_missing"}
+)
+_ASR_CONFIG_ERROR_CODES = frozenset(
+    {"asr_not_configured", "asr_protocol_mismatch", "asr_identity_invalid", "asr_invalid_config"}
+)
+
+
+def classify_asr_error(code: str) -> Literal["AUDIO", "TRANSIENT", "CONFIG", "UNKNOWN"]:
+    """Return a low-cardinality, provider-agnostic ASR failure class."""
+    normalized = str(code or "").strip().lower()
+    if normalized in _ASR_AUDIO_ERROR_CODES:
+        return "AUDIO"
+    if normalized in _ASR_CONFIG_ERROR_CODES:
+        return "CONFIG"
+    if any(
+        token in normalized
+        for token in ("rate", "limit", "thrott", "timeout", "network", "disconnect", "unavailable")
+    ):
+        return "TRANSIENT"
+    if normalized in {"asr_task_failed", "asr_stream_failed"}:
+        return "TRANSIENT"
+    return "UNKNOWN"
+
+
+def _speech_start_error_code(error: BaseException) -> str:
+    if isinstance(error, TimeoutError):
+        return "asr_start_timeout"
+    code = str(getattr(error, "code", ""))
+    return code if code in _SPEECH_START_ERROR_CODES else "asr_start_timeout"
 
 
 def _file_size(path: str | None) -> int:
@@ -55,6 +107,26 @@ def _file_size(path: str | None) -> int:
         return Path(path).stat().st_size
     except OSError:
         return 0
+
+
+def _optional_uuid(value: object) -> UUID | None:
+    """Parse external/event UUID values without accepting stringified nulls."""
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    if not normalized or normalized.lower() in {"none", "null"}:
+        return None
+    try:
+        return UUID(normalized)
+    except ValueError as error:
+        raise MatchDomainError("invalid_event_payload") from error
+
+
+def _required_uuid(value: object) -> UUID:
+    parsed = _optional_uuid(value)
+    if parsed is None:
+        raise MatchDomainError("invalid_event_payload")
+    return parsed
 
 
 def _action_snapshot(action: MatchAction) -> dict[str, Any]:
@@ -69,6 +141,7 @@ def _action_snapshot(action: MatchAction) -> dict[str, Any]:
         "speaker_kind": action.speaker_kind,
         "agent_profile_id": str(action.agent_profile_id) if action.agent_profile_id else None,
         "host_audio_path": action.host_audio_path,
+        "host_audio_duration_ms": action.host_audio_duration_ms,
         "participants": [
             {
                 "side": item.side,
@@ -84,7 +157,9 @@ def _action_snapshot(action: MatchAction) -> dict[str, Any]:
 
 
 class SpeechRuntime(Protocol):
-    async def start_speech(self, match_id: UUID, speech_id: UUID, user_id: UUID) -> None: ...
+    async def start_speech(
+        self, match_id: UUID, speech_id: UUID, user_id: UUID, envelope: CallbackEnvelope
+    ) -> None: ...
 
     async def finish_speech(self, match_id: UUID, speech_id: UUID) -> None: ...
 
@@ -118,7 +193,11 @@ def state_snapshot(state: MatchRuntimeState) -> dict[str, Any]:
         "current_agent_profile_id": (
             str(state.current_agent_profile_id) if state.current_agent_profile_id else None
         ),
+        "interim_text": state.interim_text,
+        "speech_start_sequence": state.speech_start_sequence,
         "speech_remaining_ms": state.speech_remaining_ms,
+        "host_audio_remaining_ms": state.host_audio_remaining_ms,
+        "host_audio_deadline_ms": state.host_audio_deadline_ms,
         "current_speaker_side": state.current_speaker_side,
         "current_speaker_seat_no": state.current_speaker_seat_no,
         "free_holder_side": state.free_holder_side,
@@ -137,6 +216,7 @@ def state_snapshot(state: MatchRuntimeState) -> dict[str, Any]:
                 "seat_no": item.seat_no,
                 "status": item.status,
                 "should_speak": item.should_speak,
+                "decision_reason": item.decision_reason,
                 "willingness": item.willingness,
                 "result_order": item.result_order,
                 "failed": item.failed,
@@ -144,6 +224,20 @@ def state_snapshot(state: MatchRuntimeState) -> dict[str, Any]:
             for item in state.agent_decisions
         ],
         "hand_window_open": state.hand_window_open,
+        "experiment_mode": state.experiment_mode,
+        "formal_4v4": state.formal_4v4,
+        "experiment_attempt_id": (
+            str(state.experiment_attempt_id) if state.experiment_attempt_id else None
+        ),
+        "opportunity_id": str(state.opportunity_id) if state.opportunity_id else None,
+        "allocated_opportunity_id": (
+            str(state.allocated_opportunity_id) if state.allocated_opportunity_id else None
+        ),
+        "opportunity_generation": state.opportunity_generation,
+        "selection_phase": state.selection_phase,
+        "agent_effective_status": state.agent_effective_status,
+        "selection_remaining_ms": state.selection_remaining_ms,
+        "human_wait_remaining_ms": state.human_wait_remaining_ms,
         "paused_from_status": state.paused_from_status,
         "paused_from_action_state": state.paused_from_action_state,
         "pause_initiator_user_id": (
@@ -178,6 +272,11 @@ def _state_from_snapshot(match_id: UUID, snapshot: dict[str, Any]) -> MatchRunti
                 if raw.get("agent_profile_id")
                 else None,
                 host_audio_path=raw.get("host_audio_path"),
+                host_audio_duration_ms=(
+                    int(raw["host_audio_duration_ms"])
+                    if raw.get("host_audio_duration_ms") is not None
+                    else None
+                ),
                 participants=tuple(
                     DebateParticipant(
                         side=str(item["side"]),
@@ -213,6 +312,11 @@ def _state_from_snapshot(match_id: UUID, snapshot: dict[str, Any]) -> MatchRunti
                 seat_no=int(item["seat_no"]),
                 status=cast(Literal["DECIDING", "HAND", "SKIP"], status),
                 should_speak=should_value if isinstance(should_value, bool) else None,
+                decision_reason=(
+                    str(item.get("decision_reason"))
+                    if isinstance(item.get("decision_reason"), str)
+                    else None
+                ),
                 willingness=(
                     float(willingness_value)
                     if isinstance(willingness_value, (int, float))
@@ -223,6 +327,12 @@ def _state_from_snapshot(match_id: UUID, snapshot: dict[str, Any]) -> MatchRunti
                 ),
                 failed=bool(item.get("failed", False)),
             )
+        )
+    host_audio_remaining_ms = snapshot.get("host_audio_remaining_ms")
+    host_audio_deadline_ms = snapshot.get("host_audio_deadline_ms")
+    if isinstance(host_audio_deadline_ms, int):
+        host_audio_remaining_ms = max(
+            0, host_audio_deadline_ms - int(datetime.now(UTC).timestamp() * 1000)
         )
     return MatchRuntimeState(
         match_id=match_id,
@@ -241,7 +351,15 @@ def _state_from_snapshot(match_id: UUID, snapshot: dict[str, Any]) -> MatchRunti
         current_agent_profile_id=UUID(snapshot["current_agent_profile_id"])
         if snapshot.get("current_agent_profile_id")
         else None,
+        interim_text=str(snapshot.get("interim_text", "")),
+        speech_start_sequence=(
+            int(snapshot["speech_start_sequence"])
+            if snapshot.get("speech_start_sequence") is not None
+            else None
+        ),
         speech_remaining_ms=snapshot.get("speech_remaining_ms"),
+        host_audio_remaining_ms=host_audio_remaining_ms,
+        host_audio_deadline_ms=None,
         current_speaker_side=snapshot.get("current_speaker_side"),
         current_speaker_seat_no=snapshot.get("current_speaker_seat_no"),
         free_holder_side=snapshot.get("free_holder_side"),
@@ -257,6 +375,26 @@ def _state_from_snapshot(match_id: UUID, snapshot: dict[str, Any]) -> MatchRunti
         ),
         agent_decisions=tuple(decisions),
         hand_window_open=bool(snapshot.get("hand_window_open", False)),
+        experiment_mode=bool(snapshot.get("experiment_mode", False)),
+        formal_4v4=bool(snapshot.get("formal_4v4", False)),
+        experiment_attempt_id=(
+            UUID(snapshot["experiment_attempt_id"])
+            if snapshot.get("experiment_attempt_id")
+            else None
+        ),
+        opportunity_id=(
+            UUID(snapshot["opportunity_id"]) if snapshot.get("opportunity_id") else None
+        ),
+        allocated_opportunity_id=(
+            UUID(snapshot["allocated_opportunity_id"])
+            if snapshot.get("allocated_opportunity_id")
+            else None
+        ),
+        opportunity_generation=int(snapshot.get("opportunity_generation", 0)),
+        selection_phase=snapshot.get("selection_phase"),
+        agent_effective_status=snapshot.get("agent_effective_status"),
+        selection_remaining_ms=snapshot.get("selection_remaining_ms"),
+        human_wait_remaining_ms=snapshot.get("human_wait_remaining_ms"),
         paused_from_status=snapshot.get("paused_from_status"),
         paused_from_action_state=snapshot.get("paused_from_action_state"),
         pause_initiator_user_id=(
@@ -289,6 +427,10 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         self._agent_runtime: AgentRuntime | None = None
         self._postmatch_runtime: PostmatchRuntime | None = None
         self._background_tasks: set[asyncio.Task[None]] = set()
+        self._speech_presence_tasks: dict[UUID, asyncio.Task[None]] = {}
+        self._prepared_speech_starts: set[tuple[UUID, str]] = set()
+        self._pending_agent_full_text: dict[tuple[UUID, UUID], tuple[CallbackEnvelope, str]] = {}
+        self._late_experiment_rounds: set[UUID] = set()
 
     def set_speech_runtime(self, runtime: SpeechRuntime) -> None:
         self._speech_runtime = runtime
@@ -299,6 +441,112 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
     def set_postmatch_runtime(self, runtime: PostmatchRuntime) -> None:
         self._postmatch_runtime = runtime
 
+    async def _speech_callback_envelope(
+        self, *, match_id: UUID, speech_id: UUID, user_id: UUID | None
+    ) -> CallbackEnvelope:
+        actor = self._actors.get(match_id)
+        state = actor.state if actor is not None else None
+        logical_opportunity_id = (
+            state.allocated_opportunity_id or state.opportunity_id if state is not None else None
+        )
+        session_factory = cast(Any, self._session_factory)
+        if session_factory is None:
+            return CallbackEnvelope(
+                match_id=match_id,
+                speech_id=speech_id,
+                attempt_no=1,
+                generation_id=None,
+                connection_epoch=(
+                    dict(state.connection_epochs).get(user_id, 1)
+                    if state is not None and user_id is not None
+                    else 1
+                ),
+                context_version=0,
+                opportunity_id=logical_opportunity_id,
+                opportunity_generation=(
+                    state.opportunity_generation
+                    if state is not None and state.opportunity_generation > 0
+                    else None
+                ),
+            )
+        action = state.current_action if state is not None else None
+        async with session_factory() as session:
+            match = await session.get(Match, match_id)
+            if match is None:
+                raise MatchDomainError("match_not_found")
+            attempt_query = select(func.coalesce(func.max(Speech.attempt_no), 0)).where(
+                Speech.match_id == match_id
+            )
+            if logical_opportunity_id is not None:
+                attempt_query = attempt_query.where(Speech.opportunity_id == logical_opportunity_id)
+            elif action is not None:
+                attempt_query = attempt_query.where(Speech.action_key == action.action_key)
+            previous_attempt = await session.scalar(attempt_query)
+            logical_opportunity = (
+                await session.get(FreeDebateOpportunity, logical_opportunity_id)
+                if logical_opportunity_id is not None
+                else None
+            )
+            logical_opportunity_generation = (
+                logical_opportunity.opportunity_generation
+                if logical_opportunity is not None
+                else None
+            )
+            context_version = match.context_version
+        epoch = (
+            dict(state.connection_epochs).get(user_id, 1)
+            if state is not None and user_id is not None
+            else 1
+        )
+        opportunity_id = logical_opportunity_id
+        opportunity_generation = (
+            logical_opportunity_generation
+            if logical_opportunity_generation is not None
+            else state.opportunity_generation
+            if state is not None and state.opportunity_generation > 0
+            else None
+        )
+        return CallbackEnvelope(
+            match_id=match_id,
+            speech_id=speech_id,
+            attempt_no=int(previous_attempt or 0) + 1,
+            generation_id=None,
+            connection_epoch=epoch,
+            context_version=context_version,
+            opportunity_id=opportunity_id,
+            opportunity_generation=opportunity_generation,
+        )
+
+    async def _asr_callback_is_current(
+        self, *, actor: MatchActor, envelope: CallbackEnvelope
+    ) -> bool:
+        speech_id = envelope.speech_id
+        if speech_id is None:
+            return False
+        async with self._session_factory() as session:
+            speech = await session.get(Speech, speech_id)
+            match = await session.get(Match, envelope.match_id)
+            if speech is None or match is None or speech.match_id != envelope.match_id:
+                return False
+            opportunity = (
+                await session.get(FreeDebateOpportunity, speech.opportunity_id)
+                if speech.opportunity_id is not None
+                else None
+            )
+        expected_epoch = (
+            dict(actor.state.connection_epochs).get(speech.user_id, 1)
+            if speech.user_id is not None
+            else None
+        )
+        return (
+            envelope.attempt_no == speech.attempt_no
+            and envelope.connection_epoch == expected_epoch
+            and envelope.context_version == match.context_version
+            and envelope.opportunity_id == speech.opportunity_id
+            and envelope.opportunity_generation
+            == (opportunity.opportunity_generation if opportunity is not None else None)
+        )
+
     async def _pre_commit(
         self,
         previous: MatchRuntimeState,
@@ -306,12 +554,47 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         events: tuple[MatchEvent, ...],
         command: MatchCommand,
     ) -> None:
+        if command.type == "speech.start" and self._speech_runtime is not None:
+            speech_id = candidate.current_speech_id
+            user_id = command.actor_user_id
+            if speech_id is None or user_id is None:
+                raise MatchDomainError("match_state_conflict")
+            envelope = await self._speech_callback_envelope(
+                match_id=previous.match_id,
+                speech_id=speech_id,
+                user_id=user_id,
+            )
+            try:
+                async with asyncio.timeout(HUMAN_SPEECH_START_TIMEOUT_SECONDS):
+                    await self._speech_runtime.start_speech(
+                        previous.match_id, speech_id, user_id, envelope
+                    )
+            except Exception as error:
+                try:
+                    await self._speech_runtime.reset_speech(previous.match_id)
+                except Exception as cleanup_error:
+                    logger.warning(
+                        "failed human speech start cleanup",
+                        extra={
+                            "error_code": "asr_start_cleanup_failed",
+                            "match_id": str(previous.match_id),
+                            "speech_id": str(speech_id),
+                            "details": {"exception_type": type(cleanup_error).__name__},
+                        },
+                    )
+                raise MatchDomainError(_speech_start_error_code(error)) from error
+            self._prepared_speech_starts.add((previous.match_id, command.message_id))
+            return
         if command.type != "speech.reset":
             return
         if self._speech_runtime is not None:
             await self._speech_runtime.reset_speech(previous.match_id)
         if self._agent_runtime is not None:
+            await self._agent_runtime.cancel_free_decision(previous.match_id)
             await self._agent_runtime.reset_agent(previous.match_id)
+        for key in tuple(self._pending_agent_full_text):
+            if key[0] == previous.match_id:
+                self._pending_agent_full_text.pop(key, None)
 
     def _spawn(self, coroutine: Coroutine[Any, Any, None], *, name: str) -> None:
         task = asyncio.create_task(coroutine, name=name)
@@ -334,6 +617,12 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         task.add_done_callback(finished)
 
     async def close(self) -> None:
+        presence_tasks = tuple(self._speech_presence_tasks.values())
+        self._speech_presence_tasks.clear()
+        for task in presence_tasks:
+            task.cancel()
+        if presence_tasks:
+            await asyncio.gather(*presence_tasks, return_exceptions=True)
         if self._speech_runtime is not None:
             await self._speech_runtime.close()
         if self._agent_runtime is not None:
@@ -362,6 +651,14 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         await actor.close()
 
     async def _publish(self, state: MatchRuntimeState, events: tuple[MatchEvent, ...]) -> None:
+        interruption = any(
+            event.type in ("match.paused", "match.error", "match.system_recovery")
+            for event in events
+        )
+        if interruption and self._agent_runtime is not None:
+            fence = getattr(self._agent_runtime, "fence_agent", None)
+            if fence is not None:
+                await fence(state.match_id)
         for event in events:
             for queue in tuple(self._subscribers.get(event.match_id, ())):
                 try:
@@ -373,6 +670,8 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         pass
                     queue.put_nowait(event)
             speech_id = event.payload.get("speech_id")
+            if event.type in ("match.offline", "match.online"):
+                self._queue_speech_presence_transition(state, event)
             if event.type == "speech.finalizing" and speech_id and self._speech_runtime is not None:
                 self._spawn(
                     self._speech_runtime.finish_speech(event.match_id, UUID(str(speech_id))),
@@ -413,6 +712,29 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                 action = state.current_action
                 side = str(event.payload.get("side", ""))
                 candidates = [item.agent_profile_id for item in state.agent_decisions]
+                decision_envelope = CallbackEnvelope(
+                    match_id=event.match_id,
+                    speech_id=(
+                        _required_uuid(event.payload["source_speech_id"])
+                        if event.payload.get("source_speech_id")
+                        else None
+                    ),
+                    attempt_no=1,
+                    generation_id=None,
+                    connection_epoch=None,
+                    context_version=0,
+                    opportunity_id=(
+                        _required_uuid(event.payload["opportunity_id"])
+                        if event.payload.get("opportunity_id")
+                        else None
+                    ),
+                    opportunity_generation=(
+                        int(event.payload["opportunity_generation"])
+                        if event.payload.get("opportunity_generation") is not None
+                        and int(event.payload["opportunity_generation"]) > 0
+                        else None
+                    ),
+                )
                 if self._agent_runtime is not None and action is not None and candidates:
                     self._spawn(
                         self._agent_runtime.decide_free_debate(
@@ -420,12 +742,13 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                             action_key=action.action_key,
                             side=side,
                             agent_profile_ids=candidates,
-                            decision_round_id=UUID(str(event.payload["decision_round_id"])),
+                            decision_round_id=_required_uuid(event.payload["decision_round_id"]),
+                            envelope=decision_envelope,
                         ),
                         name=f"agent-decide-{event.match_id}-{event.payload['decision_round_id']}",
                     )
                 elif candidates:
-                    round_id = UUID(str(event.payload["decision_round_id"]))
+                    round_id = _required_uuid(event.payload["decision_round_id"])
                     for agent_profile_id in candidates:
                         self._spawn(
                             self._report_unavailable_decision(
@@ -434,9 +757,17 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                                 agent_profile_id=agent_profile_id,
                                 side=side,
                                 decision_round_id=round_id,
+                                envelope=decision_envelope,
                             ),
                             name=f"agent-decision-error-{event.match_id}-{agent_profile_id}",
                         )
+            if event.type == "agent.playback_started" and event.payload.get("generation_id"):
+                generation_id = _required_uuid(event.payload["generation_id"])
+                if (event.match_id, generation_id) in self._pending_agent_full_text:
+                    self._spawn(
+                        self._consume_pending_agent_full_text(event.match_id, generation_id),
+                        name=f"agent-full-text-{event.match_id}-{generation_id}",
+                    )
             elif (
                 event.type in ("match.paused", "match.error", "match.system_recovery")
                 and self._agent_runtime is not None
@@ -446,6 +777,9 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                     name=f"agent-interruption-reset-{event.match_id}",
                 )
             elif event.type in ("match.finished", "match.terminated"):
+                presence_task = self._speech_presence_tasks.pop(event.match_id, None)
+                if presence_task is not None and presence_task is not asyncio.current_task():
+                    presence_task.cancel()
                 if self._speech_runtime is not None:
                     self._spawn(
                         self._speech_runtime.close_match(event.match_id),
@@ -461,6 +795,97 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         self._request_postmatch_judge(event.match_id),
                         name=f"judge-request-{event.match_id}",
                     )
+
+    def _queue_speech_presence_transition(
+        self, state: MatchRuntimeState, event: MatchEvent
+    ) -> None:
+        if self._speech_runtime is None or state.action_state != "HUMAN_SPEAKING":
+            return
+        speech_id = state.current_speech_id
+        speaker_id = state.current_speaker_user_id
+        event_user_id = event.payload.get("user_id")
+        if speech_id is None or speaker_id is None or str(speaker_id) != str(event_user_id):
+            return
+        previous = self._speech_presence_tasks.get(event.match_id)
+
+        async def transition() -> None:
+            if previous is not None:
+                await asyncio.gather(previous, return_exceptions=True)
+            runtime = self._speech_runtime
+            if runtime is None:
+                return
+            if event.type == "match.offline":
+                actor = self._actors.get(event.match_id)
+                if actor is None:
+                    return
+                current = actor.state
+                if (
+                    current.status != "RUNNING"
+                    or current.action_state != "HUMAN_SPEAKING"
+                    or current.current_speech_id != speech_id
+                    or current.current_speaker_user_id != speaker_id
+                ):
+                    return
+                await runtime.pause_speech(event.match_id, speech_id)
+                return
+            actor = self._actors.get(event.match_id)
+            if actor is None:
+                return
+            current = actor.state
+            if (
+                current.status != "RUNNING"
+                or current.action_state != "HUMAN_SPEAKING"
+                or current.current_speech_id != speech_id
+                or current.current_speaker_user_id != speaker_id
+                or speaker_id in dict(current.offline_since_ms)
+            ):
+                return
+            try:
+                envelope = await self._speech_callback_envelope(
+                    match_id=event.match_id,
+                    speech_id=speech_id,
+                    user_id=speaker_id,
+                )
+                await runtime.start_speech(event.match_id, speech_id, speaker_id, envelope)
+            except Exception as error:
+                await self.handle_asr_failure(
+                    envelope=CallbackEnvelope(
+                        match_id=event.match_id,
+                        speech_id=speech_id,
+                        attempt_no=1,
+                        generation_id=None,
+                        connection_epoch=None,
+                        context_version=0,
+                        opportunity_id=None,
+                        opportunity_generation=None,
+                    ),
+                    code=str(getattr(error, "code", "asr_start_timeout")),
+                )
+
+        task = asyncio.create_task(
+            transition(), name=f"asr-presence-{event.type}-{event.match_id}-{speech_id}"
+        )
+        self._speech_presence_tasks[event.match_id] = task
+        self._background_tasks.add(task)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            self._background_tasks.discard(completed)
+            if self._speech_presence_tasks.get(event.match_id) is completed:
+                self._speech_presence_tasks.pop(event.match_id, None)
+            if completed.cancelled():
+                return
+            error = completed.exception()
+            if error is not None:
+                logger.error(
+                    "speech presence transition failed",
+                    extra={
+                        "error_code": getattr(error, "code", "asr_presence_transition_failed"),
+                        "match_id": str(event.match_id),
+                        "event_type": event.type,
+                    },
+                )
+
+        task.add_done_callback(finished)
 
     async def _request_postmatch_judge(self, match_id: UUID) -> None:
         if self._postmatch_runtime is not None:
@@ -494,24 +919,28 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         agent_profile_id: UUID,
         side: str,
         decision_round_id: UUID,
+        envelope: CallbackEnvelope,
     ) -> None:
         await self.report_free_decision(
-            match_id=match_id,
+            envelope=envelope,
             action_key=action_key,
             agent_profile_id=agent_profile_id,
             side=side,
             decision_round_id=decision_round_id,
             should_speak=None,
             willingness=None,
+            decision_reason=None,
             failed=True,
             attempt_no=1,
             duration_ms=0,
             error_code="agent_unavailable",
         )
 
-    async def publish_agent_text_delta(
-        self, match_id: UUID, generation_id: UUID, text: str
-    ) -> None:
+    async def publish_agent_text_delta(self, *, envelope: CallbackEnvelope, text: str) -> None:
+        envelope.require("generation_id")
+        match_id = envelope.match_id
+        generation_id = envelope.generation_id
+        assert generation_id is not None
         actor = self._actors.get(match_id)
         if actor is None:
             return
@@ -528,10 +957,124 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             ),
         )
 
+    async def _start_current_experiment_decision(
+        self, *, match_id: UUID, source_speech_id: UUID
+    ) -> None:
+        actor = self._actors.get(match_id)
+        if actor is None:
+            return
+        state = actor.state
+        if (
+            not state.free_competition_enabled
+            or state.opportunity_id is None
+            or state.selection_phase != "COMPETING"
+            or state.agent_decision_round_id is not None
+        ):
+            return
+        async with self._session_factory() as session:
+            opportunity = await session.get(FreeDebateOpportunity, state.opportunity_id)
+        if opportunity is None:
+            return
+        source_value = opportunity.frozen_context.get("source_speech_id")
+        if str(source_value) != str(source_speech_id):
+            return
+        try:
+            await self.submit(
+                match_id,
+                MatchCommand(
+                    type="free.agent_decision_start",
+                    message_id=(
+                        f"free-agent-decision-start:{state.opportunity_id}:"
+                        f"{state.opportunity_generation}"
+                    ),
+                    payload={
+                        "opportunity_id": str(state.opportunity_id),
+                        "opportunity_generation": state.opportunity_generation,
+                        "source_speech_id": str(source_speech_id),
+                        "trigger_kind": opportunity.trigger_kind,
+                    },
+                ),
+            )
+        except MatchDomainError as exc:
+            if str(exc) != "stale_callback":
+                raise
+
+    async def agent_text_generated(self, *, envelope: CallbackEnvelope, text: str) -> None:
+        envelope.require("generation_id")
+        match_id = envelope.match_id
+        generation_id = envelope.generation_id
+        assert generation_id is not None
+        actor = self._actors.get(match_id)
+        if actor is None or not actor.state.free_competition_enabled:
+            return
+        async with self._session_factory() as session:
+            async with session.begin():
+                generation = await session.get(AgentGeneration, generation_id)
+                match = await session.get(Match, match_id)
+                action = actor.state.current_action
+                if (
+                    generation is None
+                    or match is None
+                    or generation.match_id != match_id
+                    or generation.call_type != "LLM_SPEECH"
+                    or generation.status not in {"LLM_READY", "PLAYING", "FINALIZED"}
+                    or generation.context_version != match.context_version
+                    or action is None
+                    or generation.action_key != action.action_key
+                    or actor.state.current_agent_profile_id != generation.agent_profile_id
+                ):
+                    return
+                latest_generation_id = await session.scalar(
+                    select(AgentGeneration.id)
+                    .where(
+                        AgentGeneration.match_id == match_id,
+                        AgentGeneration.action_key == generation.action_key,
+                        AgentGeneration.agent_profile_id == generation.agent_profile_id,
+                        AgentGeneration.call_type == "LLM_SPEECH",
+                    )
+                    .order_by(
+                        AgentGeneration.attempt_no.desc(),
+                        AgentGeneration.created_at.desc(),
+                    )
+                    .limit(1)
+                )
+                if latest_generation_id != generation_id:
+                    return
+                speech = await session.scalar(
+                    select(Speech)
+                    .where(
+                        Speech.match_id == match_id,
+                        Speech.generation_id == generation_id,
+                    )
+                    .order_by(Speech.created_at.desc())
+                    .limit(1)
+                    .with_for_update()
+                )
+                if speech is None:
+                    self._pending_agent_full_text[(match_id, generation_id)] = (envelope, text)
+                    return
+                if (
+                    actor.state.current_speech_id != speech.id
+                    or actor.state.current_agent_profile_id != speech.agent_profile_id
+                ):
+                    return
+                speech.llm_draft_text = text
+                speech.display_text = text
+                source_speech_id = speech.id
+        await self._start_current_experiment_decision(
+            match_id=match_id, source_speech_id=source_speech_id
+        )
+
+    async def _consume_pending_agent_full_text(self, match_id: UUID, generation_id: UUID) -> None:
+        pending = self._pending_agent_full_text.pop((match_id, generation_id), None)
+        if pending is not None:
+            envelope, text = pending
+            await self.agent_text_generated(envelope=envelope, text=text)
+
     async def report_free_decision(
         self,
         *,
-        match_id: UUID,
+        envelope: CallbackEnvelope,
         action_key: str,
         agent_profile_id: UUID,
         side: str,
@@ -542,34 +1085,129 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         attempt_no: int,
         duration_ms: int,
         error_code: str | None,
+        decision_reason: str | None = None,
     ) -> object:
-        return await self.submit(
-            match_id,
-            MatchCommand(
-                type="free.agent_decision_result",
-                message_id=(
-                    f"free-agent-decision:{match_id}:{decision_round_id}:{agent_profile_id}"
-                ),
-                payload={
-                    "action_key": action_key,
-                    "agent_profile_id": str(agent_profile_id),
-                    "side": side,
-                    "decision_round_id": str(decision_round_id),
-                    "should_speak": should_speak,
-                    "willingness": willingness,
-                    "failed": failed,
-                    "attempt_no": attempt_no,
-                    "duration_ms": duration_ms,
-                    "error_code": error_code,
-                },
-            ),
+        match_id = envelope.match_id
+        actor = await self.get_actor(match_id)
+        if actor.state.free_competition_enabled:
+            envelope.require("opportunity_id", "opportunity_generation")
+        command = MatchCommand(
+            type="free.agent_decision_result",
+            message_id=(f"free-agent-decision:{match_id}:{decision_round_id}:{agent_profile_id}"),
+            payload={
+                "action_key": action_key,
+                "agent_profile_id": str(agent_profile_id),
+                "side": side,
+                "decision_round_id": str(decision_round_id),
+                "should_speak": should_speak,
+                "willingness": willingness,
+                "decision_reason": decision_reason,
+                "failed": failed,
+                "attempt_no": attempt_no,
+                "duration_ms": duration_ms,
+                "error_code": error_code,
+            },
         )
+        state = actor.state
+        known_late_round = decision_round_id in self._late_experiment_rounds
+        if state.experiment_mode and (
+            known_late_round
+            or state.selection_phase != "COMPETING"
+            or state.agent_decision_round_id != decision_round_id
+        ):
+            await self._record_late_experiment_decision(
+                match_id=match_id,
+                agent_profile_id=agent_profile_id,
+                decision_round_id=decision_round_id,
+                should_speak=should_speak,
+                decision_reason=decision_reason,
+                failed=failed,
+                attempt_no=attempt_no,
+                duration_ms=duration_ms,
+                error_code=error_code,
+                stale=(not known_late_round and state.agent_decision_round_id != decision_round_id),
+            )
+            self._late_experiment_rounds.discard(decision_round_id)
+            return actor.view()
+        try:
+            return await self.submit(match_id, command)
+        except MatchDomainError as exc:
+            if not actor.state.free_competition_enabled or str(exc) != "stale_callback":
+                raise
+            await self._record_late_experiment_decision(
+                match_id=match_id,
+                agent_profile_id=agent_profile_id,
+                decision_round_id=decision_round_id,
+                should_speak=should_speak,
+                decision_reason=decision_reason,
+                failed=failed,
+                attempt_no=attempt_no,
+                duration_ms=duration_ms,
+                error_code=error_code,
+                stale=actor.state.agent_decision_round_id != decision_round_id,
+            )
+            return actor.view()
+
+    async def _record_late_experiment_decision(
+        self,
+        *,
+        match_id: UUID,
+        agent_profile_id: UUID,
+        decision_round_id: UUID,
+        should_speak: bool | None,
+        decision_reason: str | None,
+        failed: bool,
+        attempt_no: int,
+        duration_ms: int,
+        error_code: str | None,
+        stale: bool,
+    ) -> None:
+        async with self._session_factory() as session:
+            async with session.begin():
+                decision = await session.scalar(
+                    select(AgentFreeDebateDecision)
+                    .where(
+                        AgentFreeDebateDecision.match_id == match_id,
+                        AgentFreeDebateDecision.decision_round_id == decision_round_id,
+                        AgentFreeDebateDecision.agent_profile_id == agent_profile_id,
+                    )
+                    .with_for_update()
+                )
+                if decision is None or decision.opportunity_id is None:
+                    return
+                opportunity = await session.get(
+                    FreeDebateOpportunity,
+                    decision.opportunity_id,
+                    with_for_update=True,
+                )
+                if opportunity is None:
+                    return
+                # Raw late output remains available for analysis, while the
+                # effective status fixed at the cutoff is never changed.
+                decision.status = "SKIP" if failed or should_speak is not True else "HAND"
+                decision.should_speak = None if failed else should_speak
+                decision.decision_reason = decision_reason
+                decision.willingness = None
+                decision.attempt_no = attempt_no
+                decision.duration_ms = duration_ms
+                decision.error_code = error_code or (
+                    "STALE_EXPERIMENT_DECISION" if stale else "LATE_EXPERIMENT_DECISION"
+                )
+                decision.completed_at = datetime.now(UTC)
+                decision.late = True
+                decision.stale = stale
 
     async def publish_agent_subtitle(
-        self, match_id: UUID, speech_id: UUID, text: str, played_ms: int
+        self, *, envelope: CallbackEnvelope, text: str, played_ms: int
     ) -> None:
+        envelope.require("speech_id", "generation_id")
+        match_id = envelope.match_id
+        speech_id = envelope.speech_id
+        assert speech_id is not None
         actor = self._actors.get(match_id)
         if actor is None or actor.state.current_speech_id != speech_id:
+            return
+        if not await actor.set_interim_text(text, speech_id=speech_id):
             return
         await self._publish(
             actor.state,
@@ -584,9 +1222,11 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             ),
         )
 
-    async def publish_agent_retry(
-        self, match_id: UUID, generation_id: UUID, error_code: str
-    ) -> None:
+    async def publish_agent_retry(self, *, envelope: CallbackEnvelope, error_code: str) -> None:
+        envelope.require("generation_id")
+        match_id = envelope.match_id
+        generation_id = envelope.generation_id
+        assert generation_id is not None
         actor = self._actors.get(match_id)
         if actor is None:
             return
@@ -634,10 +1274,16 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         await self._publish(actor.state, (event,))
 
     async def publish_asr_interim(
-        self, match_id: UUID, speech_id: UUID, segment_no: int, text: str
+        self, *, envelope: CallbackEnvelope, segment_no: int, text: str
     ) -> None:
+        envelope.require("speech_id")
+        match_id = envelope.match_id
+        speech_id = envelope.speech_id
+        assert speech_id is not None
         actor = self._actors.get(match_id)
         if actor is None or actor.state.current_speech_id != speech_id:
+            return
+        if not await actor.set_interim_text(text, speech_id=speech_id):
             return
         await self._publish(
             actor.state,
@@ -659,6 +1305,7 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
     async def persist_asr_segment(
         self,
         *,
+        envelope: CallbackEnvelope,
         speech_id: UUID,
         segment_no: int,
         task_id: UUID,
@@ -667,12 +1314,17 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         final_latency_ms: int,
         pcm_sample_count: int,
     ) -> None:
-        match_id: UUID | None = None
+        envelope.require("speech_id")
+        if envelope.speech_id != speech_id:
+            return
+        match_id = envelope.match_id
         async with self._session_factory() as session:
             async with session.begin():
-                match_id = await session.scalar(
+                stored_match_id = await session.scalar(
                     select(Speech.match_id).where(Speech.id == speech_id)
                 )
+                if stored_match_id != match_id:
+                    return
                 existing = await session.scalar(
                     select(AsrSegment).where(
                         AsrSegment.speech_id == speech_id,
@@ -722,6 +1374,9 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         status="SUCCEEDED",
                         match_id=match_id,
                         speech_id=speech_id,
+                        connection_epoch=envelope.connection_epoch,
+                        context_version=envelope.context_version,
+                        opportunity_id=envelope.opportunity_id,
                         asr_segment_id=segment.id,
                         started_at=completed_at - timedelta(milliseconds=completed_latency_ms),
                     )
@@ -735,27 +1390,31 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                 call.completed_at = completed_at
                 call.first_result_latency_ms = first_interim_latency_ms
                 call.completed_latency_ms = completed_latency_ms
-        if match_id is not None:
-            actor = self._actors.get(match_id)
-            if actor is not None:
-                await self._publish(
-                    actor.state,
-                    (
-                        MatchEvent(
-                            type="asr.segment_final",
-                            match_id=match_id,
-                            sequence=actor.state.sequence,
-                            server_time_ms=int(datetime.now(UTC).timestamp() * 1000),
-                            payload={
-                                "speech_id": str(speech_id),
-                                "segment_no": segment_no,
-                                "text": final_text,
-                            },
-                        ),
+        actor = self._actors.get(match_id)
+        if actor is not None:
+            await self._publish(
+                actor.state,
+                (
+                    MatchEvent(
+                        type="asr.segment_final",
+                        match_id=match_id,
+                        sequence=actor.state.sequence,
+                        server_time_ms=int(datetime.now(UTC).timestamp() * 1000),
+                        payload={
+                            "speech_id": str(speech_id),
+                            "segment_no": segment_no,
+                            "text": final_text,
+                        },
                     ),
-                )
+                ),
+            )
 
-    async def start_asr_segment(self, *, speech_id: UUID, segment_no: int, task_id: UUID) -> None:
+    async def start_asr_segment(
+        self, *, envelope: CallbackEnvelope, segment_no: int, task_id: UUID
+    ) -> None:
+        envelope.require("speech_id")
+        speech_id = envelope.speech_id
+        assert speech_id is not None
         async with self._session_factory() as session:
             async with session.begin():
                 match_id = await session.scalar(
@@ -801,7 +1460,14 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         status="STARTED",
                         match_id=match_id,
                         speech_id=speech_id,
+                        connection_epoch=envelope.connection_epoch,
+                        context_version=envelope.context_version,
+                        opportunity_id=envelope.opportunity_id,
                         asr_segment_id=segment.id,
+                        capture_version=PROVIDER_CAPTURE_VERSION,
+                        captured_at=datetime.now(UTC),
+                        source_kind="MATCH",
+                        logical_call_id=segment.id,
                         started_at=datetime.now(UTC),
                     )
                 )
@@ -809,11 +1475,14 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
     async def fail_asr_segment(
         self,
         *,
-        speech_id: UUID,
+        envelope: CallbackEnvelope,
         segment_no: int,
         task_id: UUID,
         error_code: str,
     ) -> None:
+        envelope.require("speech_id")
+        speech_id = envelope.speech_id
+        assert speech_id is not None
         async with self._session_factory() as session:
             async with session.begin():
                 segment = await session.scalar(
@@ -843,15 +1512,35 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                     call.error_code = error_code
                     call.completed_at = datetime.now(UTC)
 
+    async def persist_asr_capture(
+        self, *, envelope: CallbackEnvelope, task_id: UUID, provider_capture: ProviderCallCapture
+    ) -> None:
+        envelope.require("speech_id")
+        async with self._session_factory() as session:
+            async with session.begin():
+                call = await session.scalar(
+                    select(ExternalCall)
+                    .join(AsrSegment, AsrSegment.id == ExternalCall.asr_segment_id)
+                    .where(AsrSegment.task_id == task_id)
+                    .with_for_update()
+                )
+                if call is not None:
+                    if call.match_id != envelope.match_id or call.speech_id != envelope.speech_id:
+                        return
+                    await persist_provider_capture(session, call, provider_capture)
+
     async def start_agent_playback(
         self,
         *,
-        match_id: UUID,
-        speech_id: UUID,
-        generation_id: UUID,
+        envelope: CallbackEnvelope,
         agent_profile_id: UUID,
         audio_storage_path: str,
     ) -> object:
+        envelope.require("speech_id", "generation_id")
+        match_id = envelope.match_id
+        speech_id = envelope.speech_id
+        generation_id = envelope.generation_id
+        assert speech_id is not None and generation_id is not None
         actor = await self.get_actor(match_id)
         return await actor.submit(
             MatchCommand(
@@ -866,7 +1555,11 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             )
         )
 
-    async def finish_agent_playback(self, match_id: UUID, speech_id: UUID) -> object:
+    async def finish_agent_playback(self, *, envelope: CallbackEnvelope) -> object:
+        envelope.require("speech_id")
+        match_id = envelope.match_id
+        speech_id = envelope.speech_id
+        assert speech_id is not None
         actor = await self.get_actor(match_id)
         return await actor.submit(
             MatchCommand(
@@ -879,6 +1572,74 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
     async def finalize_agent_speech(
         self,
         *,
+        envelope: CallbackEnvelope,
+        final_text: str,
+        llm_draft_text: str,
+        audio_storage_path: str,
+        audio_duration_ms: int,
+        audio_truncated: bool,
+    ) -> object:
+        envelope.require("speech_id", "generation_id")
+        match_id = envelope.match_id
+        speech_id = envelope.speech_id
+        generation_id = envelope.generation_id
+        assert speech_id is not None and generation_id is not None
+        actor = await self.get_actor(match_id)
+        action = actor.state.current_action
+        if (
+            actor.state.free_competition_enabled
+            and action is not None
+            and action.action_kind == "FREE_DEBATE"
+            and (
+                actor.state.action_state != "AGENT_FINALIZING"
+                or actor.state.current_speech_id != speech_id
+            )
+        ):
+            await self._persist_late_experiment_agent_final(
+                match_id=match_id,
+                speech_id=speech_id,
+                generation_id=generation_id,
+                final_text=final_text,
+                llm_draft_text=llm_draft_text,
+                audio_storage_path=audio_storage_path,
+                audio_duration_ms=audio_duration_ms,
+                audio_truncated=audio_truncated,
+            )
+            return actor.view()
+        try:
+            return await self.submit(
+                match_id,
+                MatchCommand(
+                    type="agent.finalized",
+                    message_id=f"agent-finalized:{speech_id}",
+                    payload={
+                        "speech_id": str(speech_id),
+                        "generation_id": str(generation_id),
+                        "final_text": final_text,
+                        "llm_draft_text": llm_draft_text,
+                        "audio_storage_path": audio_storage_path,
+                        "audio_duration_ms": audio_duration_ms,
+                        "audio_truncated": audio_truncated,
+                    },
+                ),
+            )
+        except MatchDomainError as error:
+            if str(error) not in {"stale_callback", "match_state_conflict"}:
+                raise
+            logger.info(
+                "late Agent finalization ignored",
+                extra={
+                    "error_code": "agent_finalization_stale",
+                    "match_id": str(match_id),
+                    "speech_id": str(speech_id),
+                    "generation_id": str(generation_id),
+                },
+            )
+            return actor.view()
+
+    async def _persist_late_experiment_agent_final(
+        self,
+        *,
         match_id: UUID,
         speech_id: UUID,
         generation_id: UUID,
@@ -887,27 +1648,90 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         audio_storage_path: str,
         audio_duration_ms: int,
         audio_truncated: bool,
-    ) -> object:
-        return await self.submit(
-            match_id,
-            MatchCommand(
-                type="agent.finalized",
-                message_id=f"agent-finalized:{speech_id}",
-                payload={
-                    "speech_id": str(speech_id),
-                    "generation_id": str(generation_id),
-                    "final_text": final_text,
-                    "llm_draft_text": llm_draft_text,
-                    "audio_storage_path": audio_storage_path,
-                    "audio_duration_ms": audio_duration_ms,
-                    "audio_truncated": audio_truncated,
-                },
-            ),
-        )
-
-    async def handle_agent_failure(
-        self, match_id: UUID, generation_id: UUID | None, error_code: str
     ) -> None:
+        async with self._session_factory() as session:
+            async with session.begin():
+                speech = await session.get(Speech, speech_id, with_for_update=True)
+                if (
+                    speech is None
+                    or speech.match_id != match_id
+                    or speech.generation_id != generation_id
+                ):
+                    return
+                if speech.status == "FINALIZED":
+                    return
+                finalized_at = datetime.now(UTC)
+                speech.status = "FINALIZED"
+                speech.display_text = final_text
+                speech.llm_draft_text = llm_draft_text
+                speech.audio_storage_path = audio_storage_path
+                speech.audio_duration_ms = audio_duration_ms
+                speech.audio_truncated = audio_truncated
+                speech.finalized_at = finalized_at
+                speech.ended_at = speech.ended_at or finalized_at
+                if speech.opportunity_id is not None:
+                    allocated = await session.get(
+                        FreeDebateOpportunity,
+                        speech.opportunity_id,
+                        with_for_update=True,
+                    )
+                    if allocated is not None:
+                        allocated.status = "COMPLETED"
+                        allocated.execution_fact = "AI_SPOKE"
+                        allocated.completed_at = finalized_at
+                source_opportunities = list(
+                    (
+                        await session.scalars(
+                            select(FreeDebateOpportunity)
+                            .where(
+                                FreeDebateOpportunity.match_id == match_id,
+                                FreeDebateOpportunity.status == "ACTIVE",
+                            )
+                            .with_for_update()
+                        )
+                    ).all()
+                )
+                source = next(
+                    (
+                        item
+                        for item in source_opportunities
+                        if str(item.frozen_context.get("source_speech_id")) == str(speech_id)
+                    ),
+                    None,
+                )
+                if source is not None:
+                    source.source_speech_id = speech_id
+                    source.source_ended_at = speech.ended_at
+                match = await session.get(Match, match_id, with_for_update=True)
+                if match is not None:
+                    match.context_version += 1
+                existing_file = await session.scalar(
+                    select(MatchFile.id).where(
+                        MatchFile.match_id == match_id,
+                        MatchFile.file_key == f"agent-{speech.id}",
+                    )
+                )
+                if existing_file is None:
+                    session.add(
+                        MatchFile(
+                            match_id=match_id,
+                            speech_id=speech.id,
+                            owner_user_id=None,
+                            file_key=f"agent-{speech.id}",
+                            file_kind="AGENT_RAW",
+                            status="READY" if audio_storage_path else "FAILED",
+                            storage_path=audio_storage_path or None,
+                            codec="ogg_opus" if audio_storage_path else None,
+                            byte_count=_file_size(audio_storage_path),
+                            duration_ms=audio_duration_ms,
+                            expires_at=datetime.now(UTC) + timedelta(days=30),
+                            error_code=None if audio_storage_path else "agent_audio_missing",
+                        )
+                    )
+
+    async def handle_agent_failure(self, *, envelope: CallbackEnvelope, error_code: str) -> None:
+        match_id = envelope.match_id
+        generation_id = envelope.generation_id
         actor = await self.get_actor(match_id)
         state = actor.state
         if state.status != "RUNNING" or state.action_state not in {
@@ -949,8 +1773,7 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
     async def finalize_asr_speech(
         self,
         *,
-        match_id: UUID,
-        speech_id: UUID,
+        envelope: CallbackEnvelope,
         final_text: str,
         first_interim_latency_ms: int | None,
         final_latency_ms: int,
@@ -958,6 +1781,38 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         audio_storage_path: str | None,
         audio_recording_error: str | None,
     ) -> MatchCommandResult:
+        envelope.require("speech_id")
+        match_id = envelope.match_id
+        speech_id = envelope.speech_id
+        assert speech_id is not None
+        actor = await self.get_actor(match_id)
+        if not await self._asr_callback_is_current(actor=actor, envelope=envelope):
+            return MatchCommandResult(state=actor.state, events=())
+        action = actor.state.current_action
+        if (
+            actor.state.free_competition_enabled
+            and action is not None
+            and action.action_kind == "FREE_DEBATE"
+        ):
+            await self._start_current_experiment_decision(
+                match_id=match_id, source_speech_id=speech_id
+            )
+            if (
+                actor.state.action_state != "SPEECH_FINALIZING"
+                or actor.state.current_speech_id != speech_id
+            ):
+                await self._persist_late_experiment_asr(
+                    match_id=match_id,
+                    speech_id=speech_id,
+                    final_text=final_text,
+                    first_interim_latency_ms=first_interim_latency_ms,
+                    final_latency_ms=final_latency_ms,
+                    audio_duration_ms=audio_duration_ms,
+                    audio_storage_path=audio_storage_path,
+                    audio_recording_error=audio_recording_error,
+                )
+                await self._start_late_asr_decision(match_id=match_id, source_speech_id=speech_id)
+                return MatchCommandResult(state=actor.state, events=())
         return await self.submit(
             match_id,
             MatchCommand(
@@ -975,7 +1830,200 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             ),
         )
 
-    async def handle_asr_failure(self, match_id: UUID, speech_id: UUID, code: str) -> None:
+    async def _persist_late_experiment_asr(
+        self,
+        *,
+        match_id: UUID,
+        speech_id: UUID,
+        final_text: str,
+        first_interim_latency_ms: int | None,
+        final_latency_ms: int,
+        audio_duration_ms: int,
+        audio_storage_path: str | None,
+        audio_recording_error: str | None,
+    ) -> None:
+        async with self._session_factory() as session:
+            async with session.begin():
+                speech = await session.get(Speech, speech_id, with_for_update=True)
+                if speech is None or speech.match_id != match_id:
+                    return
+                if speech.status not in {"STARTED", "FINALIZING"}:
+                    return
+                speech.status = "FINALIZED"
+                speech.finalized_at = datetime.now(UTC)
+                speech.ended_at = speech.ended_at or speech.finalized_at
+                speech.asr_raw_final_text = final_text
+                speech.display_text = final_text
+                speech.first_interim_latency_ms = first_interim_latency_ms
+                speech.final_latency_ms = final_latency_ms
+                speech.audio_duration_ms = audio_duration_ms
+                speech.audio_storage_path = audio_storage_path
+                if speech.opportunity_id is not None:
+                    allocated_opportunity = await session.get(
+                        FreeDebateOpportunity,
+                        speech.opportunity_id,
+                        with_for_update=True,
+                    )
+                    if allocated_opportunity is not None:
+                        allocated_opportunity.status = "COMPLETED"
+                        allocated_opportunity.execution_fact = "HUMAN_SPOKE"
+                        allocated_opportunity.completed_at = speech.finalized_at
+                source_opportunities = list(
+                    (
+                        await session.scalars(
+                            select(FreeDebateOpportunity)
+                            .where(
+                                FreeDebateOpportunity.match_id == match_id,
+                                FreeDebateOpportunity.status == "ACTIVE",
+                            )
+                            .with_for_update()
+                        )
+                    ).all()
+                )
+                source_opportunity = next(
+                    (
+                        item
+                        for item in source_opportunities
+                        if str(item.frozen_context.get("source_speech_id")) == str(speech_id)
+                    ),
+                    None,
+                )
+                if source_opportunity is not None:
+                    source_opportunity.source_speech_id = speech_id
+                    source_opportunity.source_ended_at = speech.ended_at
+                match = await session.get(Match, match_id, with_for_update=True)
+                if match is not None:
+                    match.context_version += 1
+                existing_file = await session.scalar(
+                    select(MatchFile.id).where(
+                        MatchFile.match_id == match_id,
+                        MatchFile.file_key == f"human-{speech.id}",
+                    )
+                )
+                if existing_file is None:
+                    session.add(
+                        MatchFile(
+                            match_id=match_id,
+                            speech_id=speech.id,
+                            owner_user_id=speech.user_id,
+                            file_key=f"human-{speech.id}",
+                            file_kind="HUMAN_RAW",
+                            status="READY" if audio_storage_path else "FAILED",
+                            storage_path=audio_storage_path,
+                            codec=("pcm_s16le_16000_mono" if audio_storage_path else None),
+                            byte_count=_file_size(audio_storage_path),
+                            duration_ms=audio_duration_ms,
+                            expires_at=datetime.now(UTC) + timedelta(days=30),
+                            error_code=audio_recording_error,
+                        )
+                    )
+
+    async def _start_late_asr_decision(self, *, match_id: UUID, source_speech_id: UUID) -> None:
+        actor = self._actors.get(match_id)
+        if actor is None or not actor.state.free_competition_enabled:
+            return
+        state = actor.state
+        action = state.current_action
+        if action is None or action.action_kind != "FREE_DEBATE":
+            return
+        round_id = uuid4()
+        async with self._session_factory() as session:
+            async with session.begin():
+                opportunities = list(
+                    (
+                        await session.scalars(
+                            select(FreeDebateOpportunity)
+                            .where(
+                                FreeDebateOpportunity.match_id == match_id,
+                                FreeDebateOpportunity.status == "ACTIVE",
+                            )
+                            .with_for_update()
+                        )
+                    ).all()
+                )
+                opportunity = next(
+                    (
+                        item
+                        for item in opportunities
+                        if str(item.frozen_context.get("source_speech_id")) == str(source_speech_id)
+                    ),
+                    None,
+                )
+                match = await session.get(Match, match_id)
+                if opportunity is None or match is None:
+                    return
+                side = opportunity.side
+                agents = tuple(
+                    item
+                    for item in action.participants
+                    if item.side == side and item.agent_profile_id is not None
+                )
+                if state.experiment_mode and not state.formal_4v4:
+                    agents = agents[:1]
+                if not agents:
+                    return
+                existing = await session.scalar(
+                    select(AgentFreeDebateDecision.id).where(
+                        AgentFreeDebateDecision.opportunity_id == opportunity.id
+                    )
+                )
+                if existing is not None:
+                    return
+                for agent in agents:
+                    assert agent.agent_profile_id is not None
+                    session.add(
+                        AgentFreeDebateDecision(
+                            match_id=match_id,
+                            action_key=action.action_key,
+                            decision_round_id=round_id,
+                            context_version=match.context_version,
+                            agent_profile_id=agent.agent_profile_id,
+                            side=side,
+                            seat_no=agent.seat_no,
+                            status="DECIDING",
+                            opportunity_id=opportunity.id,
+                            deadline_at=opportunity.selection_deadline_at,
+                            trigger_kind=opportunity.trigger_kind,
+                            effective_status="TECHNICAL_MISSING",
+                            late=True,
+                            error_code="ASR_LATE",
+                            started_at=datetime.now(UTC),
+                        )
+                    )
+                opportunity.decision_fact = "TECHNICAL_MISSING"
+        self._late_experiment_rounds.add(round_id)
+        if self._agent_runtime is not None:
+            decision_envelope = CallbackEnvelope(
+                match_id=match_id,
+                speech_id=source_speech_id,
+                attempt_no=1,
+                generation_id=None,
+                connection_epoch=None,
+                context_version=match.context_version,
+                opportunity_id=opportunity.id,
+                opportunity_generation=opportunity.opportunity_generation,
+            )
+            self._spawn(
+                self._agent_runtime.decide_free_debate(
+                    match_id=match_id,
+                    action_key=action.action_key,
+                    side=side,
+                    agent_profile_ids=[
+                        agent.agent_profile_id
+                        for agent in agents
+                        if agent.agent_profile_id is not None
+                    ],
+                    decision_round_id=round_id,
+                    envelope=decision_envelope,
+                ),
+                name=f"late-asr-decision-{match_id}-{round_id}",
+            )
+
+    async def handle_asr_failure(self, *, envelope: CallbackEnvelope, code: str) -> None:
+        envelope.require("speech_id")
+        match_id = envelope.match_id
+        speech_id = envelope.speech_id
+        assert speech_id is not None
         actor = await self.get_actor(match_id)
         if (
             actor.state.status != "RUNNING"
@@ -983,6 +2031,19 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             or actor.state.action_state not in {"HUMAN_SPEAKING", "SPEECH_FINALIZING"}
         ):
             return
+        action = actor.state.current_action
+        late_free_finalizing = (
+            actor.state.action_state == "SPEECH_FINALIZING"
+            and actor.state.free_competition_enabled
+            and action is not None
+            and action.action_kind == "FREE_DEBATE"
+        )
+        speaker_id = actor.state.current_speaker_user_id
+        if speaker_id is not None and speaker_id in dict(actor.state.offline_since_ms):
+            return
+        if not await self._asr_callback_is_current(actor=actor, envelope=envelope):
+            return
+        failure_class = classify_asr_error(code)
         async with self._session_factory() as session:
             async with session.begin():
                 speech = await session.get(Speech, speech_id, with_for_update=True)
@@ -991,16 +2052,33 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                 speech.status = "FAILED"
                 speech.asr_error_code = code
                 speech.ended_at = datetime.now(UTC)
-                failures = await session.scalar(
+                failure_query = (
                     select(func.count())
                     .select_from(Speech)
                     .where(
                         Speech.match_id == match_id,
-                        Speech.action_key == speech.action_key,
                         Speech.status == "FAILED",
                     )
                 )
-        if int(failures or 0) < 2:
+                if speech.opportunity_id is not None:
+                    failure_query = failure_query.where(
+                        Speech.opportunity_id == speech.opportunity_id
+                    )
+                else:
+                    failure_query = failure_query.where(Speech.action_key == speech.action_key)
+                failures = await session.scalar(failure_query)
+        # In competitive free debate the next-speaker window opens while ASR
+        # drains.  A provider close error can race a buffered final result.
+        # Keep the failed attempt for diagnostics, but never reset the Actor
+        # after speech.finish has already been accepted: that would erase the
+        # speech identity and ask the same human to speak again.  The existing
+        # bounded selection window continues the match, and a genuinely late
+        # final result is persisted by the late-finalization path.
+        if late_free_finalizing:
+            return
+        # Configuration/protocol failures cannot be repaired by replaying the
+        # same request.  Surface them immediately for operator recovery.
+        if failure_class != "CONFIG" and int(failures or 0) < 2:
             await actor.submit(
                 MatchCommand(
                     type="speech.reset",
@@ -1017,7 +2095,11 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         match_id=match_id,
                         sequence=actor.state.sequence,
                         server_time_ms=int(datetime.now(UTC).timestamp() * 1000),
-                        payload={"speech_id": str(speech_id), "error_code": code},
+                        payload={
+                            "speech_id": str(speech_id),
+                            "error_code": code,
+                            "asr_failure_class": failure_class,
+                        },
                     ),
                 ),
             )
@@ -1026,7 +2108,77 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             MatchCommand(
                 type="system.error",
                 message_id=f"asr-error:{speech_id}",
-                payload={"error_code": code},
+                payload={
+                    "error_code": code,
+                    "asr_failure": True,
+                    "asr_failure_class": failure_class,
+                },
+            )
+        )
+
+    async def _persist_started_speech(
+        self,
+        session: AsyncSession,
+        candidate: MatchRuntimeState,
+        event: MatchEvent,
+    ) -> None:
+        speech_id = event.payload.get("speech_id")
+        current = candidate.current_action
+        if (
+            speech_id is None
+            or current is None
+            or not (
+                current.speaker_user_id is not None
+                or current.agent_profile_id is not None
+                or candidate.current_speaker_user_id is not None
+                or candidate.current_agent_profile_id is not None
+            )
+        ):
+            return
+        previous_query = select(func.coalesce(func.max(Speech.attempt_no), 0)).where(
+            Speech.match_id == candidate.match_id,
+            Speech.action_key == current.action_key,
+        )
+        opportunity_id = event.payload.get("opportunity_id")
+        if opportunity_id:
+            previous_query = previous_query.where(
+                Speech.opportunity_id == UUID(str(opportunity_id))
+            )
+        previous_attempt = await session.scalar(previous_query)
+        existing_speech = await session.get(Speech, UUID(str(speech_id)), with_for_update=True)
+        if existing_speech is not None:
+            existing_speech.status = "STARTED"
+            existing_speech.ended_at = None
+            existing_speech.finalized_at = None
+            return
+        session.add(
+            Speech(
+                id=UUID(str(speech_id)),
+                match_id=candidate.match_id,
+                opportunity_id=(
+                    _required_uuid(event.payload["opportunity_id"])
+                    if candidate.free_competition_enabled and event.payload.get("opportunity_id")
+                    else None
+                ),
+                action_key=current.action_key,
+                user_id=candidate.current_speaker_user_id,
+                side=candidate.current_speaker_side or current.side or "AFFIRMATIVE",
+                seat_no=candidate.current_speaker_seat_no or current.seat_no or 1,
+                speaker_kind=(
+                    "AGENT" if candidate.current_agent_profile_id is not None else "HUMAN"
+                ),
+                agent_profile_id=candidate.current_agent_profile_id,
+                generation_id=(
+                    _required_uuid(event.payload["generation_id"])
+                    if event.payload.get("generation_id")
+                    else None
+                ),
+                audio_storage_path=(
+                    str(event.payload["audio_storage_path"])
+                    if event.payload.get("audio_storage_path")
+                    else None
+                ),
+                attempt_no=int(previous_attempt or 0) + 1,
             )
         )
 
@@ -1072,6 +2224,33 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         )
                     )
                     if candidate.status == "FINISHED":
+                        room = await session.get(Room, match.room_id)
+                        snapshot = room.format_snapshot if room is not None else None
+                        if (
+                            candidate.experiment_attempt_id is None
+                            and isinstance(snapshot, dict)
+                            and bool(snapshot.get("postmatch_questionnaire_enabled"))
+                        ):
+                            participants = list(
+                                (
+                                    await session.scalars(
+                                        select(MatchParticipant).where(
+                                            MatchParticipant.match_id == candidate.match_id,
+                                            MatchParticipant.kind == "HUMAN",
+                                            MatchParticipant.user_id.is_not(None),
+                                        )
+                                    )
+                                ).all()
+                            )
+                            for participant in participants:
+                                if participant.user_id is not None:
+                                    session.add(
+                                        PostmatchSurveyTask(
+                                            match_id=candidate.match_id,
+                                            user_id=participant.user_id,
+                                            questionnaire_version=POSTMATCH_QUESTIONNAIRE_VERSION,
+                                        )
+                                    )
                         human_count = await session.scalar(
                             select(func.count())
                             .select_from(MatchParticipant)
@@ -1091,6 +2270,42 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                                     max_attempts=2,
                                 )
                             )
+                if (
+                    candidate.free_competition_enabled
+                    and candidate.experiment_attempt_id is not None
+                ):
+                    experiment_attempt = await session.get(
+                        ExperimentMatchAttempt,
+                        candidate.experiment_attempt_id,
+                        with_for_update=True,
+                    )
+                    if experiment_attempt is None:
+                        raise MatchDomainError("match_state_conflict")
+                    scheduled_experiment = await session.get(
+                        ScheduledMatch,
+                        experiment_attempt.scheduled_match_id,
+                        with_for_update=True,
+                    )
+                    if scheduled_experiment is None:
+                        raise MatchDomainError("match_state_conflict")
+                    if candidate.status == "FINISHED":
+                        experiment_attempt.status = "COMPLETED"
+                        experiment_attempt.ended_at = datetime.now(UTC)
+                        scheduled_experiment.status = "COMPLETED"
+                        scheduled_experiment.effective_attempt_id = experiment_attempt.id
+                    elif candidate.status == "TERMINATED":
+                        experiment_attempt.status = "TERMINATED"
+                        experiment_attempt.termination_reason = str(
+                            command.payload.get("reason", "管理员终止")
+                        )
+                        experiment_attempt.ended_at = datetime.now(UTC)
+                        scheduled_experiment.status = "INCOMPLETE"
+                    elif candidate.status in {"PAUSED", "SYSTEM_RECOVERY", "ERROR"}:
+                        experiment_attempt.status = "PAUSED"
+                        scheduled_experiment.status = "PAUSED"
+                    elif candidate.status in {"START_COUNTDOWN", "RUNNING"}:
+                        experiment_attempt.status = "RUNNING"
+                        scheduled_experiment.status = "RUNNING"
                 room = await session.get(Room, match.room_id, with_for_update=True)
                 if room is not None:
                     room.status = (
@@ -1104,6 +2319,23 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         if candidate.status == "TERMINATED"
                         else room.status
                     )
+                referenced_speech_ids = {
+                    _required_uuid(event.payload["source_speech_id"])
+                    for event in events
+                    if event.type == "free.opportunity_opened"
+                    and event.payload.get("source_speech_id")
+                }
+                for event in events:
+                    speech_id = event.payload.get("speech_id")
+                    if (
+                        event.type in ("speech.started", "agent.playback_started")
+                        and speech_id
+                        and UUID(str(speech_id)) in referenced_speech_ids
+                    ):
+                        await self._persist_started_speech(session, candidate, event)
+                        # The next opportunity references this speech.  Persist
+                        # the parent before any later query can autoflush that FK.
+                        await session.flush()
                 for event in events:
                     session.add(
                         MatchEventRow(
@@ -1113,8 +2345,142 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                             payload=dict(event.payload),
                         )
                     )
-                    if event.type == "agent.decision_started":
-                        decision_round_id = UUID(str(event.payload["decision_round_id"]))
+                    if (
+                        event.type == "free.opportunity_invalidated"
+                        and candidate.free_competition_enabled
+                    ):
+                        opportunity = await session.get(
+                            FreeDebateOpportunity,
+                            _required_uuid(event.payload["opportunity_id"]),
+                            with_for_update=True,
+                        )
+                        if opportunity is not None:
+                            opportunity.status = "INVALIDATED"
+                            opportunity.invalidated_reason = str(event.payload["reason"])
+                            opportunity.completed_at = datetime.fromtimestamp(
+                                event.server_time_ms / 1000, UTC
+                            )
+                            decisions = list(
+                                (
+                                    await session.scalars(
+                                        select(AgentFreeDebateDecision)
+                                        .where(
+                                            AgentFreeDebateDecision.opportunity_id == opportunity.id
+                                        )
+                                        .with_for_update()
+                                    )
+                                ).all()
+                            )
+                            for decision in decisions:
+                                decision.stale = True
+                                decision.invalidated_reason = str(event.payload["reason"])
+                                decision.effective_status = "TECHNICAL_MISSING"
+                    elif (
+                        event.type == "free.opportunity_opened"
+                        and candidate.free_competition_enabled
+                    ):
+                        opportunity_id = _required_uuid(event.payload["opportunity_id"])
+                        existing = await session.get(
+                            FreeDebateOpportunity, opportunity_id, with_for_update=True
+                        )
+                        if existing is None:
+                            session.add(
+                                FreeDebateOpportunity(
+                                    id=opportunity_id,
+                                    match_id=candidate.match_id,
+                                    experiment_attempt_id=candidate.experiment_attempt_id,
+                                    sequence_no=int(event.payload["opportunity_generation"]),
+                                    side=str(event.payload["side"]),
+                                    trigger_kind=str(event.payload["trigger_kind"]),
+                                    source_speech_id=(
+                                        _required_uuid(event.payload["source_speech_id"])
+                                        if event.payload.get("source_speech_id")
+                                        else None
+                                    ),
+                                    context_version=match.context_version,
+                                    opportunity_generation=int(
+                                        event.payload["opportunity_generation"]
+                                    ),
+                                    selection_phase="COMPETING",
+                                    decision_fact="PENDING",
+                                    allocation_fact="PENDING",
+                                    frozen_context={
+                                        "action_key": str(event.payload["action_key"]),
+                                        "side": str(event.payload["side"]),
+                                        "source_speech_id": (
+                                            str(event.payload["source_speech_id"])
+                                            if event.payload.get("source_speech_id")
+                                            else None
+                                        ),
+                                        "affirmative_remaining_ms": (
+                                            candidate.free_affirmative_remaining_ms
+                                        ),
+                                        "negative_remaining_ms": (
+                                            candidate.free_negative_remaining_ms
+                                        ),
+                                    },
+                                    opened_at=datetime.fromtimestamp(
+                                        event.server_time_ms / 1000, UTC
+                                    ),
+                                )
+                            )
+                    elif event.type == "agent.decision_started":
+                        decision_round_id = _required_uuid(event.payload["decision_round_id"])
+                        opportunity_id = (
+                            _required_uuid(event.payload["opportunity_id"])
+                            if event.payload.get("opportunity_id")
+                            else None
+                        )
+                        if candidate.free_competition_enabled:
+                            if opportunity_id is None:
+                                raise MatchDomainError("match_state_conflict")
+                            opportunity = await session.get(
+                                FreeDebateOpportunity, opportunity_id, with_for_update=True
+                            )
+                            if opportunity is None:
+                                opportunity = FreeDebateOpportunity(
+                                    id=opportunity_id,
+                                    match_id=candidate.match_id,
+                                    experiment_attempt_id=candidate.experiment_attempt_id,
+                                    sequence_no=int(event.payload["opportunity_generation"]),
+                                    side=str(event.payload["side"]),
+                                    trigger_kind=str(event.payload["trigger_kind"]),
+                                    source_speech_id=(
+                                        _required_uuid(event.payload["source_speech_id"])
+                                        if event.payload.get("source_speech_id")
+                                        else None
+                                    ),
+                                    context_version=match.context_version,
+                                    opportunity_generation=int(
+                                        event.payload["opportunity_generation"]
+                                    ),
+                                    selection_phase="COMPETING",
+                                    decision_fact="PENDING",
+                                    allocation_fact="PENDING",
+                                    frozen_context={
+                                        "action_key": str(event.payload["action_key"]),
+                                        "side": str(event.payload["side"]),
+                                        "affirmative_remaining_ms": (
+                                            candidate.free_affirmative_remaining_ms
+                                        ),
+                                        "negative_remaining_ms": (
+                                            candidate.free_negative_remaining_ms
+                                        ),
+                                    },
+                                    opened_at=datetime.fromtimestamp(
+                                        event.server_time_ms / 1000, UTC
+                                    ),
+                                    selection_deadline_at=datetime.fromtimestamp(
+                                        event.server_time_ms / 1000, UTC
+                                    )
+                                    + timedelta(seconds=3),
+                                )
+                                session.add(opportunity)
+                                # The decision rows reference this opportunity by
+                                # foreign key.  Flush the parent explicitly before
+                                # adding children so SQLAlchemy cannot order the
+                                # inserts in the opposite direction.
+                                await session.flush()
                         for raw_agent in event.payload.get("agents", []):
                             session.add(
                                 AgentFreeDebateDecision(
@@ -1126,6 +2492,22 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                                     side=str(event.payload["side"]),
                                     seat_no=int(raw_agent["seat_no"]),
                                     status="DECIDING",
+                                    opportunity_id=opportunity_id,
+                                    deadline_at=(
+                                        datetime.fromtimestamp(event.server_time_ms / 1000, UTC)
+                                        + timedelta(seconds=3)
+                                        if candidate.free_competition_enabled
+                                        and candidate.selection_deadline_mono is not None
+                                        else None
+                                    ),
+                                    trigger_kind=(
+                                        str(event.payload["trigger_kind"])
+                                        if candidate.free_competition_enabled
+                                        else None
+                                    ),
+                                    effective_status=(
+                                        "PENDING" if candidate.free_competition_enabled else None
+                                    ),
                                     started_at=datetime.fromtimestamp(
                                         event.server_time_ms / 1000, UTC
                                     ),
@@ -1137,9 +2519,9 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                             .where(
                                 AgentFreeDebateDecision.match_id == candidate.match_id,
                                 AgentFreeDebateDecision.decision_round_id
-                                == UUID(str(event.payload["decision_round_id"])),
+                                == _required_uuid(event.payload["decision_round_id"]),
                                 AgentFreeDebateDecision.agent_profile_id
-                                == UUID(str(event.payload["agent_profile_id"])),
+                                == _required_uuid(event.payload["agent_profile_id"]),
                             )
                             .with_for_update()
                         )
@@ -1147,6 +2529,7 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                             raise MatchDomainError("match_state_conflict")
                         decision.status = str(event.payload["status"])
                         decision.should_speak = event.payload.get("should_speak")
+                        decision.decision_reason = event.payload.get("decision_reason")
                         decision.willingness = event.payload.get("willingness")
                         decision.attempt_no = int(event.payload.get("attempt_no", 1))
                         decision.duration_ms = int(event.payload.get("duration_ms", 0))
@@ -1162,27 +2545,219 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         decision.completed_at = datetime.fromtimestamp(
                             event.server_time_ms / 1000, UTC
                         )
-                    elif event.type == "free.selection_locked":
-                        decision_round_id = UUID(str(event.payload["decision_round_id"]))
-                        decision_rows = list(
-                            (
-                                await session.scalars(
-                                    select(AgentFreeDebateDecision)
-                                    .where(
-                                        AgentFreeDebateDecision.match_id == candidate.match_id,
-                                        AgentFreeDebateDecision.decision_round_id
-                                        == decision_round_id,
-                                    )
-                                    .with_for_update()
+                        if candidate.free_competition_enabled:
+                            decision.effective_status = (
+                                "TECHNICAL_MISSING"
+                                if bool(event.payload.get("failed"))
+                                else "RAISE"
+                                if bool(event.payload.get("should_speak"))
+                                else "SKIP"
+                            )
+                            if decision.opportunity_id is not None:
+                                opportunity = await session.get(
+                                    FreeDebateOpportunity,
+                                    decision.opportunity_id,
+                                    with_for_update=True,
                                 )
-                            ).all()
+                                if opportunity is not None:
+                                    opportunity.decision_fact = cast(str, decision.effective_status)
+                    elif (
+                        event.type in {"hand.raised", "hand.cancelled"}
+                        and candidate.free_competition_enabled
+                    ):
+                        opportunity_value = event.payload.get("opportunity_id")
+                        if opportunity_value and command.actor_user_id is not None:
+                            session.add(
+                                HumanHandEvent(
+                                    opportunity_id=UUID(str(opportunity_value)),
+                                    user_id=command.actor_user_id,
+                                    event_type=(
+                                        "RAISE" if event.type == "hand.raised" else "CANCEL"
+                                    ),
+                                    server_sequence=event.sequence,
+                                    connection_epoch=(
+                                        int(event.payload["connection_epoch"])
+                                        if event.payload.get("connection_epoch") is not None
+                                        else None
+                                    ),
+                                    accepted_at=datetime.fromtimestamp(
+                                        event.server_time_ms / 1000, UTC
+                                    ),
+                                )
+                            )
+                    elif (
+                        event.type == "hand.window_opened"
+                        and candidate.free_competition_enabled
+                        and event.payload.get("duration_ms") == 3000
+                        and candidate.opportunity_id is not None
+                    ):
+                        opportunity = await session.get(
+                            FreeDebateOpportunity,
+                            candidate.opportunity_id,
+                            with_for_update=True,
                         )
+                        if opportunity is not None:
+                            deadline = datetime.fromtimestamp(
+                                event.server_time_ms / 1000, UTC
+                            ) + timedelta(seconds=3)
+                            opportunity.source_ended_at = datetime.fromtimestamp(
+                                event.server_time_ms / 1000, UTC
+                            )
+                            opportunity.selection_deadline_at = deadline
+                            decision_rows = list(
+                                (
+                                    await session.scalars(
+                                        select(AgentFreeDebateDecision)
+                                        .where(
+                                            AgentFreeDebateDecision.opportunity_id == opportunity.id
+                                        )
+                                        .with_for_update()
+                                    )
+                                ).all()
+                            )
+                            for decision_row in decision_rows:
+                                decision_row.deadline_at = deadline
+                    elif event.type == "hand.window_closed" and candidate.free_competition_enabled:
+                        if candidate.opportunity_id is not None:
+                            pending_decisions = list(
+                                (
+                                    await session.scalars(
+                                        select(AgentFreeDebateDecision)
+                                        .where(
+                                            AgentFreeDebateDecision.opportunity_id
+                                            == candidate.opportunity_id,
+                                            AgentFreeDebateDecision.status == "DECIDING",
+                                        )
+                                        .with_for_update()
+                                    )
+                                ).all()
+                            )
+                            for pending in pending_decisions:
+                                pending.status = "SKIP"
+                                pending.error_code = "DECISION_DEADLINE_EXCEEDED"
+                                pending.effective_status = "TECHNICAL_MISSING"
+                                pending.completed_at = datetime.fromtimestamp(
+                                    event.server_time_ms / 1000, UTC
+                                )
+                    elif (
+                        event.type == "free.human_wait_started"
+                        and candidate.free_competition_enabled
+                    ):
+                        opportunity = await session.get(
+                            FreeDebateOpportunity,
+                            _required_uuid(event.payload["opportunity_id"]),
+                            with_for_update=True,
+                        )
+                        if opportunity is not None:
+                            opportunity.selection_phase = "HUMAN_ONLY_WAIT"
+                            opportunity.decision_fact = (
+                                "TECHNICAL_MISSING"
+                                if event.payload.get("decision_fact") == "TECHNICAL_MISSING"
+                                else "SKIP"
+                            )
+                            opportunity.allocation_fact = "WAITING_FOR_HUMAN"
+                            opportunity.human_wait_deadline_at = datetime.fromtimestamp(
+                                event.server_time_ms / 1000, UTC
+                            ) + timedelta(seconds=60)
+                    elif (
+                        event.type == "match.paused"
+                        and candidate.free_competition_enabled
+                        and event.payload.get("reason") == "HUMAN_WAIT_TIMEOUT"
+                        and event.payload.get("opportunity_id")
+                    ):
+                        opportunity = await session.get(
+                            FreeDebateOpportunity,
+                            _required_uuid(event.payload["opportunity_id"]),
+                            with_for_update=True,
+                        )
+                        if opportunity is not None:
+                            opportunity.allocation_fact = "PAUSED_WITHOUT_SPEAKER"
+                            opportunity.execution_fact = "NO_SPEECH"
+                    elif (
+                        event.type in {"speech.finished", "agent.finalized"}
+                        and candidate.free_competition_enabled
+                        and event.payload.get("opportunity_id")
+                    ):
+                        opportunity = await session.get(
+                            FreeDebateOpportunity,
+                            _required_uuid(event.payload["opportunity_id"]),
+                            with_for_update=True,
+                        )
+                        if opportunity is not None:
+                            opportunity.status = "COMPLETED"
+                            opportunity.execution_fact = (
+                                "AI_SPOKE" if event.type == "agent.finalized" else "HUMAN_SPOKE"
+                            )
+                            opportunity.completed_at = datetime.fromtimestamp(
+                                event.server_time_ms / 1000, UTC
+                            )
+                        if (
+                            candidate.opportunity_id is not None
+                            and candidate.opportunity_id
+                            != _required_uuid(event.payload["opportunity_id"])
+                            and event.payload.get("speech_id")
+                        ):
+                            source_opportunity = await session.get(
+                                FreeDebateOpportunity,
+                                candidate.opportunity_id,
+                                with_for_update=True,
+                            )
+                            if source_opportunity is not None:
+                                source_opportunity.source_speech_id = UUID(
+                                    str(event.payload["speech_id"])
+                                )
+                                source_ended_at = datetime.fromtimestamp(
+                                    event.server_time_ms / 1000, UTC
+                                )
+                                source_opportunity.source_ended_at = source_ended_at
+                                source_opportunity.selection_deadline_at = (
+                                    source_ended_at + timedelta(seconds=3)
+                                )
+                                decision_rows = list(
+                                    (
+                                        await session.scalars(
+                                            select(AgentFreeDebateDecision)
+                                            .where(
+                                                AgentFreeDebateDecision.opportunity_id
+                                                == source_opportunity.id
+                                            )
+                                            .with_for_update()
+                                        )
+                                    ).all()
+                                )
+                                for decision_row in decision_rows:
+                                    decision_row.deadline_at = (
+                                        source_opportunity.selection_deadline_at
+                                    )
+                    elif event.type == "free.selection_locked":
+                        # Human-priority selection can happen while no agent
+                        # decision round exists.  In that path the domain
+                        # intentionally omits decision_round_id; do not turn
+                        # the otherwise valid hand raise into a 500.
+                        decision_round_value = event.payload.get("decision_round_id")
+                        if decision_round_value:
+                            decision_round_id = UUID(str(decision_round_value))
+                            decision_rows = list(
+                                (
+                                    await session.scalars(
+                                        select(AgentFreeDebateDecision)
+                                        .where(
+                                            AgentFreeDebateDecision.match_id == candidate.match_id,
+                                            AgentFreeDebateDecision.decision_round_id
+                                            == decision_round_id,
+                                        )
+                                        .with_for_update()
+                                    )
+                                ).all()
+                            )
+                        else:
+                            decision_rows = []
                         agent_ranks = {
                             agent_id: len(candidate.hand_queue) + index + 1
                             for index, agent_id in enumerate(candidate.agent_hand_queue)
                         }
                         selected_agent_id = (
-                            UUID(str(event.payload["agent_profile_id"]))
+                            _required_uuid(event.payload["agent_profile_id"])
                             if event.payload.get("agent_profile_id")
                             else None
                         )
@@ -1197,65 +2772,49 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                                 decision.selected
                                 and event.payload.get("agent_selection_mode") == "FALLBACK"
                             )
+                        if candidate.free_competition_enabled and event.payload.get(
+                            "opportunity_id"
+                        ):
+                            opportunity_id = _required_uuid(event.payload["opportunity_id"])
+                            opportunity = await session.get(
+                                FreeDebateOpportunity, opportunity_id, with_for_update=True
+                            )
+                            if opportunity is None:
+                                raise MatchDomainError("match_state_conflict")
+                            speaker_kind = str(event.payload["speaker_kind"])
+                            opportunity.selection_phase = "ALLOCATED"
+                            opportunity.allocation_fact = (
+                                "HUMAN_SELECTED" if speaker_kind == "HUMAN" else "AI_SELECTED"
+                            )
+                            session.add(
+                                SpeakerAllocation(
+                                    opportunity_id=opportunity_id,
+                                    speaker_kind=speaker_kind,
+                                    user_id=(
+                                        _required_uuid(event.payload["speaker_user_id"])
+                                        if event.payload.get("speaker_user_id")
+                                        else None
+                                    ),
+                                    agent_profile_id=(
+                                        _required_uuid(event.payload["agent_profile_id"])
+                                        if event.payload.get("agent_profile_id")
+                                        else None
+                                    ),
+                                    reason=(
+                                        "HUMAN_PRIORITY"
+                                        if speaker_kind == "HUMAN"
+                                        else "AGENT_RAISE"
+                                    ),
+                                    effective=True,
+                                    allocated_at=datetime.fromtimestamp(
+                                        event.server_time_ms / 1000, UTC
+                                    ),
+                                )
+                            )
                 for event in events:
                     speech_id = event.payload.get("speech_id")
                     if event.type in ("speech.started", "agent.playback_started") and speech_id:
-                        current = candidate.current_action
-                        if current is not None and (
-                            current.speaker_user_id is not None
-                            or current.agent_profile_id is not None
-                            or candidate.current_speaker_user_id is not None
-                            or candidate.current_agent_profile_id is not None
-                        ):
-                            previous_attempt = await session.scalar(
-                                select(func.coalesce(func.max(Speech.attempt_no), 0)).where(
-                                    Speech.match_id == candidate.match_id,
-                                    Speech.action_key == current.action_key,
-                                )
-                            )
-                            existing_speech = await session.get(
-                                Speech, UUID(str(speech_id)), with_for_update=True
-                            )
-                            if existing_speech is not None:
-                                existing_speech.status = "STARTED"
-                                existing_speech.ended_at = None
-                                existing_speech.finalized_at = None
-                            else:
-                                session.add(
-                                    Speech(
-                                        id=UUID(str(speech_id)),
-                                        match_id=candidate.match_id,
-                                        action_key=current.action_key,
-                                        user_id=candidate.current_speaker_user_id,
-                                        side=(
-                                            candidate.current_speaker_side
-                                            or current.side
-                                            or "AFFIRMATIVE"
-                                        ),
-                                        seat_no=(
-                                            candidate.current_speaker_seat_no
-                                            or current.seat_no
-                                            or 1
-                                        ),
-                                        speaker_kind=(
-                                            "AGENT"
-                                            if candidate.current_agent_profile_id is not None
-                                            else "HUMAN"
-                                        ),
-                                        agent_profile_id=candidate.current_agent_profile_id,
-                                        generation_id=(
-                                            UUID(str(event.payload["generation_id"]))
-                                            if event.payload.get("generation_id")
-                                            else None
-                                        ),
-                                        audio_storage_path=(
-                                            str(event.payload["audio_storage_path"])
-                                            if event.payload.get("audio_storage_path")
-                                            else None
-                                        ),
-                                        attempt_no=int(previous_attempt or 0) + 1,
-                                    )
-                                )
+                        await self._persist_started_speech(session, candidate, event)
                     elif event.type == "speech.finalizing" and speech_id:
                         speech = await session.get(
                             Speech, UUID(str(speech_id)), with_for_update=True
@@ -1283,28 +2842,43 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                             speech.audio_duration_ms = event.payload.get("audio_duration_ms")
                             storage_path = event.payload.get("audio_storage_path")
                             speech.audio_storage_path = str(storage_path) if storage_path else None
-                            session.add(
-                                MatchFile(
-                                    match_id=candidate.match_id,
-                                    speech_id=speech.id,
-                                    owner_user_id=speech.user_id,
-                                    file_key=f"human-{speech.id}",
-                                    file_kind="HUMAN_RAW",
-                                    status="READY" if storage_path else "FAILED",
-                                    storage_path=str(storage_path) if storage_path else None,
-                                    codec="pcm_s16le_16000_mono" if storage_path else None,
-                                    byte_count=_file_size(
-                                        str(storage_path) if storage_path else None
-                                    ),
-                                    duration_ms=speech.audio_duration_ms,
-                                    expires_at=datetime.now(UTC) + timedelta(days=30),
-                                    error_code=(
-                                        str(event.payload.get("audio_recording_error"))
-                                        if event.payload.get("audio_recording_error")
-                                        else None
-                                    ),
+                            file_values = {
+                                "speech_id": speech.id,
+                                "owner_user_id": speech.user_id,
+                                "file_kind": "HUMAN_RAW",
+                                "status": "READY" if storage_path else "FAILED",
+                                "storage_path": str(storage_path) if storage_path else None,
+                                "codec": "pcm_s16le_16000_mono" if storage_path else None,
+                                "byte_count": _file_size(
+                                    str(storage_path) if storage_path else None
+                                ),
+                                "duration_ms": speech.audio_duration_ms,
+                                "expires_at": datetime.now(UTC) + timedelta(days=30),
+                                "error_code": (
+                                    str(event.payload.get("audio_recording_error"))
+                                    if event.payload.get("audio_recording_error")
+                                    else None
+                                ),
+                            }
+                            existing_file = await session.scalar(
+                                select(MatchFile)
+                                .where(
+                                    MatchFile.match_id == candidate.match_id,
+                                    MatchFile.file_key == f"human-{speech.id}",
                                 )
+                                .with_for_update()
                             )
+                            if existing_file is None:
+                                session.add(
+                                    MatchFile(
+                                        match_id=candidate.match_id,
+                                        file_key=f"human-{speech.id}",
+                                        **file_values,
+                                    )
+                                )
+                            else:
+                                for key, value in file_values.items():
+                                    setattr(existing_file, key, value)
                     elif event.type == "agent.finalizing" and speech_id:
                         speech = await session.get(
                             Speech, UUID(str(speech_id)), with_for_update=True
@@ -1332,24 +2906,40 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                             )
                             speech.audio_truncated = bool(event.payload.get("audio_truncated"))
                             speech.finalized_at = datetime.now(UTC)
-                            session.add(
-                                MatchFile(
-                                    match_id=candidate.match_id,
-                                    speech_id=speech.id,
-                                    owner_user_id=None,
-                                    file_key=f"agent-{speech.id}",
-                                    file_kind="AGENT_RAW",
-                                    status="READY" if speech.audio_storage_path else "FAILED",
-                                    storage_path=speech.audio_storage_path or None,
-                                    codec="ogg_opus" if speech.audio_storage_path else None,
-                                    byte_count=_file_size(speech.audio_storage_path),
-                                    duration_ms=speech.audio_duration_ms,
-                                    expires_at=datetime.now(UTC) + timedelta(days=30),
-                                    error_code=(
-                                        None if speech.audio_storage_path else "agent_audio_missing"
-                                    ),
+                            file_key = f"agent-{speech.id}"
+                            agent_file = await session.scalar(
+                                select(MatchFile)
+                                .where(
+                                    MatchFile.match_id == candidate.match_id,
+                                    MatchFile.file_key == file_key,
                                 )
+                                .with_for_update()
                             )
+                            file_values = {
+                                "speech_id": speech.id,
+                                "owner_user_id": None,
+                                "file_kind": "AGENT_RAW",
+                                "status": "READY" if speech.audio_storage_path else "FAILED",
+                                "storage_path": speech.audio_storage_path or None,
+                                "codec": "ogg_opus" if speech.audio_storage_path else None,
+                                "byte_count": _file_size(speech.audio_storage_path),
+                                "duration_ms": speech.audio_duration_ms,
+                                "expires_at": datetime.now(UTC) + timedelta(days=30),
+                                "error_code": (
+                                    None if speech.audio_storage_path else "agent_audio_missing"
+                                ),
+                            }
+                            if agent_file is None:
+                                session.add(
+                                    MatchFile(
+                                        match_id=candidate.match_id,
+                                        file_key=file_key,
+                                        **file_values,
+                                    )
+                                )
+                            else:
+                                for key, value in file_values.items():
+                                    setattr(agent_file, key, value)
                             match.context_version += 1
                 if (
                     command.type in ("speech.reset", "system.recover")
@@ -1362,6 +2952,41 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                     if speech is not None:
                         speech.status = "RESET"
                         speech.ended_at = datetime.now(UTC)
+                if (
+                    candidate.free_competition_enabled
+                    and candidate.status == "FINISHED"
+                    and candidate.experiment_attempt_id is not None
+                ):
+                    attempt = await session.get(
+                        ExperimentMatchAttempt, candidate.experiment_attempt_id
+                    )
+                    if attempt is None:
+                        raise MatchDomainError("match_state_conflict")
+                    scheduled = await session.get(ScheduledMatch, attempt.scheduled_match_id)
+                    if scheduled is None:
+                        raise MatchDomainError("match_state_conflict")
+                    existing_postmatch_task = await session.scalar(
+                        select(BackgroundTask.id).where(
+                            BackgroundTask.task_type == "EXPERIMENT_POSTMATCH",
+                            func.jsonb_extract_path_text(BackgroundTask.payload, "attempt_id")
+                            == str(attempt.id),
+                        )
+                    )
+                    if existing_postmatch_task is None:
+                        session.add(
+                            BackgroundTask(
+                                task_type="EXPERIMENT_POSTMATCH",
+                                payload={
+                                    "attempt_id": str(attempt.id),
+                                    "scheduled_match_id": str(scheduled.id),
+                                    "match_id": str(candidate.match_id),
+                                },
+                                max_attempts=2,
+                            )
+                        )
+
+        if command.type == "speech.start":
+            self._prepared_speech_starts.discard((candidate.match_id, command.message_id))
 
     async def recover_unfinished(self) -> int:
         """Rehydrate active matches into a safe, non-playing recovery state."""
@@ -1423,8 +3048,20 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                 )
                 if room is None:
                     raise AuthError("room_unavailable")
-                if actor_role != "ADMIN" and room.organizer_user_id != actor_user_id:
-                    raise AuthError("forbidden")
+                experiment_link = await resolve_room_link(session, room_id=room_id)
+                if experiment_link is None:
+                    if actor_role != "ADMIN" and room.organizer_user_id != actor_user_id:
+                        raise AuthError("forbidden")
+                elif actor_role != "ADMIN":
+                    if experiment_link.scheduled_match_kind == "TRAINING":
+                        if room.organizer_user_id != actor_user_id:
+                            raise AuthError("forbidden")
+                    elif not await is_experiment_side_controller(
+                        session,
+                        scheduled_match_id=experiment_link.scheduled_match_id,
+                        user_id=actor_user_id,
+                    ):
+                        raise AuthError("forbidden")
                 existing = await session.scalar(select(Match).where(Match.room_id == room_id))
                 if existing is not None:
                     if existing.status not in ("FINISHED", "TERMINATED"):
@@ -1449,6 +3086,19 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                     if seat.occupant_type == "AGENT" and seat.agent_profile_id is not None
                 }
                 actions = compile_linear_actions(room.rule_snapshot, seat_map, agent_seat_map)
+                formal_4v4 = {(seat.side, seat.seat_no) for seat in seats} == {
+                    (side, seat_no)
+                    for side in ("AFFIRMATIVE", "NEGATIVE")
+                    for seat_no in range(1, 5)
+                }
+                if any(
+                    action.host_audio_path
+                    and (
+                        action.host_audio_duration_ms is None or action.host_audio_duration_ms <= 0
+                    )
+                    for action in actions
+                ):
+                    raise AuthError("host_audio_duration_unavailable")
                 match_id = uuid4()
                 state = MatchRuntimeState(
                     match_id=match_id,
@@ -1456,6 +3106,11 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                     action_state="NOT_STARTED",
                     actions=actions,
                     match_seed=match_id.int % (2**63 - 1),
+                    experiment_mode=experiment_link is not None,
+                    formal_4v4=formal_4v4,
+                    experiment_attempt_id=(
+                        experiment_link.attempt_id if experiment_link is not None else None
+                    ),
                 )
                 session.add(
                     Match(
@@ -1466,6 +3121,27 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         runtime_snapshot=state_snapshot(state),
                     )
                 )
+                if experiment_link is not None:
+                    attempt = await session.get(
+                        ExperimentMatchAttempt,
+                        experiment_link.attempt_id,
+                        with_for_update=True,
+                    )
+                    scheduled = await session.get(
+                        ScheduledMatch,
+                        experiment_link.scheduled_match_id,
+                        with_for_update=True,
+                    )
+                    if (
+                        attempt is None
+                        or scheduled is None
+                        or attempt.status not in {"CREATED", "WAITING"}
+                    ):
+                        raise AuthError("match_state_conflict")
+                    attempt.match_id = match_id
+                    attempt.status = "RUNNING"
+                    attempt.started_at = datetime.now(UTC)
+                    scheduled.status = "RUNNING"
                 user_ids = [
                     seat.user_id
                     for seat in seats
@@ -1534,6 +3210,31 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             raise MatchDomainError("match_not_found")
         return actor
 
+    async def ensure_actor(self, session: AsyncSession, match_id: UUID) -> MatchActor:
+        """Load an active actor on demand for operator recovery after a restart."""
+        actor = self._actors.get(match_id)
+        if actor is not None:
+            return actor
+        match = await session.get(Match, match_id)
+        if match is None:
+            raise MatchDomainError("match_not_found")
+        if match.status in ("FINISHED", "TERMINATED"):
+            raise MatchDomainError("match_not_running")
+        actor = MatchActor(
+            _state_from_snapshot(match.id, match.runtime_snapshot),
+            commit=self._commit,
+            publish=self._publish,
+            pre_commit=self._pre_commit,
+        )
+        await actor.start()
+        async with self._lock:
+            existing = self._actors.get(match_id)
+            if existing is not None:
+                await actor.close()
+                return existing
+            self._actors[match_id] = actor
+        return actor
+
     async def submit(self, match_id: UUID, command: MatchCommand) -> MatchCommandResult:
         actor = await self.get_actor(match_id)
         previous_state = actor.state
@@ -1546,23 +3247,27 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         ):
             # Recovery must not race a pending interruption cleanup.
             await self._reset_interrupted_agent(match_id)
-        if command.type == "speech.start" and self._speech_runtime is not None:
-            if command.actor_user_id is None:
-                raise MatchDomainError("not_current_speaker")
-            speech_id = actor.state.current_speech_id or uuid4()
-            await self._speech_runtime.start_speech(match_id, speech_id, command.actor_user_id)
+        if command.type == "speech.start":
+            start_key = (match_id, command.message_id)
             try:
-                return await actor.submit(
-                    MatchCommand(
-                        type=command.type,
-                        message_id=command.message_id,
-                        actor_user_id=command.actor_user_id,
-                        payload={**command.payload, "speech_id": str(speech_id)},
-                    )
-                )
+                result = await actor.submit(command)
             except Exception:
-                await self._speech_runtime.reset_speech(match_id)
+                if start_key in self._prepared_speech_starts and self._speech_runtime is not None:
+                    self._prepared_speech_starts.discard(start_key)
+                    try:
+                        await self._speech_runtime.reset_speech(match_id)
+                    except Exception as cleanup_error:
+                        logger.warning(
+                            "failed committed speech start cleanup",
+                            extra={
+                                "error_code": "asr_start_cleanup_failed",
+                                "match_id": str(match_id),
+                                "details": {"exception_type": type(cleanup_error).__name__},
+                            },
+                        )
                 raise
+            self._prepared_speech_starts.discard(start_key)
+            return result
         result = await actor.submit(command)
         if command.type == "match.pause":
             if (

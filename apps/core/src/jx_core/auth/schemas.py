@@ -33,6 +33,16 @@ class ChangePasswordRequest(BaseModel):
     new_password: str = Field(min_length=1, max_length=128)
 
 
+class AdminSetPasswordRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    new_password: str = Field(min_length=8, max_length=64)
+
+
+class AdminSetPasswordResponse(BaseModel):
+    status: str = "password_changed"
+
+
 class ProfileUpdateRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -106,6 +116,8 @@ class UserSummaryResponse(BaseModel):
 
 
 __all__ = [
+    "AdminSetPasswordRequest",
+    "AdminSetPasswordResponse",
     "AuthResponse",
     "AvatarPresetUpdateRequest",
     "ChangePasswordRequest",

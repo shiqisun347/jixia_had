@@ -1,7 +1,7 @@
 'use client';
 
 import { useQuery } from '@tanstack/react-query';
-import { Pencil, RotateCcw, Trash2 } from 'lucide-react';
+import { KeyRound, Pencil, Trash2 } from 'lucide-react';
 import { useDeferredValue, useEffect, useMemo, useState } from 'react';
 import { type ColumnDef, getCoreRowModel, useReactTable } from '@tanstack/react-table';
 
@@ -27,8 +27,6 @@ import { useOptionalToast } from '@/components/ui/toast-provider';
 import { requestJson } from '@/lib/auth-api';
 import { AdminBulkActions } from '@/features/admin/admin-bulk-actions';
 
-type TemporaryPasswordResponse = { temporary_password: string; must_change_password: boolean };
-
 export default function AdminUsersPage() {
   const toast = useOptionalToast();
   const { isSubmitting, submit } = useAdminSubmit();
@@ -39,10 +37,7 @@ export default function AdminUsersPage() {
   const [page, setPage] = useState(1);
   const [drawerUser, setDrawerUser] = useState<UserRow | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<UserRow | null>(null);
-  const [resetTarget, setResetTarget] = useState<UserRow | null>(null);
-  const [temporaryPassword, setTemporaryPassword] = useState<TemporaryPasswordResponse | null>(
-    null,
-  );
+  const [passwordTarget, setPasswordTarget] = useState<UserRow | null>(null);
   const deferredQuery = useDeferredValue(query);
   const params = useMemo(
     () => ({
@@ -124,12 +119,17 @@ export default function AdminUsersPage() {
                 <Pencil className="mr-2 size-3.5" aria-hidden="true" />
                 编辑资料
               </AdminActionItem>
-              {row.original.username.toLowerCase() !== 'admin' ? (
-                <AdminActionItem onSelect={() => setResetTarget(row.original)}>
-                  <RotateCcw className="mr-2 size-3.5" aria-hidden="true" />
-                  重置密码
+              {row.original.username.toLowerCase() === 'admin' ? (
+                <AdminActionItem onSelect={() => window.location.assign('/change-password')}>
+                  <KeyRound className="mr-2 size-3.5" aria-hidden="true" />
+                  修改自己的密码
                 </AdminActionItem>
-              ) : null}
+              ) : (
+                <AdminActionItem onSelect={() => setPasswordTarget(row.original)}>
+                  <KeyRound className="mr-2 size-3.5" aria-hidden="true" />
+                  修改密码
+                </AdminActionItem>
+              )}
               {row.original.match_count === 0 && row.original.username.toLowerCase() !== 'admin' ? (
                 <AdminActionItem onSelect={() => setDeleteTarget(row.original)} tone="danger">
                   <Trash2 className="mr-2 size-3.5" aria-hidden="true" />
@@ -218,19 +218,17 @@ export default function AdminUsersPage() {
     }
   }
 
-  async function resetPassword(target = resetTarget) {
+  async function setPassword(target = passwordTarget, newPassword = '') {
     if (!target) return;
     try {
-      let result: TemporaryPasswordResponse | null = null;
       const submitted = await submit(async () => {
-        result = await requestJson<TemporaryPasswordResponse>(
-          `/api/admin/users/${target.id}/temporary-password`,
-          { method: 'POST', body: '{}' },
-        );
+        await requestJson(`/api/admin/users/${target.id}/password`, {
+          method: 'POST',
+          body: JSON.stringify({ new_password: newPassword }),
+        });
       });
-      if (!submitted || !result) return;
-      setResetTarget(null);
-      setTemporaryPassword(result);
+      if (!submitted) return;
+      setPasswordTarget(null);
       toast?.showToast({ message: `${target.real_name} 的旧会话已撤销。`, tone: 'success' });
     } catch (error: unknown) {
       toast?.showToast({ message: readableAdminError(error), tone: 'error' });
@@ -345,25 +343,14 @@ export default function AdminUsersPage() {
         open={Boolean(deleteTarget)}
         title="删除用户？"
       />
-      <AdminConfirmDialog
-        confirmLabel="确认重置"
-        description={
-          resetTarget ? `将撤销 ${resetTarget.real_name} 的全部会话并生成一次性临时密码。` : ''
-        }
-        onConfirm={() => void resetPassword(resetTarget)}
+      <PasswordDrawer
         loading={isSubmitting}
         onOpenChange={(open) => {
-          if (!open && !isSubmitting) setResetTarget(null);
+          if (!open && !isSubmitting) setPasswordTarget(null);
         }}
-        open={Boolean(resetTarget)}
-        title="重置密码？"
+        onSave={(password) => setPassword(passwordTarget, password)}
+        user={passwordTarget}
       />
-      {temporaryPassword ? (
-        <TemporaryPasswordDialog
-          password={temporaryPassword.temporary_password}
-          onClose={() => setTemporaryPassword(null)}
-        />
-      ) : null}
     </div>
   );
 }
@@ -437,31 +424,49 @@ function UserDrawer({
   );
 }
 
-function TemporaryPasswordDialog({ password, onClose }: { password: string; onClose: () => void }) {
+function PasswordDrawer({
+  loading,
+  user,
+  onOpenChange,
+  onSave,
+}: {
+  loading: boolean;
+  user: UserRow | null;
+  onOpenChange: (open: boolean) => void;
+  onSave: (password: string) => Promise<void>;
+}) {
+  const [password, setPassword] = useState('');
   return (
     <AdminDrawer
-      description="此密码只显示一次；用户登录后必须立即修改。"
+      description="管理员直接设置新密码；保存后目标用户的全部旧会话立即失效。"
       footer={
         <div className="flex justify-end">
-          <AdminButton onClick={onClose} tone="primary" type="button">
-            我已安全记录，关闭
+          <AdminButton
+            disabled={password.length < 8}
+            loading={loading}
+            onClick={() => void onSave(password)}
+            tone="primary"
+            type="button"
+          >
+            保存新密码
           </AdminButton>
         </div>
       }
       onOpenChange={(open) => {
-        if (!open) onClose();
+        if (open || !loading) onOpenChange(open);
       }}
-      open
-      title="一次性临时密码"
+      open={Boolean(user)}
+      title={`修改密码 · ${user?.real_name ?? ''}`}
     >
       <div className="space-y-4">
-        <p className="text-sm leading-6 text-slate-600">
-          目标用户旧会话已撤销。请通过安全渠道将临时密码交给用户。
-        </p>
         <input
-          aria-label="临时密码"
+          aria-label="新密码"
           className="admin-field font-mono text-lg"
-          readOnly
+          disabled={loading}
+          minLength={8}
+          onChange={(event) => setPassword(event.target.value)}
+          placeholder="至少 8 个字符"
+          type="password"
           value={password}
         />
       </div>

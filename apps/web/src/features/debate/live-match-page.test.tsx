@@ -6,12 +6,41 @@ import type { RoomSnapshot } from '@/lib/rooms-api';
 
 import {
   actionLabel,
+  canManageMatch,
   normalizedTranscriptDraft,
+  shouldShowPostmatchPrompt,
   terminalPresentation,
   transcriptSaveErrorText,
 } from './live-match-page';
 import { resolveCurrentSeat } from './match-presentation';
 import { matchSocketErrorText, newestMatchSnapshot } from './use-match-runtime';
+
+describe('experiment match controls', () => {
+  const baseRoom = {
+    organizer_user_id: 'affirmative-first',
+    experiment_mode: true,
+    viewer_is_experiment_controller: false,
+  } as unknown as RoomSnapshot;
+
+  it('allows both side controllers and an administrator who entered to control', () => {
+    expect(canManageMatch(baseRoom, 'affirmative-first', 'USER')).toBe(true);
+    expect(
+      canManageMatch(
+        { ...baseRoom, viewer_is_experiment_controller: true },
+        'negative-controller',
+        'USER',
+      ),
+    ).toBe(true);
+    expect(canManageMatch(baseRoom, 'admin-viewer', 'ADMIN')).toBe(true);
+  });
+
+  it('does not elevate ordinary viewers or administrators in ordinary rooms', () => {
+    expect(canManageMatch(baseRoom, 'ordinary-viewer', 'USER')).toBe(false);
+    expect(canManageMatch({ ...baseRoom, experiment_mode: false }, 'ordinary-admin', 'ADMIN')).toBe(
+      false,
+    );
+  });
+});
 
 describe('live match completion presentation', () => {
   it('points users to the available post-match record instead of an unfinished placeholder', () => {
@@ -27,6 +56,19 @@ describe('live match completion presentation', () => {
     expect(presentation?.title).toBe('本场比赛已终止');
     expect(presentation?.detail).toContain('不能继续发言');
     expect(presentation?.detail).not.toContain('AI 裁判正在生成');
+  });
+
+  it('only tells the current human viewer that it is their turn', () => {
+    expect(actionLabel('HUMAN_READY_TO_START').title).toBe('轮到你发言了！');
+    expect(actionLabel('HUMAN_READY_TO_START', false, '正方二辩').title).toBe('轮到正方二辩发言');
+  });
+
+  it('prompts only an unfinished debater and respects dismissal', () => {
+    expect(shouldShowPostmatchPrompt('FINISHED', true, true, false)).toBe(true);
+    expect(shouldShowPostmatchPrompt('FINISHED', false, true, false)).toBe(false);
+    expect(shouldShowPostmatchPrompt('FINISHED', true, false, false)).toBe(false);
+    expect(shouldShowPostmatchPrompt('FINISHED', true, true, true)).toBe(false);
+    expect(shouldShowPostmatchPrompt('TERMINATED', true, true, false)).toBe(false);
   });
 });
 

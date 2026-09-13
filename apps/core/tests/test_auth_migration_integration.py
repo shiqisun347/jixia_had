@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import os
 import subprocess
+import sys
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
+from pathlib import Path
 from tempfile import TemporaryDirectory
 from uuid import UUID, uuid4
 
@@ -26,16 +28,21 @@ from jx_core.legal.terms import get_current_human_participation_terms
 from jx_core.matches.domain import MatchCommand
 from jx_core.matches.service import MatchRuntimeManager
 from jx_core.models import (
+    AgentProfile,
     BackgroundTask,
     HostAudioAsset,
     Match,
     MatchEvent,
+    ModelProfile,
     Room,
     RoomMember,
     Rule,
+    RuleStage,
     Seat,
     Speech,
+    StageAction,
     User,
+    VoiceProfile,
 )
 from jx_core.room_connections import RoomConnectionService
 from jx_core.rooms.schemas import (
@@ -51,6 +58,7 @@ from jx_core.rules.schemas import (
     AgentProfileUpdate,
     ModelProfileCreate,
     RuleCreate,
+    RuleStageUpdate,
     TopicCreate,
     VoiceProfileCreate,
 )
@@ -74,11 +82,12 @@ def _test_database_url() -> str:
 def _run_alembic(database_url: str, *arguments: str) -> None:
     environment = {**os.environ, "DATABASE_URL": database_url}
     completed = subprocess.run(
-        ["uv", "run", "--package", "jx-core", "alembic", *arguments],
+        [sys.executable, "-m", "alembic", *arguments],
         check=False,
         capture_output=True,
         text=True,
         env=environment,
+        cwd=Path(__file__).resolve().parents[3],
     )
     if completed.returncode != 0:
         raise AssertionError("Alembic command failed without exposing its captured output")
@@ -317,6 +326,16 @@ async def test_rule_catalog_creation_queues_audio_and_requires_review(
                 database_session,
                 payload=ModelProfileCreate(name="测试模型", config_ref="model-probe"),
             )
+            for index in range(2, 9):
+                await catalog.create_voice(
+                    database_session,
+                    payload=VoiceProfileCreate(
+                        name=f"Agent 音色 {index}",
+                        kind="AGENT",
+                        provider_voice=f"agent-probe-{index}",
+                        avatar_key=f"agent-{index:02d}",
+                    ),
+                )
             agent = await catalog.create_agent(
                 database_session,
                 payload=AgentProfileCreate(
@@ -340,9 +359,10 @@ async def test_rule_catalog_creation_queues_audio_and_requires_review(
                 payload=RuleCreate.model_validate(
                     {
                         "host_voice_profile_id": str(host_voice.id),
+                        "default_agent_model_profile_id": str(model.id),
                         "draft": {
-                            "name": "一对一测试规则",
-                            "side_size": 1,
+                            "name": "四对四测试规则",
+                            "side_size": 4,
                             "stages": [
                                 {
                                     "name": "正方立论",
@@ -412,6 +432,9 @@ async def test_enabling_new_rule_version_disables_only_older_enabled_version(
             )
             reviewed_at = datetime.now(UTC)
             async with session.begin():
+                model = ModelProfile(name="版本规则模型", config_ref="versioned-rule-model")
+                session.add(model)
+                await session.flush()
                 old_version = Rule(
                     rule_key="versioned-rule",
                     version=1,
@@ -428,11 +451,12 @@ async def test_enabling_new_rule_version_disables_only_older_enabled_version(
                     version=2,
                     name="版本规则 v2",
                     description="",
-                    side_size=1,
+                    side_size=4,
                     estimated_seconds=60,
                     status="READY",
                     created_by=admin.id,
                     audio_reviewed_at=reviewed_at,
+                    default_agent_model_profile_id=model.id,
                 )
                 unrelated = Rule(
                     rule_key="unrelated-rule",
@@ -446,6 +470,24 @@ async def test_enabling_new_rule_version_disables_only_older_enabled_version(
                     audio_reviewed_at=reviewed_at,
                 )
                 session.add_all([old_version, new_version, unrelated])
+                await session.flush()
+                for index in range(8):
+                    voice = VoiceProfile(
+                        name=f"版本规则音色 {index + 1}",
+                        kind="AGENT",
+                        provider_voice=f"versioned-rule-voice-{index + 1}",
+                        avatar_key=f"agent-{index + 1:02d}",
+                    )
+                    session.add(voice)
+                    await session.flush()
+                    session.add(
+                        AgentProfile(
+                            name=voice.name,
+                            rule_id=new_version.id,
+                            model_profile_id=model.id,
+                            voice_profile_id=voice.id,
+                        )
+                    )
             await RuleService().enable_rule(session, rule_id=new_version.id)
             await session.refresh(old_version)
             await session.refresh(new_version)
@@ -497,6 +539,307 @@ async def test_rule_delete_is_reference_safe_and_draft_without_host_text_is_edit
             assert rule.status == "READY"
             await rules.delete_rule(session, rule_id=rule.id, actor_user_id=admin.id)
             assert await session.get(Rule, rule.id) is None
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_rule_stage_update_replaces_actions_and_uses_a_new_audio_asset(
+    auth_database_url: str,
+    tmp_path: Path,
+) -> None:
+    engine = create_async_engine(auth_database_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    catalog = CatalogService()
+    rules = RuleService()
+    try:
+        async with factory() as session:
+            admin = await AuthService().create_admin(
+                session,
+                username="stage-update-admin",
+                real_name="阶段编辑管理员",
+                password="stage-update-admin-password-123",
+            )
+            host = await catalog.create_voice(
+                session,
+                payload=VoiceProfileCreate(
+                    name="阶段编辑主持", kind="HOST", provider_voice="stage-update-host"
+                ),
+            )
+            model = await catalog.create_model(
+                session,
+                payload=ModelProfileCreate(
+                    name="阶段编辑模型", config_ref="stage-update-model"
+                ),
+            )
+            rule = await rules.create_rule(
+                session,
+                creator_user_id=admin.id,
+                payload=RuleCreate.model_validate(
+                    {
+                        "rule_key": "stage-update-rule",
+                        "host_voice_profile_id": str(host.id),
+                        "default_agent_model_profile_id": str(model.id),
+                        "draft": {
+                            "name": "阶段编辑规则",
+                            "side_size": 4,
+                            "stages": [
+                                {
+                                    "name": "正方立论",
+                                    "stage_kind": "FIXED_SPEECH",
+                                    "start_host_text": "旧主持词",
+                                    "actions": [
+                                        {
+                                            "side": "AFFIRMATIVE",
+                                            "seat_no": 1,
+                                            "duration_seconds": 90,
+                                        }
+                                    ],
+                                },
+                                {"name": "结束", "stage_kind": "END"},
+                            ],
+                        },
+                    }
+                ),
+            )
+            stage = await session.scalar(
+                select(RuleStage).where(
+                    RuleStage.rule_id == rule.id,
+                    RuleStage.position == 1,
+                )
+            )
+            assert stage is not None
+            old_asset = await session.scalar(
+                select(HostAudioAsset).where(
+                    HostAudioAsset.rule_id == rule.id,
+                    HostAudioAsset.segment_key == "stage-1-start",
+                )
+            )
+            assert old_asset is not None
+            old_asset_id = old_asset.id
+            audio_path = tmp_path / "historical-host.mp3"
+            audio_path.write_bytes(b"historical-audio")
+            old_asset.storage_path = str(audio_path)
+            old_asset.status = "READY"
+            await session.commit()
+
+            await rules.update_rule_stage(
+                session,
+                rule_id=rule.id,
+                stage_id=stage.id,
+                actor_user_id=admin.id,
+                payload=RuleStageUpdate.model_validate(
+                    {
+                        "name": "正方立论（更新）",
+                        "start_host_text": "新主持词",
+                        "actions": [
+                            {
+                                "side": "AFFIRMATIVE",
+                                "seat_no": 2,
+                                "duration_seconds": 45,
+                            }
+                        ],
+                    }
+                ),
+            )
+
+            replacement = await session.scalar(
+                select(HostAudioAsset).where(
+                    HostAudioAsset.rule_id == rule.id,
+                    HostAudioAsset.segment_key == "stage-1-start",
+                )
+            )
+            actions = list(
+                (
+                    await session.scalars(
+                        select(StageAction)
+                        .where(StageAction.stage_id == stage.id)
+                        .order_by(StageAction.position)
+                    )
+                ).all()
+            )
+            assert replacement is not None
+            assert replacement.id != old_asset_id
+            assert replacement.text == "新主持词"
+            assert audio_path.read_bytes() == b"historical-audio"
+            assert [(item.seat_no, item.duration_seconds) for item in actions] == [(2, 45)]
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_referenced_rule_is_archived_instead_of_deleted(
+    auth_database_url: str,
+) -> None:
+    engine = create_async_engine(auth_database_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    catalog = CatalogService()
+    rules = RuleService()
+    try:
+        async with factory() as session:
+            admin = await AuthService().create_admin(
+                session,
+                username="rule-archive-admin",
+                real_name="规则归档管理员",
+                password="rule-archive-admin-password-123",
+            )
+            host = await catalog.create_voice(
+                session,
+                payload=VoiceProfileCreate(
+                    name="规则归档主持", kind="HOST", provider_voice="rule-archive-host"
+                ),
+            )
+            rule = await rules.create_rule(
+                session,
+                creator_user_id=admin.id,
+                payload=RuleCreate.model_validate(
+                    {
+                        "rule_key": "referenced-rule",
+                        "host_voice_profile_id": str(host.id),
+                        "draft": {
+                            "name": "已引用规则",
+                            "side_size": 1,
+                            "stages": [{"name": "结束", "stage_kind": "END"}],
+                        },
+                    }
+                ),
+            )
+            async with session.begin():
+                session.add(
+                    Room(
+                        code="ARCH1A",
+                        title="规则引用房间",
+                        label="正式赛",
+                        topic_snapshot={},
+                        rule_id=rule.id,
+                        rule_snapshot={},
+                        organizer_user_id=admin.id,
+                    )
+                )
+
+            assert await rules.delete_rule(
+                session, rule_id=rule.id, actor_user_id=admin.id
+            ) == []
+            await session.refresh(rule)
+            assert rule.status == "ARCHIVED"
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_voice_delete_removes_unreferenced_and_disables_referenced_agents(
+    auth_database_url: str,
+) -> None:
+    engine = create_async_engine(auth_database_url)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    catalog = CatalogService()
+    rules = RuleService()
+    try:
+        async with factory() as session:
+            admin = await AuthService().create_admin(
+                session,
+                username="voice-lifecycle-admin",
+                real_name="音色生命周期管理员",
+                password="voice-lifecycle-admin-password-123",
+            )
+            host = await catalog.create_voice(
+                session,
+                payload=VoiceProfileCreate(
+                    name="音色生命周期主持", kind="HOST", provider_voice="voice-life-host"
+                ),
+            )
+            model = await catalog.create_model(
+                session,
+                payload=ModelProfileCreate(name="音色生命周期模型", config_ref="voice-life-model"),
+            )
+            rule = await rules.create_rule(
+                session,
+                creator_user_id=admin.id,
+                payload=RuleCreate.model_validate(
+                    {
+                        "rule_key": "voice-lifecycle-rule",
+                        "host_voice_profile_id": str(host.id),
+                        "default_agent_model_profile_id": str(model.id),
+                        "draft": {
+                            "name": "音色生命周期规则",
+                            "side_size": 4,
+                            "stages": [{"name": "结束", "stage_kind": "END"}],
+                        },
+                    }
+                ),
+            )
+            disposable_voice = await catalog.create_voice(
+                session,
+                payload=VoiceProfileCreate(
+                    name="未引用音色",
+                    kind="AGENT",
+                    provider_voice="voice-life-disposable",
+                    avatar_key="agent-01",
+                ),
+            )
+            referenced_voice = await catalog.create_voice(
+                session,
+                payload=VoiceProfileCreate(
+                    name="已引用音色",
+                    kind="AGENT",
+                    provider_voice="voice-life-referenced",
+                    avatar_key="agent-02",
+                ),
+            )
+            disposable_agent = await session.scalar(
+                select(AgentProfile).where(
+                    AgentProfile.rule_id == rule.id,
+                    AgentProfile.voice_profile_id == disposable_voice.id,
+                )
+            )
+            referenced_agent = await session.scalar(
+                select(AgentProfile).where(
+                    AgentProfile.rule_id == rule.id,
+                    AgentProfile.voice_profile_id == referenced_voice.id,
+                )
+            )
+            assert disposable_agent is not None and referenced_agent is not None
+
+            outcome = await catalog.delete_voice(
+                session, voice_id=disposable_voice.id, actor_user_id=admin.id
+            )
+            await session.commit()
+            assert outcome == "DELETED"
+            assert await session.get(VoiceProfile, disposable_voice.id) is None
+            assert await session.get(AgentProfile, disposable_agent.id) is None
+
+            room = Room(
+                code="VOICE1",
+                title="音色引用房间",
+                label="正式赛",
+                topic_snapshot={},
+                rule_id=rule.id,
+                rule_snapshot={},
+                organizer_user_id=admin.id,
+            )
+            session.add(room)
+            await session.flush()
+            session.add(
+                Seat(
+                    room_id=room.id,
+                    side="AFFIRMATIVE",
+                    seat_no=1,
+                    occupant_type="AGENT",
+                    agent_profile_id=referenced_agent.id,
+                    configured_agent_profile_id=referenced_agent.id,
+                )
+            )
+            await session.commit()
+
+            outcome = await catalog.delete_voice(
+                session, voice_id=referenced_voice.id, actor_user_id=admin.id
+            )
+            await session.commit()
+            assert outcome == "ARCHIVED"
+            await session.refresh(referenced_voice)
+            await session.refresh(referenced_agent)
+            assert referenced_voice.status == "DISABLED"
+            assert referenced_agent.status == "DISABLED"
     finally:
         await engine.dispose()
 
@@ -870,40 +1213,30 @@ async def test_room_creation_join_seat_ready_and_start_pending_runtime(
                     provider_voice="room-host",
                 ),
             )
-            agent_voice = await catalog.create_voice(
-                session,
-                payload=VoiceProfileCreate(
-                    name="房间 Agent 音色",
-                    kind="AGENT",
-                    provider_voice="room-agent",
-                    avatar_key="agent-02",
-                ),
-            )
+            for index in range(8):
+                await catalog.create_voice(
+                    session,
+                    payload=VoiceProfileCreate(
+                        name=f"房间 Agent 音色 {index + 1}",
+                        kind="AGENT",
+                        provider_voice=f"room-agent-{index + 1}",
+                        avatar_key=f"agent-{index + 1:02d}",
+                    ),
+                )
             model = await catalog.create_model(
                 session,
                 payload=ModelProfileCreate(name="房间模型", config_ref="room-model"),
             )
-            room_agents = []
-            for index in range(4):
-                room_agents.append(
-                    await catalog.create_agent(
-                        session,
-                        payload=AgentProfileCreate(
-                            name=f"房间补位 Agent {index + 1}",
-                            model_profile_id=model.id,
-                            voice_profile_id=agent_voice.id,
-                        ),
-                    )
-                )
             rule = await rule_service.create_rule(
                 session,
                 creator_user_id=admin.id,
                 payload=RuleCreate.model_validate(
                     {
                         "host_voice_profile_id": str(host.id),
+                        "default_agent_model_profile_id": str(model.id),
                         "draft": {
                             "name": "房间规则",
-                            "side_size": 2,
+                                "side_size": 4,
                             "stages": [
                                 {
                                     "name": "开场",
@@ -1136,6 +1469,30 @@ async def test_room_creation_join_seat_ready_and_start_pending_runtime(
             )
             await session.commit()
 
+            # A browser/session reconnect keeps the membership and seat, but
+            # presence may already have marked the member offline. Rejoining
+            # the room must repair that online state so it cannot block start.
+            disconnected = await session.scalar(
+                select(RoomMember).where(
+                    RoomMember.room_id == room_id,
+                    RoomMember.user_id == user_two_id,
+                )
+            )
+            assert disconnected is not None
+            disconnected.online = False
+            await session.commit()
+            reconnected = await room_service.join_room(
+                session,
+                user_id=user_two_id,
+                room_id=room_id,
+                payload=RoomJoinRequest(
+                    member_role="DEBATER",
+                    human_participation_terms_version=terms_version,
+                ),
+            )
+            assert reconnected.online is True
+            await session.commit()
+
             for contender_id in (user_three_id, user_four_id):
                 await room_service.join_room(
                     session,
@@ -1285,37 +1642,30 @@ async def test_room_capacity_guards_serialize_spectators_and_fifth_match(
                     provider_voice="capacity-host",
                 ),
             )
-            agent_voice = await catalog.create_voice(
-                session,
-                payload=VoiceProfileCreate(
-                    name="容量 Agent 音色",
-                    kind="AGENT",
-                    provider_voice="capacity-agent",
-                    avatar_key="agent-03",
-                ),
-            )
+            for index in range(8):
+                await catalog.create_voice(
+                    session,
+                    payload=VoiceProfileCreate(
+                        name=f"容量 Agent 音色 {index + 1}",
+                        kind="AGENT",
+                        provider_voice=f"capacity-agent-{index + 1}",
+                        avatar_key=f"agent-{index + 1:02d}",
+                    ),
+                )
             model = await catalog.create_model(
                 session,
                 payload=ModelProfileCreate(name="容量模型", config_ref="capacity-model"),
             )
-            for index in range(2):
-                await catalog.create_agent(
-                    session,
-                    payload=AgentProfileCreate(
-                        name=f"容量 Agent {index + 1}",
-                        model_profile_id=model.id,
-                        voice_profile_id=agent_voice.id,
-                    ),
-                )
             rule = await rules.create_rule(
                 session,
                 creator_user_id=admin_id,
                 payload=RuleCreate.model_validate(
                     {
                         "host_voice_profile_id": str(host_voice.id),
+                        "default_agent_model_profile_id": str(model.id),
                         "draft": {
-                            "name": "容量一对一规则",
-                            "side_size": 1,
+                            "name": "容量四对四规则",
+                            "side_size": 4,
                             "stages": [
                                 {
                                     "name": "自由辩论",
@@ -1357,7 +1707,7 @@ async def test_room_capacity_guards_serialize_spectators_and_fifth_match(
             assert first_all_agent_room.is_all_agent is True
             assert all(member.member_role == "ORGANIZER" for member in first_all_agent_members)
             assert all(seat.occupant_type == "AGENT" for seat in first_all_agent_seats)
-            assert len({seat.agent_profile_id for seat in first_all_agent_seats}) == 2
+            assert len({seat.agent_profile_id for seat in first_all_agent_seats}) == 8
             await session.commit()
             spectator_room_id = room_ids[5]
             spectator_ids: list[UUID] = []
@@ -1977,6 +2327,84 @@ async def test_admin_temporary_password_is_one_time_visible_and_restricts_user(
 
 
 @pytest.mark.asyncio
+async def test_admin_sets_user_password_and_revokes_existing_sessions(
+    auth_database_url: str,
+) -> None:
+    settings = _auth_settings(auth_database_url)
+    runtime = CoreRuntime(settings, lock_key=uuid4().int & ((1 << 63) - 1))
+    app = create_app(settings, runtime=runtime)
+    headers = {"Origin": "http://localhost:3000"}
+
+    async with app.router.lifespan_context(app):
+        async with runtime.database.session_factory() as database_session:
+            await AuthService().create_admin(
+                database_session,
+                username="password-admin",
+                real_name="管理员",
+                password="admin-password-123",
+            )
+        async with (
+            AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://testserver", headers=headers
+            ) as target_client,
+            AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://testserver", headers=headers
+            ) as admin_client,
+        ):
+            terms = (await target_client.get("/api/legal/platform-terms/current")).json()["version"]
+            registered = await target_client.post(
+                "/api/auth/register",
+                json={
+                    "username": "password-target",
+                    "real_name": "密码修改用户",
+                    "password": "old-password-123",
+                    "platform_terms_version": terms,
+                },
+            )
+            target_id = registered.json()["user"]["id"]
+            assert (await target_client.get("/api/auth/me")).status_code == 200
+            assert (
+                await admin_client.post(
+                    "/api/auth/login",
+                    json={"username": "password-admin", "password": "admin-password-123"},
+                )
+            ).status_code == 200
+
+            changed = await admin_client.post(
+                f"/api/admin/users/{target_id}/password",
+                json={"new_password": "new-password-456"},
+            )
+            assert changed.status_code == 200
+            assert changed.json() == {"status": "password_changed"}
+            assert "password" not in changed.text.lower().replace("password_changed", "")
+            assert (await target_client.get("/api/auth/me")).status_code == 401
+
+            old_login = await target_client.post(
+                "/api/auth/login",
+                json={"username": "password-target", "password": "old-password-123"},
+            )
+            assert old_login.status_code == 401
+            new_login = await target_client.post(
+                "/api/auth/login",
+                json={"username": "password-target", "password": "new-password-456"},
+            )
+            assert new_login.status_code == 200
+            assert new_login.json()["user"]["must_change_password"] is False
+
+        async with runtime.database.session_factory() as database_session:
+            audit_details = (
+                await database_session.execute(
+                    text(
+                        "SELECT details FROM audit_logs "
+                        "WHERE action = 'password.changed_by_admin'"
+                    )
+                )
+            ).scalar_one()
+            assert "new-password-456" not in str(audit_details)
+            assert "new_password" not in str(audit_details)
+
+
+@pytest.mark.asyncio
 async def test_admin_cli_service_requires_current_migration_and_audits(
     auth_database_url: str,
 ) -> None:
@@ -2107,6 +2535,22 @@ async def test_room_connection_replacement_and_stale_release(
                     user_id=user_id,
                     connection_id=second_id,
                     connection_epoch=2,
+                )
+                is True
+            )
+            third = await service.acquire(
+                database_session,
+                user_id=user_id,
+                room_id=first_room,
+                connection_id=uuid4(),
+            )
+            assert third.connection_epoch == 3
+            assert (
+                await service.release(
+                    database_session,
+                    user_id=user_id,
+                    connection_id=third.connection_id,
+                    connection_epoch=third.connection_epoch,
                 )
                 is True
             )

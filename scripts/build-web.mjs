@@ -1,6 +1,14 @@
 import { spawnSync } from 'node:child_process';
 import { createRequire } from 'node:module';
-import { cpSync, existsSync, lstatSync, mkdirSync, readFileSync, rmSync } from 'node:fs';
+import {
+  cpSync,
+  existsSync,
+  lstatSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  rmSync,
+} from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -99,6 +107,57 @@ export function assertHomeBundleBoundary(webRoot) {
   }
 }
 
+export function assertQuestionnaireSurface(webRoot) {
+  const manifestPath = join(webRoot, '.next', 'app-path-routes-manifest.json');
+  const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+  const requiredRoutes = ['/me/ai-experience/page', '/me/postmatch-surveys/page'];
+  for (const route of requiredRoutes) {
+    if (!Object.hasOwn(manifest, route)) {
+      throw new Error(`Production Web build is missing questionnaire route: ${route}`);
+    }
+  }
+
+  const serverChunks = join(webRoot, '.next', 'server', 'chunks');
+  const files = existsSync(serverChunks)
+    ? readdirSync(serverChunks, { recursive: true, encoding: 'utf8' })
+    : [];
+  const mePageSources = files
+    .filter((file) => file.endsWith('.js'))
+    .map((file) => readFileSync(join(serverChunks, file), 'utf8'))
+    .filter((source) => source.includes('apps_web_src_features_auth_me-page'));
+  if (!mePageSources.some((source) => source.includes('AI 辩论感受'))) {
+    throw new Error('Production Web build is missing the AI experience link on /me.');
+  }
+  if (!mePageSources.some((source) => source.includes('赛后问卷'))) {
+    throw new Error('Production Web build is missing the post-match survey link on /me.');
+  }
+}
+
+export function assertStaticArtifactIntegrity(webRoot) {
+  const serverAppRoot = join(webRoot, '.next', 'server', 'app');
+  const staticRoot = join(webRoot, '.next', 'static');
+  if (!existsSync(serverAppRoot) || !existsSync(staticRoot)) {
+    throw new Error('Production Web build is missing server or static output.');
+  }
+  const htmlFiles = readdirSync(serverAppRoot, { recursive: true, encoding: 'utf8' })
+    .filter((file) => file.endsWith('.html'))
+    .map((file) => join(serverAppRoot, file));
+  const references = new Set();
+  for (const file of htmlFiles) {
+    const source = readFileSync(file, 'utf8');
+    for (const match of source.matchAll(
+      /(?:src|href)="\/_next\/static\/([^"?]+\.(?:js|css))(?:\?[^\"]*)?"/g,
+    )) {
+      references.add(match[1]);
+    }
+  }
+  for (const reference of references) {
+    if (!existsSync(join(staticRoot, reference))) {
+      throw new Error(`Production Web build is missing static artifact: ${reference}`);
+    }
+  }
+}
+
 export function buildWeb({ webRoot = defaultWebRoot, spawnBuild = spawnSync } = {}) {
   cleanNextOutput(webRoot);
   const requireFromWeb = createRequire(join(webRoot, 'package.json'));
@@ -132,6 +191,8 @@ export function buildWeb({ webRoot = defaultWebRoot, spawnBuild = spawnSync } = 
     }),
   );
   assertHomeBundleBoundary(webRoot);
+  assertQuestionnaireSurface(webRoot);
+  assertStaticArtifactIntegrity(webRoot);
 
   // Next standalone intentionally omits the public directory. The deployed
   // server must still carry the brand logo and identity avatars referenced by

@@ -10,8 +10,10 @@ import type {
   AdminOverview,
   AdminPage,
   Catalog,
+  AgentRow,
   JudgeProfile,
   LogRow,
+  RuntimeLogRow,
   MatchRow,
   StorageStatus,
   UserRow,
@@ -39,6 +41,10 @@ export const adminApi = {
     requestJson<AdminPage<UserRow>>(listPath('/api/admin/users', query)),
   matches: (query?: AdminListQuery) =>
     requestJson<AdminPage<MatchRow>>(listPath('/api/admin/matches', query)),
+  matchIds: (query?: AdminListQuery) =>
+    requestJson<{ ids: string[]; total: number; truncated: boolean }>(
+      listPath('/api/admin/matches/ids', query),
+    ),
   matchGenerations: (matchId: string) =>
     requestJson<AgentGenerationDiagnostic[]>(`/api/admin/matches/${matchId}/agent-generations`),
   matchGeneration: (matchId: string, generationId: string) =>
@@ -51,17 +57,46 @@ export const adminApi = {
     ),
   logs: (query?: AdminListQuery) =>
     requestJson<AdminPage<LogRow>>(listPath('/api/admin/logs', query)),
+  auditLog: (logId: string) => requestJson<LogRow>(`/api/admin/audit-logs/${logId}`),
+  runtimeLogs: (query?: AdminListQuery) =>
+    requestJson<AdminPage<RuntimeLogRow>>(listPath('/api/admin/runtime-logs', query)),
+  runtimeLogStats: () =>
+    requestJson<{ queue_size: number; queue_capacity: number; dropped_count: number }>(
+      '/api/admin/runtime-logs/stats',
+    ),
   diagnosticEvents: () =>
     requestJson<{ items: DiagnosticEventRow[] }>('/api/admin/diagnostics/events?page_size=50'),
-  diagnosticTasks: () =>
-    requestJson<{ items: DiagnosticTaskRow[] }>('/api/admin/diagnostics/tasks?page_size=50'),
+  diagnosticTasks: (query?: AdminListQuery) =>
+    requestJson<{ items: DiagnosticTaskRow[] }>(
+      listPath('/api/admin/diagnostics/tasks', { page_size: 50, ...query }),
+    ),
+  retryDiagnosticTask: (taskId: string) =>
+    requestJson<{ id: string; status: string }>(`/api/admin/diagnostics/tasks/${taskId}/retry`, {
+      method: 'POST',
+      body: '{}',
+    }),
   incidents: (status = '') =>
     requestJson<{ items: IncidentRow[] }>(listPath('/api/admin/incidents', { status })),
+  incident: (incidentId: string) =>
+    requestJson<{ incident: IncidentRow; events: DiagnosticEventRow[] }>(
+      `/api/admin/incidents/${incidentId}`,
+    ),
+  updateIncident: (incidentId: string, status: string, notes: string) =>
+    requestJson<{ id: string; status: string; notes: string | null }>(
+      `/api/admin/incidents/${incidentId}`,
+      { method: 'PATCH', body: JSON.stringify({ status, notes }) },
+    ),
   catalog: () => requestJson<Catalog>('/api/admin/catalog'),
+  ruleAgents: (ruleId: string) => requestJson<AgentRow[]>(`/api/admin/rules/${ruleId}/agents`),
   judge: () => requestJson<JudgeProfile>('/api/admin/judge-profile'),
   storage: () => requestJson<StorageStatus>('/api/admin/storage'),
   matchWorkbenchOverview: (matchId: string) =>
     requestJson<MatchWorkbenchOverview>(`/api/admin/matches/${matchId}/workbench/overview`),
+  controlMatch: (matchId: string, action: 'terminate' | 'resume' | 'recover' | 'reset_speech') =>
+    requestJson<{ status: string; action_state: string; sequence: number }>(
+      `/api/admin/matches/${matchId}/control`,
+      { method: 'POST', body: JSON.stringify({ action }) },
+    ),
   matchWorkbenchParticipants: (matchId: string) =>
     requestJson<Record<string, unknown>[]>(`/api/admin/matches/${matchId}/workbench/participants`),
   matchWorkbenchTranscript: (matchId: string, page = 1) =>
@@ -78,6 +113,8 @@ export const adminApi = {
     ),
   externalCall: (callId: string) =>
     requestJson<ExternalCallDetail>(`/api/admin/external-calls/${callId}`),
+  externalCalls: (query?: AdminListQuery) =>
+    requestJson<AdminPage<ExternalCallRow>>(listPath('/api/admin/external-calls', query)),
   matchWorkbenchTimeline: (matchId: string, page = 1) =>
     requestJson<WorkbenchPage<WorkbenchTimelineItem>>(
       `/api/admin/matches/${matchId}/workbench/timeline?page=${page}&page_size=50`,

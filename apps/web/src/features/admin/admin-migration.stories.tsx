@@ -6,6 +6,7 @@ import AdminUsersPage from '@/app/admin/users/page';
 import AdminMatchesPage from '@/app/admin/matches/page';
 import AdminLogsPage from '@/app/admin/logs/page';
 import AdminModelsPage from '@/app/admin/models/page';
+import AdminSettingsPage from '@/app/admin/settings/page';
 import AdminVoicesPage from '@/app/admin/voices/page';
 import AdminTopicsPage from '@/app/admin/topics/page';
 
@@ -163,6 +164,14 @@ const handlers = [
       automatic_backup: false,
     }),
   ),
+  http.get('*/api/admin/settings', () =>
+    HttpResponse.json({
+      log_retention_days: 30,
+      debug_enabled: false,
+      debug_expires_at: null,
+      max_upload_bytes: 2 * 1024 * 1024,
+    }),
+  ),
   http.patch('*/api/admin/catalog/:kind/:id/status', () =>
     HttpResponse.json({ status: 'DISABLED' }),
   ),
@@ -208,9 +217,9 @@ export const Logs: Story = {
   render: () => <AdminLogsPage />,
   async play({ canvasElement }) {
     await expect(
-      within(canvasElement).findByRole('heading', { name: '日志管理' }),
+      within(canvasElement).findByRole('heading', { name: 'API 请求日志' }),
     ).resolves.toBeVisible();
-    await expect(within(canvasElement).findByText('admin.agent.updated')).resolves.toBeVisible();
+    await expect(within(canvasElement).findByText('查询模式')).resolves.toBeVisible();
   },
 };
 export const Models: Story = {
@@ -238,5 +247,16 @@ export const Topics: Story = {
       within(canvasElement).findByRole('heading', { name: '辩题管理' }),
     ).resolves.toBeVisible();
     await expect(within(canvasElement).findByText(topic.title)).resolves.toBeVisible();
+  },
+};
+export const Settings: Story = {
+  render: () => <AdminSettingsPage />,
+  async play({ canvasElement }) {
+    await expect(
+      within(canvasElement).findByRole('heading', { name: '系统设置' }),
+    ).resolves.toBeVisible();
+    await expect(within(canvasElement).findByLabelText('运行日志保留天数')).resolves.toHaveValue(
+      30,
+    );
   },
 };

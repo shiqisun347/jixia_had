@@ -127,9 +127,22 @@ class RoomConnectionService:
     ) -> bool:
         async with database_session.begin():
             current = await database_session.scalar(
-                select(RoomConnection)
-                .where(RoomConnection.user_id == user_id)
+                select(RoomConnection).where(RoomConnection.user_id == user_id).with_for_update()
+            )
+            lease = await database_session.scalar(
+                select(RoomConnectionLease)
+                .where(
+                    RoomConnectionLease.user_id == user_id,
+                    RoomConnectionLease.connection_id == connection_id,
+                    RoomConnectionLease.connection_epoch == connection_epoch,
+                )
                 .with_for_update()
+            )
+            if lease is None:
+                return False
+            is_current = current is not None and (
+                current.connection_id == connection_id
+                and current.connection_epoch == connection_epoch
             )
             result = await database_session.execute(
                 delete(RoomConnectionLease)
@@ -143,32 +156,28 @@ class RoomConnectionService:
             released = result.scalar_one_or_none() is not None
             if not released:
                 return False
-            remaining = await database_session.scalar(
-                select(RoomConnectionLease)
-                .where(RoomConnectionLease.user_id == user_id)
-                .order_by(RoomConnectionLease.connection_epoch.desc())
-                .limit(1)
-            )
-            if remaining is None:
-                if current is not None:
-                    await database_session.delete(current)
-                return True
-            if current is not None:
-                current.room_id = remaining.room_id
-                current.connection_id = remaining.connection_id
-                current.connection_epoch = remaining.connection_epoch
-                current.connected_at = remaining.connected_at
-                current.last_seen_at = remaining.last_seen_at
-            return False
+            # The summary remains a high-water row. Only releasing that exact
+            # connection may tell the caller that the current socket closed.
+            return is_current
 
     async def revoke_for_user(self, database_session: AsyncSession, *, user_id: UUID) -> None:
         async with database_session.begin():
             await database_session.execute(
                 delete(RoomConnectionLease).where(RoomConnectionLease.user_id == user_id)
             )
-            await database_session.execute(
-                delete(RoomConnection).where(RoomConnection.user_id == user_id)
+
+    async def clear_active_leases(self, database_session: AsyncSession) -> list[tuple[UUID, UUID]]:
+        """Drop leases left by a previous Core process while keeping epochs."""
+        async with database_session.begin():
+            rows = list(
+                (
+                    await database_session.execute(
+                        select(RoomConnectionLease.user_id, RoomConnectionLease.room_id)
+                    )
+                ).all()
             )
+            await database_session.execute(delete(RoomConnectionLease))
+        return [(row[0], row[1]) for row in rows]
 
 
 __all__ = ["ConnectionLease", "RoomConnectionService"]

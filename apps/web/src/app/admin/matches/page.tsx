@@ -2,13 +2,14 @@
 
 import { useQuery } from '@tanstack/react-query';
 import { type ColumnDef, getCoreRowModel, useReactTable } from '@tanstack/react-table';
-import { Activity, Archive, Gavel, Radio, Trash2, Volume2 } from 'lucide-react';
+import { Activity, Archive, CheckSquare, Gavel, Radio, Trash2, Volume2 } from 'lucide-react';
 import Link from 'next/link';
 import { useDeferredValue, useEffect, useMemo, useState } from 'react';
 
 import { useOptionalToast } from '@/components/ui/toast-provider';
 import { adminApi, readableAdminError } from '@/features/admin/admin-api';
 import {
+  AdminButton,
   AdminActionItem,
   AdminActionMenu,
   AdminConfirmDialog,
@@ -30,15 +31,19 @@ import { requestJson } from '@/lib/auth-api';
 import { commitAdminAction } from '@/features/admin/commit-admin-action';
 import { useAdminSubmit } from '@/features/admin/use-admin-submit';
 import { AdminBulkActions } from '@/features/admin/admin-bulk-actions';
+import { useAppTranslations } from '@/i18n';
 
 type MatchAction = 'terminate' | 'judge' | 'audio' | 'retention' | 'delete';
 type ActionTarget = { match: MatchRow; action: MatchAction } | null;
 
 export default function AdminMatchesPage() {
+  const t = useAppTranslations('Admin');
   const toast = useOptionalToast();
   const [query, setQuery] = useState('');
   const [status, setStatus] = useState('ALL');
   const [sort, setSort] = useState('created_at');
+  const [formatVersionId, setFormatVersionId] = useState('');
+  const [batchId, setBatchId] = useState('');
   const [page, setPage] = useState(1);
   const [target, setTarget] = useState<ActionTarget>(null);
   const [diagnosticMatch, setDiagnosticMatch] = useState<MatchRow | null>(null);
@@ -52,14 +57,16 @@ export default function AdminMatchesPage() {
       q: deferredQuery,
       status: status === 'ALL' ? '' : status,
       sort,
+      format_version_id: formatVersionId,
+      batch_id: batchId,
     }),
-    [deferredQuery, page, sort, status],
+    [batchId, deferredQuery, formatVersionId, page, sort, status],
   );
   const matchesQuery = useQuery({
     queryKey: ['admin', 'matches', params],
     queryFn: () => adminApi.matches(params),
   });
-  const matches = matchesQuery.data?.items ?? [];
+  const matches = useMemo(() => matchesQuery.data?.items ?? [], [matchesQuery.data?.items]);
   const diagnosticsQuery = useQuery({
     queryKey: ['admin', 'matches', diagnosticMatch?.id, 'agent-generations'],
     queryFn: () => adminApi.matchGenerations(diagnosticMatch?.id ?? ''),
@@ -76,6 +83,8 @@ export default function AdminMatchesPage() {
     setQuery(url.searchParams.get('q') ?? '');
     setStatus(url.searchParams.get('status') ?? 'ALL');
     setSort(url.searchParams.get('sort') ?? 'created_at');
+    setFormatVersionId(url.searchParams.get('format_version_id') ?? '');
+    setBatchId(url.searchParams.get('batch_id') ?? '');
     setPage(Number(url.searchParams.get('page') ?? 1) || 1);
   }, []);
   useEffect(() => {
@@ -88,8 +97,15 @@ export default function AdminMatchesPage() {
     else url.searchParams.set('sort', sort);
     if (page === 1) url.searchParams.delete('page');
     else url.searchParams.set('page', String(page));
+    if (formatVersionId) url.searchParams.set('format_version_id', formatVersionId);
+    else url.searchParams.delete('format_version_id');
+    if (batchId) url.searchParams.set('batch_id', batchId);
+    else url.searchParams.delete('batch_id');
     window.history.replaceState(null, '', `${url.pathname}${url.search}`);
-  }, [page, query, sort, status]);
+  }, [batchId, formatVersionId, page, query, sort, status]);
+  useEffect(() => {
+    setSelectedIds([]);
+  }, [batchId, deferredQuery, formatVersionId, status]);
 
   async function executeAction(selected = target) {
     if (!selected) return;
@@ -126,20 +142,20 @@ export default function AdminMatchesPage() {
       setTarget(null);
       const message =
         action === 'terminate'
-          ? '比赛已终止。'
+          ? t('matchesPage.terminated')
           : action === 'judge'
-            ? '重新评分任务已开始。'
+            ? t('matchesPage.judgeStarted')
             : action === 'audio'
-              ? '回放任务已排队。'
+              ? t('matchesPage.audioQueued')
               : action === 'retention'
                 ? match.files_permanent
-                  ? '已恢复默认保留期。'
-                  : '比赛音频已永久保留。'
-                : '比赛数据已删除。';
+                  ? t('matchesPage.retentionRestored')
+                  : t('matchesPage.audioRetained')
+                : t('matchesPage.deleted');
       toast?.showToast({ message, tone: 'success' });
       if (refreshResult.value === 'refresh_failed') {
         toast?.showToast({
-          message: '操作已完成，但比赛列表未刷新；请稍后手动刷新。',
+          message: t('matchesPage.refreshFailed'),
           tone: 'info',
         });
       }
@@ -148,14 +164,54 @@ export default function AdminMatchesPage() {
     }
   }
 
+  async function selectAllFiltered() {
+    try {
+      const result = await adminApi.matchIds({
+        q: deferredQuery,
+        status: status === 'ALL' ? '' : status,
+        format_version_id: formatVersionId,
+        batch_id: batchId,
+      });
+      setSelectedIds(result.ids);
+      if (result.truncated) {
+        toast?.showToast({ message: '结果超过 5000 项，请缩小筛选范围后再全选。', tone: 'error' });
+      } else {
+        toast?.showToast({
+          message: `已选择当前筛选结果 ${result.total} 场比赛。`,
+          tone: 'success',
+        });
+      }
+    } catch (error) {
+      toast?.showToast({ message: readableAdminError(error), tone: 'error' });
+    }
+  }
+
   const columns = useMemo<ColumnDef<MatchRow>[]>(
     () => [
       {
         id: 'select',
-        header: '选择',
+        header: () => {
+          const visibleIds = matches.map((item) => item.id);
+          const allVisible =
+            visibleIds.length > 0 && visibleIds.every((id) => selectedIds.includes(id));
+          return (
+            <input
+              aria-label={t('common.selectCurrentPage')}
+              checked={allVisible}
+              onChange={() =>
+                setSelectedIds((current) =>
+                  allVisible
+                    ? current.filter((id) => !visibleIds.includes(id))
+                    : [...new Set([...current, ...visibleIds])],
+                )
+              }
+              type="checkbox"
+            />
+          );
+        },
         cell: ({ row }) => (
           <input
-            aria-label={`选择 ${row.original.label || '比赛'}`}
+            aria-label={t('common.selectItem', { label: row.original.label || t('matchesPage.match') })}
             checked={selectedIds.includes(row.original.id)}
             onChange={() =>
               setSelectedIds((current) =>
@@ -170,7 +226,7 @@ export default function AdminMatchesPage() {
       },
       {
         accessorKey: 'label',
-        header: '比赛',
+        header: t('matchesPage.match'),
         cell: ({ row }) => {
           return (
             <div className="min-w-64">
@@ -178,10 +234,10 @@ export default function AdminMatchesPage() {
                 className="font-black text-slate-950 hover:text-blue-700"
                 href={`/admin/matches/${row.original.id}`}
               >
-                {row.original.label || '未命名比赛'}
+                {row.original.label || t('matchesPage.unnamed')}
               </Link>
               <p className="mt-1 truncate text-xs text-slate-600">
-                {row.original.display_topic || '未记录辩题'}
+                {row.original.display_topic || t('matchesPage.noTopic')}
               </p>
             </div>
           );
@@ -189,12 +245,12 @@ export default function AdminMatchesPage() {
       },
       {
         accessorKey: 'status',
-        header: '状态',
+        header: t('matchesPage.status'),
         cell: ({ row }) => <StatusBadge status={row.original.status} />,
       },
       {
         accessorKey: 'created_at',
-        header: '创建时间',
+        header: t('matchesPage.createdAt'),
         cell: ({ row }) => (
           <span className="text-xs text-slate-600">
             {new Date(row.original.created_at).toLocaleString('zh-CN')}
@@ -203,7 +259,7 @@ export default function AdminMatchesPage() {
       },
       {
         id: 'files',
-        header: '数据',
+        header: t('matchesPage.data'),
         cell: ({ row }) => (
           <span className="text-xs text-slate-600">
             上下文 v{row.original.context_version} · 文件 {row.original.file_count}
@@ -213,7 +269,7 @@ export default function AdminMatchesPage() {
       },
       {
         id: 'actions',
-        header: '操作',
+        header: t('matchesPage.action'),
         cell: ({ row }) => {
           const match = row.original;
           const terminal = ['FINISHED', 'TERMINATED'].includes(match.status);
@@ -224,11 +280,11 @@ export default function AdminMatchesPage() {
                   onSelect={() => window.location.assign(`/admin/matches/${match.id}`)}
                 >
                   <Activity className="mr-2 size-3.5" aria-hidden="true" />
-                  打开比赛工作台
+                  {t('matchesPage.openWorkbench')}
                 </AdminActionItem>
                 <AdminActionItem onSelect={() => setDiagnosticMatch(match)}>
                   <Activity className="mr-2 size-3.5" aria-hidden="true" />
-                  模型诊断
+                  {t('matchesPage.diagnostics')}
                 </AdminActionItem>
                 {!terminal ? (
                   <AdminActionItem
@@ -236,25 +292,25 @@ export default function AdminMatchesPage() {
                     tone="danger"
                   >
                     <Radio className="mr-2 size-3.5" aria-hidden="true" />
-                    终止比赛
+                    {t('matchesPage.terminate')}
                   </AdminActionItem>
                 ) : null}
                 {match.status === 'FINISHED' ? (
                   <AdminActionItem onSelect={() => setTarget({ match, action: 'judge' })}>
                     <Gavel className="mr-2 size-3.5" aria-hidden="true" />
-                    重新评分
+                    {t('matchesPage.retryJudge')}
                   </AdminActionItem>
                 ) : null}
                 {terminal ? (
                   <AdminActionItem onSelect={() => setTarget({ match, action: 'audio' })}>
                     <Volume2 className="mr-2 size-3.5" aria-hidden="true" />
-                    生成/重试回放
+                    {t('matchesPage.retryAudio')}
                   </AdminActionItem>
                 ) : null}
                 {terminal && match.file_count > 0 ? (
                   <AdminActionItem onSelect={() => setTarget({ match, action: 'retention' })}>
                     <Archive className="mr-2 size-3.5" aria-hidden="true" />
-                    {match.files_permanent ? '恢复保留期' : '永久保留音频'}
+                    {match.files_permanent ? t('matchesPage.restoreRetention') : t('matchesPage.retainAudio')}
                   </AdminActionItem>
                 ) : null}
                 {terminal ? (
@@ -263,7 +319,7 @@ export default function AdminMatchesPage() {
                     tone="danger"
                   >
                     <Trash2 className="mr-2 size-3.5" aria-hidden="true" />
-                    永久删除
+                    {t('matchesPage.delete')}
                   </AdminActionItem>
                 ) : null}
               </AdminActionMenu>
@@ -272,7 +328,7 @@ export default function AdminMatchesPage() {
         },
       },
     ],
-    [selectedIds],
+    [matches, selectedIds],
   );
   // eslint-disable-next-line react-hooks/incompatible-library
   const table = useReactTable({ data: matches, columns, getCoreRowModel: getCoreRowModel() });
@@ -312,11 +368,39 @@ export default function AdminMatchesPage() {
             value={status}
           >
             <option value="ALL">全部状态</option>
+            <option value="START_PENDING_RUNTIME">等待运行时</option>
+            <option value="START_COUNTDOWN">开赛倒计时</option>
             <option value="RUNNING">进行中</option>
             <option value="PAUSED">已暂停</option>
+            <option value="SYSTEM_RECOVERY">系统恢复中</option>
+            <option value="ERROR">异常</option>
             <option value="FINISHED">已结束</option>
             <option value="TERMINATED">已终止</option>
           </AdminSelect>
+          <AdminButton onClick={() => void selectAllFiltered()} size="sm" tone="secondary">
+            <CheckSquare className="size-3.5" />
+            全选当前筛选结果（{matchesQuery.data?.total ?? 0}）
+          </AdminButton>
+          <input
+            aria-label="赛制版本 ID"
+            className="admin-field max-w-64"
+            onChange={(event) => {
+              setPage(1);
+              setFormatVersionId(event.target.value.trim());
+            }}
+            placeholder="赛制版本 ID"
+            value={formatVersionId}
+          />
+          <input
+            aria-label="实验批次 ID"
+            className="admin-field max-w-64"
+            onChange={(event) => {
+              setPage(1);
+              setBatchId(event.target.value.trim());
+            }}
+            placeholder="实验批次 ID"
+            value={batchId}
+          />
           <AdminSelect
             label="比赛排序"
             onChange={(event) => {

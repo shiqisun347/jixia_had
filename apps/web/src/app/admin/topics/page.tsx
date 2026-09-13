@@ -106,6 +106,18 @@ export default function AdminTopicsPage() {
         ),
       },
       {
+        id: 'source',
+        header: '来源',
+        cell: ({ row }) => (
+          <div className="max-w-sm text-xs text-slate-600">
+            <p className="truncate">{row.original.source_text || '未填写原始来源'}</p>
+            <p className="mt-1 truncate text-slate-500">
+              CEDAR：{row.original.cedar_id || '未取得'}
+            </p>
+          </div>
+        ),
+      },
+      {
         accessorKey: 'status',
         header: '状态',
         cell: ({ row }) => <StatusBadge status={row.original.status} />,
@@ -209,6 +221,8 @@ function TopicDrawer({
   const [title, setTitle] = useState(topic?.title ?? '');
   const [affirmative, setAffirmative] = useState(topic?.affirmative_text ?? '');
   const [negative, setNegative] = useState(topic?.negative_text ?? '');
+  const [source, setSource] = useState(topic?.source_text ?? '');
+  const [cedarId, setCedarId] = useState(topic?.cedar_id ?? '');
   async function save() {
     try {
       const result = await submitCatalogSave(
@@ -222,6 +236,8 @@ function TopicDrawer({
                 title: title.trim(),
                 affirmative_text: affirmative.trim(),
                 negative_text: negative.trim(),
+                source_text: source.trim() || null,
+                cedar_id: cedarId.trim() || null,
               }),
             },
           ),
@@ -260,6 +276,8 @@ function TopicDrawer({
         <Field label="辩题标题" value={title} onChange={setTitle} />
         <Area label="正方立场" value={affirmative} onChange={setAffirmative} />
         <Area label="反方立场" value={negative} onChange={setNegative} />
+        <Area label="原始来源文本" value={source} onChange={setSource} />
+        <Field label="CEDAR ID（可选）" value={cedarId} onChange={setCedarId} />
       </div>
     </AdminDrawer>
   );

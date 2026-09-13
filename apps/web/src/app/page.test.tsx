@@ -43,10 +43,13 @@ describe('home prototype route', () => {
 
     expect(
       screen.getByRole('heading', {
-        name: '让人类与 Agent，在声音中交锋与共创',
+        name: '人机共辩，百家之言各得鸣。',
       }),
     ).toBeVisible();
     expect(screen.getByRole('navigation', { name: '主导航' })).toBeVisible();
+    expect(
+      screen.getByRole('navigation', { name: '主导航' }).querySelector('a[href="/experiments"]'),
+    ).toBeNull();
     expect(screen.getByRole('heading', { name: '正在进行' })).toBeVisible();
     expect(screen.queryByTestId('home-prototype-note')).not.toBeInTheDocument();
     await waitFor(() => expect(requestJson).toHaveBeenCalledWith('/api/leaderboards'));

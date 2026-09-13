@@ -49,7 +49,7 @@ export const HomeDefault: Story = {
     await expect(payload.rooms).toHaveLength(3);
     await expect(
       canvas.getByRole('heading', {
-        name: /让人类与 Agent，\s*在声音中交锋与共创/,
+        name: /人机共辩，\s*百家之言各得鸣。/,
       }),
     ).toBeVisible();
     await expect(canvas.getAllByRole('link', { name: /查看比赛：/ })).toHaveLength(3);

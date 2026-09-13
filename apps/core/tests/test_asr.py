@@ -9,10 +9,15 @@ from uuid import UUID, uuid4
 
 import pytest
 
-from jx_core.asr.protocol import FunAsrConnection
-from jx_core.asr.runtime import MatchAudioReceiver
+from jx_core.asr.protocol import FunAsrConnection, FunAsrError
+from jx_core.asr.runtime import (  # pyright: ignore[reportPrivateUsage]
+    MatchAudioReceiver,
+    _user_id_from_identity,
+)
 from jx_core.asr.session import AsrQueueFull, AsrSpeechSession
 from jx_core.config import Settings
+from jx_core.data_capture.provider import ProviderCallCapture
+from jx_core.runtime_identity import CallbackEnvelope
 
 
 class FakeSocket:
@@ -91,6 +96,30 @@ async def test_fun_asr_protocol_waits_for_task_started_and_finishes() -> None:
     assert result.final_text == "你好，"
     assert seen == ["你好，"]
     assert socket.sent_actions == ["run-task", "finish-task"]
+    capture = connection.take_capture(result.task_id)
+    assert isinstance(capture, ProviderCallCapture)
+    assert capture.request is not None
+    assert capture.request.payload["binary_summary"] == {
+        "direction": "platform_to_provider",
+        "format": "pcm_s16le_16000_mono",
+        "frame_count": 1,
+        "total_bytes": 3200,
+        "audio_duration_ms": 100,
+    }
+    assert "\\x00" not in str(capture.request.payload)
+    assert capture.response is not None
+    assert capture.response.payload["events"][-1]["header"]["event"] == "task-finished"
+
+
+def test_fun_asr_capture_buffer_is_bounded_and_cleared_on_close() -> None:
+    connection = FunAsrConnection(url="wss://asr.test", api_key="secret")
+    task_ids = [uuid4() for _ in range(connection._MAX_PENDING_CAPTURES + 1)]
+
+    for task_id in task_ids:
+        connection._store_capture(task_id, ProviderCallCapture())
+
+    assert connection.take_capture(task_ids[0]) is None
+    assert connection.take_capture(task_ids[-1]) is not None
 
 
 @pytest.mark.asyncio
@@ -261,6 +290,48 @@ async def test_asr_session_resumes_same_speech_with_contiguous_segment_and_prefi
     assert result.audio_duration_ms == 200
 
 
+@pytest.mark.asyncio
+async def test_asr_session_rejects_empty_audio_before_provider_request() -> None:
+    provider_calls = 0
+
+    async def factory(_: str, __: dict[str, str]) -> FakeSocket:
+        nonlocal provider_calls
+        provider_calls += 1
+        return FakeSocket()
+
+    connection = FunAsrConnection(url="wss://asr.test", api_key="secret", socket_factory=factory)
+    speech = AsrSpeechSession(
+        speech_id=uuid4(),
+        connection=connection,
+        on_interim=lambda *_args: _record([], ""),
+        on_segment=lambda *_args: _record_int([], 0),
+    )
+    await speech.finish()
+
+    with pytest.raises(FunAsrError, match="asr_empty_audio"):
+        await speech.run()
+
+    assert provider_calls == 0
+
+
+def test_asr_resolves_current_livekit_human_identity() -> None:
+    user_id = UUID("11111111-1111-1111-1111-111111111111")
+    identity = (
+        "jx-human-22222222-2222-2222-2222-222222222222-"
+        "11111111-1111-1111-1111-111111111111-3-abcdef12"
+    )
+
+    assert _user_id_from_identity(identity) == user_id
+
+
+def test_asr_keeps_legacy_identity_compatibility_and_rejects_other_participants() -> None:
+    user_id = UUID("11111111-1111-1111-1111-111111111111")
+
+    assert _user_id_from_identity(f"user-{user_id}") == user_id
+    assert _user_id_from_identity("jx-agent-22222222-2222-2222-2222-222222222222-abcd") is None
+    assert _user_id_from_identity("jx-human-not-a-valid-identity") is None
+
+
 async def _record_int(target: list[int], value: int) -> None:
     target.append(value)
 
@@ -269,8 +340,9 @@ class RuntimeCallbacks:
     def __init__(self) -> None:
         self.segments: list[int] = []
         self.finalized: list[dict[str, Any]] = []
+        self.failures: list[tuple[object, ...]] = []
 
-    async def publish_asr_interim(self, *_args: object) -> None:
+    async def publish_asr_interim(self, **_kwargs: object) -> None:
         return
 
     async def persist_asr_segment(self, **payload: Any) -> None:
@@ -280,8 +352,8 @@ class RuntimeCallbacks:
         self.finalized.append(payload)
         return object()
 
-    async def handle_asr_failure(self, *_args: object) -> None:
-        pytest.fail("ASR runtime unexpectedly failed")
+    async def handle_asr_failure(self, **_kwargs: object) -> None:
+        self.failures.append(tuple(_kwargs.values()))
 
 
 @pytest.mark.asyncio
@@ -302,23 +374,85 @@ async def test_receiver_pause_resumes_same_business_speech_without_early_final()
     receiver._connection = connection
     speech_id = uuid4()
     user_id = uuid4()
+    envelope = CallbackEnvelope(
+        match_id=receiver.match_id,
+        speech_id=speech_id,
+        attempt_no=1,
+        generation_id=None,
+        connection_epoch=1,
+        context_version=0,
+        opportunity_id=None,
+        opportunity_generation=None,
+    )
 
-    await receiver.start_speech(speech_id, user_id)
+    resumed_envelope = CallbackEnvelope(
+        match_id=receiver.match_id,
+        speech_id=speech_id,
+        attempt_no=1,
+        generation_id=None,
+        connection_epoch=2,
+        context_version=0,
+        opportunity_id=None,
+        opportunity_generation=None,
+    )
+    await receiver.start_speech(speech_id, user_id, envelope)
     assert receiver._speech is not None
     receiver._speech.feed_pcm(b"\x00" * 3200)
     await receiver.pause_speech(speech_id)
     assert callbacks.finalized == []
 
-    await receiver.start_speech(speech_id, user_id)
+    await receiver.start_speech(speech_id, user_id, resumed_envelope)
     assert receiver._speech is not None
     receiver._speech.feed_pcm(b"\x00" * 3200)
     await receiver.finish_speech(speech_id)
 
     assert callbacks.segments == [1, 2]
     assert len(callbacks.finalized) == 1
-    assert callbacks.finalized[0]["speech_id"] == speech_id
+    assert callbacks.finalized[0]["envelope"].speech_id == speech_id
+    assert callbacks.finalized[0]["envelope"].connection_epoch == 2
     assert callbacks.finalized[0]["final_text"] == "你好，你好，"
     assert callbacks.finalized[0]["audio_duration_ms"] == 200
+    assert callbacks.failures == []
+
+
+@pytest.mark.asyncio
+async def test_receiver_pause_does_not_report_provider_close_failure() -> None:
+    callbacks = RuntimeCallbacks()
+    receiver = MatchAudioReceiver(
+        match_id=uuid4(),
+        settings=cast(Settings, object()),
+        callbacks=callbacks,
+    )
+    speech_id = uuid4()
+
+    class FailingSession:
+        def __init__(self) -> None:
+            self.speech_id = speech_id
+
+        async def finish(self) -> None:
+            return
+
+        async def run(self) -> None:
+            raise FunAsrError("asr_task_failed")
+
+        def checkpoint(self) -> SimpleNamespace:
+            return SimpleNamespace(
+                final_text="已确认前缀",
+                audio_duration_ms=2_000,
+                last_segment_no=3,
+                first_interim_latency_ms=120,
+            )
+
+    session = cast(Any, FailingSession())
+    receiver._speech = session
+    receiver._speech_task = asyncio.create_task(receiver._run_speech(session))
+
+    await receiver.pause_speech(speech_id)
+
+    assert callbacks.failures == []
+    assert receiver._paused_speech is not None
+    assert receiver._paused_speech.final_text == "已确认前缀"
+    assert receiver._paused_speech.last_segment_no == 3
 
 
 def test_human_recording_publishes_atomically_and_reset_discards_spool(tmp_path) -> None:
