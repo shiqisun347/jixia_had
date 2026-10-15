@@ -3670,3 +3670,80 @@ WebHX2A/schema0047/ownedrtc0，仍paused766345/lease1、waiting034835。已发�
 两房async请求，暂停比赛终止不可恢复、候场关闭不可继续，保留历史；答复前不创建
 管理session、不调用终止接口、不停服务。发布后尾音/混合赛尚未执行。报告
 profile_output/spec305/release/RELEASE_REPORT.md、ROOT_TRUST_RECEIPT、UPLOAD_RECEIPT。
+
+
+### Spec305用户批准结束两旧房，正常接口完成，尚待释放旧连接租约
+
+用户明确答复call_0b5f607cc3224b0794f8b9412fbff0b7：“结束暂停比赛并关闭两个旧房间，
+保留历史后发布（推荐）”。真实批准收到UTC15:36:46；APPROVAL0709e3ec…绑定原两UUID/
+latestRO78ead…和披露occupancy，freshRO15:37:51不增长。final90b helper正常HTTPS
+两POST均200，23:38:29CST暂停match+两房TERMINATED/ended_at均正常，8speech/8member/
+16seat/2generation/1match/2room历史计数不变，临时Session89dc…精确撤销、cookie清空。
+CLOSURE_RECEIPT.json保留。仍1旧ADMIN SPECTATOR lease，因此未停服/未执行publisher。
+15:40:58UTC freshRO唯一lease准确属于已TERM766345/同match、唯一ACTIVEADMIN e679…、
+epoch142/connection8bc…，连接last_seen22:51:23CST。A确认无leaseTTL/自动扫表，terminal
+WS仍可留连接；C独立确认在本次明确结束room授权内，可用正常同ADMIN terminal events
+连接替换→close完成精确lease释放，不SQL删、不改gate或其他room。A准备最小ignored
+helper+控制/C独审，若并发用户重连使lease非0则失败、不盲重试。线上仍原Spec304与
+WebHX2A，发布步骤尚未执行；所有Spec306并行文件保留。
+
+
+### Spec305正式上线并完成安装后真实语音/完整混合赛复验
+
+2026-10-15 23:51CST按用户授权发布20261015-spec305-24ccc540。先normalWS收尾142→143
+已normalclose/ownsessionrevoke/0lease/历史事件counts同，check-only通过。首启动器广义
+LAUNCH占位替换误伤receipt文件名导致语法错误、业务未执行；保留失败收据并仅修
+启动器、compile后正常detached启动178496。冻结publisher e1d3最终published，四gate
+均0、112rooms/95matches/1336speeches/schema0047前后完全同；双旧源备份700目录
+/opt/jixia-release-backups/20261015-spec305-24ccc540。Core/Jobs/Web新PID178585/587/589
+active0restart，WebHX2A不改。C独立真实RO/双备份/SDK1.1.20/122新源/health通过，
+review f8da4c23eaa40824e0084f82ddcc1bcf3d1ea4301901598fc31dedefe3c86c5f。
+
+安装后browser-01实际installed mode185QA+122安装+3音源前后审计：3baseline真缺尾→
+3protected完整，6onsetpresence通过，全段frame连续，原始实际buffer344.9–397.2ms，
+SDKunsub清srcObject/child0/FFI和ownedroom/owner0通过。TAILQUAL0be2eb50…，F最终
+原PCM/directNCC/规则35/原始counter晚窗freshness/proof包络±128/实际installed路径
+独审9d57bf940a4c174b1dc229ba08edc5fc8e79f5d7f1e12dcc398e983edaad4169 passed。
+旧rigid/driver1与全部旧失败保持，不升级为pass。
+
+安装后完整混合赛230405ms自然FINISHED，每队2模拟真人+2Agent，实际16speech
+FINALIZED（fixed8/free8）、8AgentGenFINALIZED，双四辩/结束主持/Judge/AWARDS/实际Jobs
+归档通过：26sources=16speech+10host、6629976正文样本与独立解码差0。自然收尾6次
+650–707ms，TIME_LIMIT2次约2.1s原取消，不额外保护。权威错误0，ownedPG/音频/RTC
+清理，Agent/Host/ASR/Actor/pending starts/tasks新增owner均0；保留2条供应商
+cleanup_timeout，不宣称关闭超时已解决。发布前候选15speech与安装后16speech按各
+实际记录报告，不偷换为固定15/7Agent。产用户/比赛新增0，仅正常OPS_PROBE审计可能写。
+
+15:59:21UTC最终RO（23:59:21CST）122源匹配/三PID与0restart稳定/live-ready-Web200/
+非终态房赛0/自有测试RTC0。后续浏览器正常重连终态766345，epoch144、原ADMIN
+SPECTATOR/lease1且非target0；不是发布四gate前活动或安装失败，不再次关房/改lease。
+既有terminalWS不自动结束且lease无TTL的运维风险保留后续治理。两场混合实际完赛，
+不冒称物理mic/音箱、五场压力/50LLM/11音色盲听。Spec306并行文件/独立站点未动。
+证据profile_output/spec305/release/、browser-tail-buffered/installed-browser-01/、
+mixed-installed-01/。最终文档同步GitHub后交付。
+
+
+## Spec306 — 按用户明确提供的八席名单更新独立展示站点
+
+用户直接在消息中提供名单，未读取api.md：正方1吴昊轩/2执锋Agent/3孙运海/4博闻Agent，
+反方1曹合欢/2睿断Agent/3孔德琳/4明辨Agent。通过独立站点正常HTTPS管理员API保存
+并发布，只改participants；此前草稿与已发布内容完全一致，未夹带发布其他草稿。
+各方真人1/3、Agent2/4，沿用固定ID及预设头像；阶段、投票开关、轮次保持，0票无提交。
+服务器私有配置备份保留；后台验证会话已登出，无代码/服务/原辩论平台变更。
+用户提及睿断男音：独立站点无语音链，未实际配置音色；已异步询问是否需要修改原
+辩论系统，待明确答复，不以男款预设展示头像冒充实际男声配置。
+公网浏览器验证八席姓名/4真人4Agent以及投票页面所用公开名单一致；未存生产截图。
+
+
+## 2026-10-16 — 取消睿断男声音色待办
+
+用户明确要求忽略先前“配置男音”这句话。该待确认项已解除，不再调整睿断实际音色；
+独立展示站点已发布的八席名单保持不变，原辩论系统与音色配置不动。
+
+
+安装混合最终独审e3537f940717b1fccd13ad78754cef0783ebfd2471a4b6370c071635d1302395，
+31项通过/输入前后SHA稳定，实际16/8/26及6natural+2TIME_LIMIT/6629976diff0和资源
+清理均核；保留2条TTS关闭timeout，以及主持disconnect/终局callback中间取消观测，
+最终权威FINISHED1/owners0通过，不把每条中间操作均记正常返回。FINAL_DELIVERY.json
+已绑定完整发布/安装/尾音/混合赛/闭房/normalWS及最终RO原件SHA，当前状态已发布并
+完成复验（适用范围及遗留限制保留）；最终报告release/RELEASE_REPORT.md。
