@@ -80,6 +80,7 @@ AGENT_TASK_CANCEL_TIMEOUT_SECONDS = 3.0
 AGENT_TTS_QUEUE_SIZE = 32
 AGENT_PROVIDER_RETRY_BACKOFF_SECONDS = 0.5
 AGENT_RESOURCE_CLEANUP_TIMEOUT_SECONDS = 0.5
+AGENT_AUDIO_TAIL_MS = 600
 CLOSED_MATCH_TOMBSTONE_LIMIT = 4096
 AGENT_HISTORY_CHAR_BUDGET = 24_000
 AGENT_HISTORY_ENTRY_OVERHEAD_CHARS = 256
@@ -1081,6 +1082,9 @@ class AgentRuntime:
             return
         run.finalizing = True
         truncated = reason != "COMPLETED" or not run.natural_complete
+        finalizing_source = run.source
+        finalizing_envelope = run.callback_envelope
+        finalizing_action, finalizing_agent = run.action_key, run.agent_profile_id
         if truncated:
             if run.source is not None:
                 _try_agent_cleanup(run.source.clear_queue, resource="agent_audio_queue")
@@ -1105,11 +1109,21 @@ class AgentRuntime:
             os.replace(run.spool_path, run.storage_path)
         try:
             async with asyncio.timeout(AGENT_FINALIZATION_TIMEOUT_SECONDS):
+                if not truncated:
+                    await self._protect_agent_audio_tail(run)
                 await self._persist_final(run)
+                if not truncated:
+                    self._require_current_agent_audio_tail(
+                        run,
+                        envelope=finalizing_envelope,
+                        source=finalizing_source,
+                        action_key=finalizing_action,
+                        agent_profile_id=finalizing_agent,
+                    )
                 if self._runs.get(match_id) is run:
                     self._runs.pop(match_id, None)
                 callback_kwargs: dict[str, Any] = {
-                    "envelope": self._run_envelope(run),
+                    "envelope": (finalizing_envelope if not truncated else self._run_envelope(run)),
                     "final_text": final_text,
                     "llm_draft_text": draft,
                     "audio_storage_path": str(run.storage_path),
@@ -1173,13 +1187,84 @@ class AgentRuntime:
                 envelope=self._run_envelope(run), error_code="agent_finalization_failed"
             )
         finally:
+            # The producer may already have handed this completed run over.
+            # Retirement must never remove a replacement run for the match.
+            if self._runs.get(match_id) is run:
+                self._runs.pop(match_id, None)
             try:
-                await asyncio.wait_for(self._close_run(run), timeout=3.0)
+                await asyncio.wait_for(
+                    self._close_run(run, expected_source=finalizing_source), timeout=3.0
+                )
             except TimeoutError:
                 logger.warning(
                     "agent media cleanup timed out",
                     extra={"error_code": "agent_cleanup_timeout"},
                 )
+
+    async def _protect_agent_audio_tail(self, run: AgentRun) -> None:
+        """Flush native partial frames and let remote audio precede unpublication.
+
+        The authority has already frozen the content budget. These bounded
+        zero frames belong only to the same source's transport tail: they do
+        not change the content spool, played samples or official duration.
+        """
+        source = run.source
+        envelope = run.callback_envelope
+        if source is None or envelope is None:
+            raise TtsProviderError("agent_finalization_media_missing")
+        action_key, agent_profile_id = run.action_key, run.agent_profile_id
+
+        def require_current() -> None:
+            self._require_current_agent_audio_tail(
+                run,
+                envelope=envelope,
+                source=source,
+                action_key=action_key,
+                agent_profile_id=agent_profile_id,
+            )
+
+        frame = rtc.AudioFrame(
+            data=b"\x00" * (48_000 // 50 * 2),
+            sample_rate=48_000,
+            num_channels=1,
+            samples_per_channel=48_000 // 50,
+        )
+        try:
+            for _ in range(AGENT_AUDIO_TAIL_MS // 20):
+                async with self._media_lock:
+                    require_current()
+                    await source.capture_frame(frame)
+                    require_current()
+            require_current()
+            # Do not hold a media lock while waiting for native playout or
+            # any authority callback. Interruptions can fence this run now.
+            await source.wait_for_playout()
+            require_current()
+        except (Exception, asyncio.CancelledError):
+            _try_agent_cleanup(source.clear_queue, resource="agent_audio_tail")
+            raise
+
+    def _require_current_agent_audio_tail(
+        self,
+        run: AgentRun,
+        *,
+        envelope: CallbackEnvelope | None,
+        source: rtc.AudioSource | None,
+        action_key: str,
+        agent_profile_id: UUID,
+    ) -> None:
+        if (
+            source is None
+            or envelope is None
+            or self._runs.get(run.match_id) is not run
+            or run.source is not source
+            or not self.agent_callback_is_current(
+                envelope=envelope,
+                action_key=action_key,
+                agent_profile_id=agent_profile_id,
+            )
+        ):
+            raise asyncio.CancelledError
 
     async def reset_agent(self, match_id: UUID) -> None:
         self.retire_pending_media_start(match_id)
@@ -1235,6 +1320,7 @@ class AgentRuntime:
         self._tts_connections.clear()
 
     async def _run_with_retry(self, run: AgentRun) -> None:
+        handed_to_finalizer = False
         try:
             for attempt in (1, 2):
                 if (
@@ -1292,6 +1378,7 @@ class AgentRuntime:
                         )
                         raise
                     await self._execute(run, config, generation_id)
+                    handed_to_finalizer = run.natural_complete and run.speech_id is not None
                     return
                 except asyncio.CancelledError:
                     raise
@@ -1371,7 +1458,12 @@ class AgentRuntime:
             # A fenced run is still owned by the authority's pending reset or
             # finalizer. Keep its handle until that handler takes ownership.
             # Other terminal tasks must not block recovery of the same action.
-            if self._runs.get(run.match_id) is run and not run.media_fenced:
+            if (
+                self._runs.get(run.match_id) is run
+                and not run.media_fenced
+                and not run.finalizing
+                and not handed_to_finalizer
+            ):
                 self._runs.pop(run.match_id, None)
 
     async def _discard_tts_connection(self, match_id: UUID) -> None:
@@ -3115,12 +3207,16 @@ class AgentRuntime:
             if not completed.cancelled():
                 completed.exception()
 
-    async def _close_run(self, run: AgentRun) -> None:
+    async def _close_run(
+        self, run: AgentRun, *, expected_source: rtc.AudioSource | None = None
+    ) -> None:
         decoder, run.decoder = run.decoder, None
         if decoder is not None:
             _try_agent_cleanup(decoder.finish_input, resource="agent_decoder_input")
             await _bounded_agent_cleanup(decoder.close(), resource="agent_decoder")
-        source, run.source = run.source, None
+        source = expected_source if expected_source is not None else run.source
+        if run.source is source:
+            run.source = None
         if source is not None:
             await _bounded_agent_cleanup(source.aclose(), resource="agent_audio_source")
         room, run.room = run.room, None

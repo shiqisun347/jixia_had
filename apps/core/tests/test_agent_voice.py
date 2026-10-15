@@ -5,8 +5,9 @@ import inspect
 import io
 import json
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 from uuid import uuid4
 
 import av
@@ -1519,6 +1520,29 @@ async def test_truncated_agent_finalization_is_bounded_when_pipeline_cleanup_sta
     await pipeline
 
 
+def _attach_natural_finalizer_media(run: AgentRun) -> None:
+    # These persistence fault controls now pass through the real transport tail.
+    run.source = cast(
+        Any,
+        SimpleNamespace(
+            capture_frame=AsyncMock(),
+            wait_for_playout=AsyncMock(),
+            clear_queue=Mock(),
+            aclose=AsyncMock(),
+        ),
+    )
+    run.callback_envelope = CallbackEnvelope(
+        match_id=run.match_id,
+        speech_id=run.speech_id,
+        attempt_no=1,
+        generation_id=run.generation_id,
+        connection_epoch=None,
+        context_version=0,
+        opportunity_id=None,
+        opportunity_generation=None,
+    )
+
+
 @pytest.mark.asyncio
 async def test_agent_finalization_failure_reports_authoritative_error(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -1548,6 +1572,7 @@ async def test_agent_finalization_failure_reports_authoritative_error(
         played_samples=48_000,
         natural_complete=True,
     )
+    _attach_natural_finalizer_media(runtime._runs[match_id])
     monkeypatch.setattr(
         runtime,
         "_persist_final",
@@ -1592,6 +1617,7 @@ async def test_agent_finalization_retries_callback_after_transient_commit_failur
         played_samples=48_000,
         natural_complete=True,
     )
+    _attach_natural_finalizer_media(runtime._runs[match_id])
     monkeypatch.setattr(runtime, "_persist_final", AsyncMock())
 
     await runtime.finalize_agent(match_id, speech_id, "COMPLETED")
@@ -1628,6 +1654,7 @@ async def test_agent_finalization_timeout_reports_authoritative_error(
         played_samples=48_000,
         natural_complete=True,
     )
+    _attach_natural_finalizer_media(runtime._runs[match_id])
 
     async def stalled_persist(_: AgentRun) -> None:
         await asyncio.Event().wait()

@@ -16,6 +16,7 @@ from jx_core.agent.runtime import AgentRun, AgentRuntime, HostAudioRun
 from jx_core.config import Settings
 from jx_core.matches.domain import MatchAction, MatchActor, MatchCommand, MatchRuntimeState
 from jx_core.matches.service import MatchRuntimeManager
+from jx_core.runtime_identity import CallbackEnvelope
 
 
 def make_runtime(callbacks: Any) -> AgentRuntime:
@@ -142,6 +143,8 @@ async def test_public_agent_finalizer_closes_remaining_media_after_decoder_input
         close=AsyncMock(),
     )
     source = SimpleNamespace(
+        capture_frame=AsyncMock(),
+        wait_for_playout=AsyncMock(),
         clear_queue=Mock(
             side_effect=(
                 RuntimeError("synthetic-private-clear-failure")
@@ -167,6 +170,16 @@ async def test_public_agent_finalizer_closes_remaining_media_after_decoder_input
         decoder=cast(Any, decoder),
         source=cast(Any, source),
         room=cast(Any, room),
+    )
+    run.callback_envelope = CallbackEnvelope(
+        match_id=run.match_id,
+        speech_id=run.speech_id,
+        attempt_no=1,
+        generation_id=run.generation_id,
+        connection_epoch=None,
+        context_version=0,
+        opportunity_id=None,
+        opportunity_generation=None,
     )
     runtime._runs[run.match_id] = run  # pyright: ignore[reportPrivateUsage]
     persist = AsyncMock()

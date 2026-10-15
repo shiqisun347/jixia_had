@@ -3562,3 +3562,96 @@ root清理13个经来源/manifest/工具SHA核验且无活动进程的本轮/tmp
 正式HTTPS原native/Esc检查通过，首轮fallback在合成终态事件处失败：正式站只允许localhost测试socket注入，未改生产限制。C仅在ignored生产UI夹具内拦截精确合成UUID的WebSocket，API静态响应、未知API/外部HTTP/媒体/signaling阻断；原test bodies逐字不变，再跑2项5.9秒全绿（含七视口、终态、Esc恢复普通顶栏）。网络收据保留，不称真实登录/比赛/语音复验；首红及sourceSHA原件保留。Colima已恢复原3GiB/2CPU、旧容器/卷/镜像保留，owned构件冒烟容器清理。最终证据profile_output/spec304/clean-header/及production-ui-owned-01/。
 
 最终生产复查三服务PID不变、active/0重启、live/ready200，新Web BUILD一致。核验发布进程已退出、精确5件上传文件及工具SHA后，仅移除本轮/tmp/jx-web-clean-header-058dd5fecfd949f39f43ab9a481cf700；/opt完整回滚备份和本地全部证据保留，见FINAL_PRODUCTION_CHECK.json。GitHub同步只包含本轮Web/测试/规格/记忆5个文件，私有凭据、生成缓存和本地.claude文件均不加入。
+
+## 2026-10-15 AI末尾吞音调查与Spec305（待批准）
+
+用户报告仍余时间AI末字被吞，确认实时听到、尚未对比回放。当前只读调查与ignored受控测试，未改业务/部署。A本机SDK1.1.20+自有LK1.13.5交替10轮：无保护5轮sender queued=0/drain后接收者仍收到50/30/60/40/80ms尾标记，最后marker晚66.685–89.733ms且已发unsub；有600ms尾保护5轮全部marker在drain前结束。原接收器unsub后继续消费，因此不是浏览器截尾/多字丢失的已证复现；Opus/PLC标记时长±30ms不能硬判丢包。owned容器已删除/FFI0，原件profile_output/workflow_candidate/spec304/audio-tail-investigation/local-rtc-tail.json。Root合成3长度增量decoder与full逐字节/最后500ms一致（含最后53/173samples），不能用这证明Provider实际音频完整。
+
+F生产只读：按UTC10:52:59–11:12:59 started_at筛选18AGENT，11:16:34读取最新状态（最新finalized超日志窗，不冒称截止快照）：exact agent.finalizing10COMPLETED/FINALIZED/untruncated，正文比配额少506–8470ms；7TIME_LIMIT/FINALIZED/true、1TIME_LIMIT/RESET/true。tts_connection_cleanup_timeout9、legacyvoicecorrected29警告，未证其致尾音；Python应用WARNING不等systemd PRIORITY。服务健康/源未变，未生产写/重启。Speech.finish_reason被finalized事件空reason覆盖、playback_started_at NULL另记旁支，不在本轮修。证据profile_output/spec304/tail-audio-ro/。
+
+C核Web正常speechfinished只清字幕不detach；SDK在TrackUnsubscribed事件前已stop/detach，延迟DOM remove不能修。现QA只计累计PCM/RMS与落盘→回放一致，没有逐发言接收尾端门禁，不能据07/08称完整尾音通过。另roomQuery后台失败保留data但isSuccessfalse可触音频effectcleanup、WSepoch改变也会重连，属未归因网络旁支，不混修。
+
+已写Spec305：只自然COMPLETED+natural_complete，在原AGENT_FINALIZING已冻结预算/停timer后、persist/pop/finalizecallback前以同source600ms静音+排空保护，正文played_samples/时长/spool不变，原15s上限内逐await身份重验；中断即时清理不保护，不先等/取消run.task避免ActorACK互等。不在_execute完成callback前插入等待以免消耗发言配额。需用户按AGENTS先批规格，再实现回归/实际TTS末句与完整混合场/安全发布；若不能证改善不硬上。当前未修复/未发布。
+
+独立方案审阅补齐两个必要边界：producer `_run_with_retry` finally1374会无条件pop未fencedrun，必须显式把自然完成owner交给finalizer并强控producer done/尾capture未完成仍登记，不能只加600ms函数。自由辩3s窗口允许旧FINALIZING时提前选席，保留此行为和现source-finalized门禁，不错误添加Actor.current_speech==旧speech的一刀切guard；保护跨窗回归要验证后继正文等待/旧finalizer只落旧行。A额外native控制不足10ms末帧最多479samples留buffer，补20ms收齐；小于一字，只支持实际PCM flush必要，不能解释多字吞音，禁止用sleep替代尾PCM。以上均已纳入305草案，尚无业务改动。
+
+### Spec305已获明确批准，开始实施
+
+用户选择“批准 Spec305，修复、验证后上线”。按既有门禁继续，不重复询问权限。A独占runtime与新tail单元、C独占新真实PG集成与候选复核、F准备ignored真实编码尾标记/固定TTS末句工具，Root完整回归与最小Core发布。源码未冻结前不进行候选真实资格测试；正式Web HX2A保持，业务旁支不扩展。
+
+### Spec305候选与实际门禁进展（仍未发布）
+
+最终runtime57a13e7a23d0b911e47f4cb65e54279a25d8168de279d1e32d6327d8b70d0cf0（45新增/482Agentpure绿），servicef4d6f47081eee4de9fe59acd33dbd0abbe80514c493d408c8b987e042fc343b5（13行Human sourcepending门禁，原ASR无旧human session时真的会提前开声；11PG+23原专项绿）。A额外补sameidentityclone精确run对象guard，旧38db只作诊断。C旧free fixture context硬编码0→1纠正保留所有新/旧角色断言，未放宽业务。
+
+Root fullCore01 1319pure中2fail（ASR sdk connect manager-timeout），已由C原case捕获caller AttributeError.name=free_source_speech_id/joins0，不是10ms或CPU竞态。只给旧fixed-start SimpleNamespace补None；原12case全绿/所有超时与FFI断言未改。fullCore02新ownedPG/全部Corepure+PG运行中，源SHA冻结；原01失败/owned容器清理收据保留。
+
+F最后工具rtc3d28bcc0/matcher c67e7bd1/mixed43426c1d，C已独立审（补真实TTS末partial endpoint阳/截掉阴性，阈值.60/.45固定）。本机local-markers-01 20次10pair终态70.642s：strict native-unsub cutoff无保护0/10、调用候选helper保护10/10，所有pair sourcePCM相同、尾NCC .992350–.994870/最弱尾帧.980882–.993883，body>=.999985，FFI0/pending[]/精确owned容器已删。不等实体浏览器/扬声器/多字缺失因果。
+
+Root source185新候选stage /tmp/jx-spec305-candidate-6c77428f4a，manifest30f3c17d9e499d73b36da6e2699ec5159d8e0edb25c7f570b4a4e5a6f56fa76c，tar df88598d18c42ed87a9d8aabb7e8ce6d0529f935c0eadcf43821d5b4c335df5e，来自旧182源allowlist+3审核工具（无测试/缓存/凭据）。全185逐SHA解包验证，服务/业务未改。第一次remote实际TTS（session81319已exit1）anmingyuan_v3.1/rate1/qwen-audio3.1三Ogg同源AB/BA，首音437/237/229ms：三baseline/protected尾全pass、improvement0，工具严格no_improvement_evidence；另两row早段bodycorrelation失败。receipt/3源Ogg/6组source+strict/reference PCM已取回profile_output/spec305/remote-tts-01/artifacts；185beforeafter一致，FFI/pending/ownedLK全清。仅正规生产OPS_PROBE capture审计3调用，不写生产比赛/用户/配置；不是全程无DB写。
+
+按批准条件不能凭padding marker通过就发。C准备仅ignored真实JS SDK+audioelement/WebAudio浏览器收尾录音，A准备同3既有Ogg远端publisher/stdin协议，仅生产LK自有新room，token/url只内存不进日志/文件；尚未实际启动此边界。F分析源静音/同源/earlybodyfail，并离线FFmpeg对比独立解码；不先新增Provider。Root私有publisher8c62373d…/测试92f5d54f…经A30真实temp控制/静态全绿，支持两源+固定baselineaudit122/WebHX2A、全停/空闲门禁和开放后新活动defer回滚，未制合格包/执行发布。
+
+### Spec305完整回归与比赛通过，实际浏览器改善仍待证（未发布）
+
+fullCore02终态1569unique=1319pure+250真实PG，0fail/error/skip，315源前后SHA一致、ownedPG清理。混合candidate-normal01终态233028ms/15speeches，双方各2模拟真人+2Agent，双四辩/谢幕/FINISHED/Judge/AWARDS/实际Jobs回放与资源清理全通过；6自然finalizer658–718ms，1TIME_LIMIT2154ms为原provider关闭路径未加自然保护。runtime57a13/servicef4d6与185stage不变，Ruff/strictPyright0。原full01两夹具AttributeError红保留。
+
+原3条TTS在服务器FFmpeg6.1.1独立解码与增量PCM全部逐字节相同（310572/359532/345132samples）；另两主要音色longyingtao/longanlang各3条配对也全尾pass/improvement0/exit1，早段body相关性原失败未抹。voice-variant-v1 CLI正则拒点exit2且0调用，v2只放合法点并正控后实际6calls，185源不变、ownedLK/FFI/pending清。F独立复算见voice-variant-v2/actual-01两independent目录；Mac/server少量±1取整不当作丢尾。
+
+F再RO核原10条naturalCOMPLETED/untruncated长源20.390–118.250s，精确Speech→generation→asset且正常agent_audio_storage_dir内regular.ogg，独立FFmpeg全部decoded_samples==asset.pcm_sample_count差0，floor(ms)也一致，末静音约200–280ms。仅server500ms ring/样本计数、0Provider/0DB写，未下载真实比赛音频/正文/路径，原文件stat不变；LONG_SOURCE_FFMPEG_RO.json SHA dc8aafab33754f397c5fb4ce167e768097b797764380164b09528320166b0749。
+
+浏览器工具run_pairing f0e2df82…/实际HTMLAudioElement.captureStream本地阳NCC1/提前SDKstop-detach阴性0，早MediaElementSource全零原失败保留；private PIPE、exactOrigin/prefix与sourcealias控制全绿。workerdf36a8a9…经16协议清理控制已上传/tmp/jx-spec305-browser-worker-a161be5dbb.py，Root仅经driver私密PIPE实际启动actual-browser-01(session68348)，复用3公开测试Ogg共6plays，自有LK房最多2人、不新增Provider或AppDB写；token/url不打印/落盘。默认浏览器若仍无改善不能发布。生产最近13:37:46UTC仍有2非终态房/1比赛/1租约，旧PID/source/Web稳定；发布须重新RO空闲门禁，不关未授权房间。
+
+### Spec305浏览器实际失败与时间伸缩调查（未发布）
+
+actual-browser01终态exit1：首段baseline尾pass/prefix.600822，第二prepared无subscribed超时，worker_closed null（旧driver失败路径未消费close帧）。C本地原SDK/HTML captureStream证明captured轨虽非同对象但共享native底层，finish里captureTrack.stop令原receiver ended，后续SDK拒sub；原before01/02红保留。新独立browser-tail-admission只移除错误stop/释放图和port，源/SDKstop-detach/阈值不变；after01原断言native live、完整阳NCC1、earlydetach阴性尾帧0；driver9fb73d10…补失败close收据。Root实际02(session62482)六plays全部完成，两process0、closedpassed/ownedroomdeleted/FFI+joins+runs+starts0，原PAIRING overallfailed保留。
+
+actual02原fixed-lag指标：baseline1/2 tailfalse、protected1 tail.489689/suffix部分负、protected2/3 pass；4prefix<.60。表面improvement1原指句2，但F独立诊断其末120ms实际.9751，全1s lag279ms/尾实际222ms，可能是时伸误判，不能当改善。protected句1末120ms.946524/80ms.921466，100ms分窗lag601→665ms约64ms伸长，单一offset621ms导致原6帧反相；baseline句1末200ms仅.3848/120ms峰跳早段，疑实际约200ms被截。C证6worklet均128连续无缺块，3helper实际601.068/600.782/601.178ms，严格bodydrain→tail→disconnect，非漏加保护。原红绝不改绿；F/C先设计有界单调分窗验证与裁160/240/PLC/错源/错位阴性，再决定新实际录音门禁；不任意DTW/不降.60/.45，400ms原生buffer压力实际暂缓。
+
+Root核官方NetEQ main g3doc明确自适应time-stretch accelerate/decelerate及PLC，仅支持可行机制，不冒充本次RTCStats因果。F Web readonlyreview绑定源SHA，普通speechfinished/换辩手/context/timer不使媒体effect重建，原WSepoch/queryfailure/终态/SDKunsub清理边界另保留。用户补充实际设备电脑内置扬声器或有线音箱。生产RO02 UTC13:56:39：房766345 PAUSED/5conn/1lease、034835WAITING/0conn，match1PAUSED；原三PID0restart/live-ready-Web200/122源前后相同/schema0047/WebHX2A，exact自有browserprefix房残留0，无生产变更。
+
+A发布器已收紧音频硬门禁publisher bccd40c5…/test4d163af5…：51temp controls含旧12项错误放行强红修正、Ruff/strictPyr0；要求原PAIRING整体passed、3同源protected全过+>=1改善+6prefix .60与Root外部canonicalSHA信任review，overallfailed不得靠局部1改善放行。若新有界对齐经独立控验需另审schema，当前不生成真实qualified/包。业务57a13/f4d6及185stage仍原冻结，未上线。
+
+### Spec305最终语音判读协议与实际05（仍未发布）
+
+F v2合成27控绿但自然语音全保守拒：短120ms相似峰不是完整尾链歧义，首fricative20ms波形也会被Opus/时伸反相；旧红/局限保留。C与Root独立同意收敛v3，只验证last1s tail+aggregate120ms presence，不保证首40/80ms/整头/中段质量。尾阈值.60/.45/partial.60、10×100ms有界单调/跨度100ms/邻40ms不减；唯一性改完整10窗链，远位短峰最多32候选全部检查，超限ambiguous。35控含3实际源理想阳、各裁audible160/240ms六阴性、partial479裁剪/PLC/错源/完整尾链复制/超界/逆序通过。READY_V3 4ae631…/rules6aa77e4a…/controls18669437…/scorer7b628cb7…/base483bdbc…/runnerc2b52f09…冻结；C独审cef2c10…通过，原02/03只诊断不回填资格。
+
+Rootqualification_processor6be03ac…经Ruff/Pyr0、F窄审02c100…/7假改善控制通过；C新driverd6b033…/10控绿，A新worker3a662e59…/31控绿，实际import可切candidate与installed，stage185+business122+3Ogg前后逐SHA。新worker上传/tmp/jx-spec305-browser-worker-368cd3086e.py，旧worker/stage全保留。Root冻结QUALIFICATION_POLICY.json e18d4ede… UTC14:46:02.536968，03source三对SHA明确且三种不同，Processor/driver/rules/controls全部绑定，真实资格必须新run开始晚于policy。
+
+Root04launcher误用venvPython.resolve导致裸Python缺numpy（独立强证），六captures完成后legacy scorer import报ModuleNotFoundError，PAIRING最小failed0680ca…/launch1/原6PCM保留，无法补资格。修正仅launcher用sys.executable项目venv（工具/政策全不改），fresh05完整capture/child0/owner0/两1851223audit通过，但processor硬拒render_block_gap：源2baseline currentFrame相邻0后256，块payload不同不是重复PCM，位于尾链前约625ms。05原failed不变、QUALIFICATION_FAILURE.json单独保存，无TAIL_QUALIFICATION。F独立4beb7b97…复算9PCM/全部v3数值：baseline3/3尾完整、protected3/3尾完整、真实改善0，故双理由notqualified；不保证中段无损失。
+
+C准备独立browser-tail-buffered固定原生RTCRtpReceiver.jitterBufferTarget400ms，需每6条laststable实际ΔjitterBufferDelay/Δemitted>=300ms（非getter/targetdelay代替），只自有receiver/无DOM延迟/不改Core/模型/音源或SDKstop，不新增Provider。尚未实际执行；Root将同字节processor复制newdir/另冻policy，不能改e18旧policy/原failed。A发布器最终v3 3d8a52fc…/test e0c5eed9…71控/静态绿，旧rigidfailed仍拒，新路径只信Root外部canonicalreview绑定TAIL_QUALIFICATION与全部数值，当前pin旧e18/6be需后续新bufferpolicy明确更新；无真实qualified包。
+
+14:44:31UTC fresh productionRO03：三服务健康/原PID0重启、122源前后相同/schema0047/WebHX2A，仍房766345 PAUSED/5历史conn/lease0、034835WAITING/0conn，match1PAUSED、总lease0，自有browserprefix0。未关闭/终止/改写任何生产房/比赛，发布空闲门禁仍不满足；只有完整音频资格通过/具体发布包可审后，才可就结束这两现存房间问新授权，不能把原Spec发布批准当终止比赛授权。
+
+
+### Spec305受控浏览器第06轮与证明范围收敛（未发布）
+
+新buffer工具V2已通过17Python+7Node控制，末窗口有效期<=500ms；第06轮六次实际
+HTMLAudioElement播放实测buffer377.5–397.6ms，非仅getter宣称。F独立原PCM验证
+3baseline尾主判据均失败，3protected尾链/anchor/partial与6条有限首段presence通过。
+但旧processor6be对整段currentFrame严格连续校验失败：tts3protected约752/754ms
+两块counter重复后跳256，payload并不重复；尾链6348–7348ms、presence176–296ms。
+06按原policy仍为失败，不能回填资格或覆盖原失败。C与F分别独立同意仅对已声明
+尾音/有限presence证明范围验采集连续性：按累计PCM sample index取receiver末1秒、
+主10窗完整包络/anchor/partial、actual与matched首120ms，扩128sample及跨边界相邻
+两块；正文外异常完整保留诊断，不宣称全句录音完整。C新独立processor8a90edd0…
+8项纯控制/AST原其他门禁一致/Ruff/Pyright全绿，待F窄审后冻结新policy并fresh07。
+全部源/音频阈值/cleanup/SDK stop-detach不变，不新增Provider调用。线上未发布，
+原两非终态房尚未关闭；暂停比赛需另获明确结束授权，不能把先前发布授权视为关闭授权。
+
+
+### Spec305实际浏览器08独审通过，待现有房间保护后发布
+
+第07轮3尾保护/3真改善/6pressure/全段frame连续通过，但tts3protected首120ms
+presence未通过。F只读搜到其首120/500ms在后续出现，超冻结±40ms锚，原因未定；
+07仍failed，不回填。使用完全相同policy2faaf965…/processor8a90…/源/媒体/35控
+新开08，3baseline真缺尾→3protected完整、6presence全部通过，全段frame亦连续。
+独立TAILQUAL9897e51b…passed，F原PCM逐分数/directNCC/6pressure原始累计counter
+晚窗和新鲜度/全部proof union±128/源1851223/SDK真unsub清srcObject/child0和全部
+自有owner0逐项复算通过；最终独审4094f3665680960714c326d87cfdbe4f1fb1ece0da4c94469ccc5a8d6a94e708。
+旧legacyrigid仍failed/driverexit1完整保留，绝不改写为pass。只证明受控400ms目标
+接收buffer的tail+有限onsetpresence，不等于唯一生产根因、整句保真或物理音箱验收。
+C代码+1569unique/315源/15speech完整混合赛独审7a5d9e9a…通过，仍保留1供应商
+cleanup_timeout事件；业务最终runtime57a13/servicef4d6冻结不变。发布工具新V3
+87控/static0、A准备真实合格包，C窄审中。15:24:12UTC两目标只读：034835WAITING
+无match/lease0；766345PAUSED+同match/lease1/历史connections5，尚未关闭或停服。

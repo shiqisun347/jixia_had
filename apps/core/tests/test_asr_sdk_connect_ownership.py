@@ -224,7 +224,7 @@ class AsrSdkCase:
     async def retired(self, trigger: str) -> tuple[asyncio.Task[Any], Join]:
         assert self.module is not None and self.service_module is not None
         if trigger == "manager-timeout":
-            previous = SimpleNamespace(match_id=self.match_id)
+            previous = SimpleNamespace(match_id=self.match_id, free_source_speech_id=None)
             candidate = SimpleNamespace(current_speech_id=uuid4())
             command = self.service_module.MatchCommand(
                 type="speech.start", message_id="synthetic-start", actor_user_id=uuid4()

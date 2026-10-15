@@ -759,6 +759,19 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             ):
                 raise MatchDomainError("stale_callback")
         if command.type == "speech.start" and self._speech_runtime is not None:
+            if previous.free_source_speech_id is not None:
+                async with self._session_factory() as session:
+                    source_status = await session.scalar(
+                        select(Speech.status).where(
+                            Speech.id == previous.free_source_speech_id,
+                            Speech.match_id == previous.match_id,
+                        )
+                    )
+                if source_status in {"STARTED", "FINALIZING"}:
+                    # A preceding Agent has no ASR session for the receiver's
+                    # input-closed guard. Wait for its authoritative final too,
+                    # before freezing a new human's callback context.
+                    raise MatchDomainError("asr_finalization_pending")
             speech_id = candidate.current_speech_id
             user_id = command.actor_user_id
             if speech_id is None or user_id is None:
