@@ -262,3 +262,26 @@ generation、完整 callback envelope、action、Agent 和退役状态，再校�
 `real-full/QUALIFICATION_REVIEW.json`、`real-full/INSTALLED_QUALIFICATION_REVIEW.json`、
 `release/OPERATIONAL_OBSERVATION_REVIEW.json`、`release/LEGACY_TERMINAL_METADATA_AUDIT.json`。
 上述相对证据路径均位于 `profile_output/workflow_candidate/spec304/`；原失败日志与旧候选保留在本地证据中。
+
+## 用户指定的大屏顶栏补充（2026-10-15，已上线）
+
+本轮用户明确要求：全屏展示时隐藏左上角“房间号”、房间号码和赛制/人数，
+隐藏右上角“文字记录”与“退出大屏”按钮，使用 Esc 退出。这是本规格已批准的大屏
+展示范围内的具体界面调整，按本轮明确指示实施。
+
+- 只调整 `presentationMode` 下的顶部显示，保留品牌、辩题、比赛状态与现有舞台。
+- 普通视图继续显示房间信息及原有操作；管理员应急入口和权限遵循既有行为。
+- 复用原生全屏与浏览器拒绝全屏时的兼容大屏 Esc 处理，不修改 Core、计时、媒体或接口。
+- 验收：现有 Playwright 原生全屏和兼容大屏用例覆盖隐藏、Esc 退出、普通顶栏恢复，
+  七种既有视口检查无溢出、品牌和八席可见；相关类型/Lint及仓库构建检查通过。
+- 回滚：仅恢复该 Web 顶栏条件显示及匹配测试，无数据库或后端回滚。
+
+交付：Web 构件 `HX2A8FaQQj1tYWmwcfx9d` 已单独上线；Core、Jobs 的122个安装文件、
+进程与数据库保持原发布版本。旧完整 Web（含缓存）保留于
+`/opt/jx-web-clean-header-20261015-058dd5fe/web-before`。
+Web260项单元测试、Lint、类型检查、20项浏览器测试和正式 Linux `pnpm build` 通过；
+实际 Linux 构件的5项展示测试、正式 HTTPS 的原生全屏与七尺寸兼容大屏两项检查通过。
+正式站检查使用浏览器侧合成比赛接口/连接且阻断媒体，不代表真实比赛或真人语音复验。
+首轮选择器、构建并发和生产测试注入限制所致失败原件保留；仅修测试夹具，未放宽生产限制。
+证据：`profile_output/spec304/clean-header/PUBLISHED_WEB_REPORT.json`、
+`profile_output/spec304/clean-header/production-ui-owned-01/`。

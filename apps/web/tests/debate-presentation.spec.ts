@@ -189,6 +189,10 @@ test.beforeEach(async ({ page }) => {
 
 test('native fullscreen can be exited with Escape', async ({ page }) => {
   await page.goto(`/debate?match_id=${matchId}`);
+  const header = page.locator('.debate-topic');
+  await expect(header.getByText('房间号', { exact: true })).toBeVisible();
+  await expect(header.getByText(room.code, { exact: true })).toBeVisible();
+  await expect(header.getByText(/YXH 4v4/)).toBeVisible();
   await page.evaluate(() => {
     Element.prototype.requestFullscreen = (
       window as unknown as {
@@ -198,8 +202,19 @@ test('native fullscreen can be exited with Escape', async ({ page }) => {
   });
   await page.getByRole('button', { name: '切换大屏展示' }).click();
   await expect.poll(() => page.evaluate(() => Boolean(document.fullscreenElement))).toBe(true);
+  await expect(header.getByRole('img', { name: '稷下', exact: true })).toBeVisible();
+  await expect(header.getByText('房间号', { exact: true })).toHaveCount(0);
+  await expect(header.getByText(room.code, { exact: true })).toHaveCount(0);
+  await expect(header.getByText(/YXH 4v4/)).toHaveCount(0);
+  await expect(header.getByRole('button', { name: '文字记录' })).toHaveCount(0);
+  await expect(header.getByRole('button', { name: '切换大屏展示' })).toHaveCount(0);
   await page.keyboard.press('Escape');
   await expect(page.locator('main.debate-page')).toHaveAttribute('data-presentation-mode', 'false');
+  await expect.poll(() => page.evaluate(() => Boolean(document.fullscreenElement))).toBe(false);
+  await expect(header.getByText('房间号', { exact: true })).toBeVisible();
+  await expect(header.getByText(room.code, { exact: true })).toBeVisible();
+  await expect(header.getByText(/YXH 4v4/)).toBeVisible();
+  await expect(header.getByRole('button', { name: '切换大屏展示' })).toBeVisible();
 });
 
 test('an ordinary organizer receives no administrator recovery actions', async ({ page }) => {
@@ -325,12 +340,13 @@ test('a pending ASR handoff leaves the microphone off until a later acknowledged
 
 test('presentation fills each viewport and terminal state discards old speech controls', async ({
   page,
-}) => {
+}, testInfo) => {
   test.setTimeout(60000);
   await page.goto(`/debate?match_id=${matchId}`);
   await expect(page.getByText('发言计时', { exact: true })).toBeVisible();
   await page.getByRole('button', { name: '切换大屏展示' }).click();
   const main = page.locator('main.debate-page');
+  const header = main.locator('.debate-topic');
   await expect(main).toHaveAttribute('data-presentation-mode', 'true');
   await expect(main.getByRole('img', { name: '稷下', exact: true })).toBeVisible();
   for (const [width, height] of [
@@ -343,6 +359,11 @@ test('presentation fills each viewport and terminal state discards old speech co
     [375, 812],
   ]) {
     await page.setViewportSize({ width, height });
+    await expect(header.getByText('房间号', { exact: true })).toHaveCount(0);
+    await expect(header.getByText(room.code, { exact: true })).toHaveCount(0);
+    await expect(header.getByText(/YXH 4v4/)).toHaveCount(0);
+    await expect(header.getByRole('button', { name: '文字记录' })).toHaveCount(0);
+    await expect(header.getByRole('button', { name: '切换大屏展示' })).toHaveCount(0);
     const geometry = await main.evaluate((element) => {
       const grid = element.querySelector('[data-testid="debate-content-grid"]')!;
       const arena = element.querySelector('.debate-arena')!;
@@ -362,7 +383,10 @@ test('presentation fills each viewport and terminal state discards old speech co
     expect(geometry.pageOverflow).toBe(false);
     expect(geometry.seats).toHaveLength(8);
     expect(geometry.seats.every((seat) => seat.top >= 0 && seat.bottom <= height)).toBe(true);
-    const output = resolve('../../profile_output/spec304/screens-final-v6');
+    const output = resolve(
+      '../../profile_output/spec304/screens-clean-header',
+      testInfo.project.name,
+    );
     mkdirSync(output, { recursive: true });
     await page.screenshot({ path: resolve(output, `speaking-${width}x${height}.png`) });
   }
@@ -384,8 +408,17 @@ test('presentation fills each viewport and terminal state discards old speech co
   await expect(center.getByTestId('free-debate-clock')).toHaveCount(0);
   await expect(center.getByRole('link', { name: '查看赛后记录' })).toBeVisible();
   await page.screenshot({
-    path: resolve('../../profile_output/spec304/screens-final-v6/finished-1920x1080.png'),
+    path: resolve(
+      '../../profile_output/spec304/screens-clean-header',
+      testInfo.project.name,
+      'finished-1920x1080.png',
+    ),
   });
-  await page.getByRole('button', { name: '切换大屏展示' }).click();
+  await page.keyboard.press('Escape');
   await expect(main).toHaveAttribute('data-presentation-mode', 'false');
+  await expect(header.getByText('房间号', { exact: true })).toBeVisible();
+  await expect(header.getByText(room.code, { exact: true })).toBeVisible();
+  await expect(header.getByText(/YXH 4v4/)).toBeVisible();
+  await expect(header.locator('button').filter({ hasText: '文字记录' })).toHaveCount(1);
+  await expect(header.getByRole('button', { name: '切换大屏展示' })).toBeVisible();
 });

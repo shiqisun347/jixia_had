@@ -3548,3 +3548,17 @@ F打包器054371/五critical/32控制据实际锁2202，已实际check-only→wr
 **观察结论必须分开：** 原INSTALLED_AUDIT_01为exit1/stable=false，原因19条TERMINATED历史比赛ended_at NULL。11样本/300.082秒运行指标均正常：122文件一致，Core/Jobs/Web PID4110699/4110701/4110703全程不变、0重启、health200、guards0、服务journal warning及以上0。F只读server-memory解析真实SHA验证发布前PGdump，当前/备份完全同19个ID与id/room/status/created/ended五字段，规范化SHA两侧9125ed…；非此次发布新增，不靠创建时间猜测，未回填历史记录。原auditfalse不改，单独OPERATIONAL_OBSERVATION_REVIEW f702cd9d…记运行true/metadatafalse，LEGACY_TERMINAL_METADATA_AUDIT d541030c…记基线确证，C独立复核均通过。遗留19历史元数据缺口明确保留，不把原整体审计写成通过。
 
 root清理13个经来源/manifest/工具SHA核验且无活动进程的本轮/tmp目录，释放115294208B约110MiB；所有8候选源归档、失败收据、本地发布包/审阅证据保留，生产backup/history/runtime无清理。Spec304与索引状态已更新，完整最终报告 profile_output/workflow_candidate/spec304/release/RELEASE_REPORT.md。未声称实体mic/正式全时长/五场并发/50路LLM/11音色盲听通过；RTC04单次慢连接仍无唯一因果结论。
+
+## 2026-10-15 用户指定大屏顶栏收敛（待Web发布）
+
+本轮明确要求全屏隐藏房间号/号码/赛制人数和文字记录/退出大屏按钮，只用Esc退出。先在已批准Spec304追加用户具体范围后，最小改DebatePageLayout条件显示，保留品牌/辩题/比赛状态，普通模式保持既有内容，未改LiveMatchPage的原生与fallback Esc处理。既有浏览器用例改验隐藏→Esc恢复并用每project新截图目录，20项/四project/七size全部绿；Web260unit/Lint/types绿。首轮4red系宽屏隐藏按钮getByRole不匹配已用真实DOM筛选修，首轮types与Playwright build清.next并发引起generated文件缺失，按顺序后绿，原日志留存，无放宽产品。
+
+新Linuxamd64/Node24.12标准pnpm build181.255秒成功，273源输入与workspace全相同；Web BUILD_ID HX2A8FaQQj1tYWmwcfx9d，tarSHA3a2a1ca0caf83cc9930d034981817d334a259348e78ada61f0037ae79f26c5b2。真实tar2246项逐SHA、UID1000/静态HTTP/3认证边界smoke以及该实际bundle的5浏览器用例全部通过(同native/fallback/七size)，owned容器清理。临时Colima6GiB正在恢复3GiB，旧容器/卷/镜像保留。F正在准备仅Web切换+旧完整Web回滚与最小真目录控制，C独立只读复核；禁止运行304全栈publisher，Core/Jobs/DB/主持资源不在这次修改范围，当前尚未发新Web。证据profile_output/spec304/clean-header/。
+
+### 大屏顶栏补充已上线并完成正式网址展示验证
+
+新的Web构件HX2A8FaQQj1tYWmwcfx9d已实际发布，PUBLISHED_WEB_REPORT.json记published=true/installed；旧完整Web与缓存备份保留于/opt/jx-web-clean-header-20261015-058dd5fe/web-before。最终Web专用工具5573d4e…通过7项真实目录成功/回滚控制、Ruff/严格Pyright及C独立复核；仅切换jx-web，前后三次活动房间/比赛均0，122后端安装源SHA一致，Core4110699/Jobs4110701均active且PID不变/0重启，新Web4168963active/0重启，健康/静态资源检查通过，数据库写入0、后端服务操作0。原304后端20261015-spec304-8cd36502及19条历史元数据缺口不变。
+
+正式HTTPS原native/Esc检查通过，首轮fallback在合成终态事件处失败：正式站只允许localhost测试socket注入，未改生产限制。C仅在ignored生产UI夹具内拦截精确合成UUID的WebSocket，API静态响应、未知API/外部HTTP/媒体/signaling阻断；原test bodies逐字不变，再跑2项5.9秒全绿（含七视口、终态、Esc恢复普通顶栏）。网络收据保留，不称真实登录/比赛/语音复验；首红及sourceSHA原件保留。Colima已恢复原3GiB/2CPU、旧容器/卷/镜像保留，owned构件冒烟容器清理。最终证据profile_output/spec304/clean-header/及production-ui-owned-01/。
+
+最终生产复查三服务PID不变、active/0重启、live/ready200，新Web BUILD一致。核验发布进程已退出、精确5件上传文件及工具SHA后，仅移除本轮/tmp/jx-web-clean-header-058dd5fecfd949f39f43ab9a481cf700；/opt完整回滚备份和本地全部证据保留，见FINAL_PRODUCTION_CHECK.json。GitHub同步只包含本轮Web/测试/规格/记忆5个文件，私有凭据、生成缓存和本地.claude文件均不加入。

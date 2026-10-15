@@ -12,7 +12,6 @@ import {
   Maximize2,
   Hand,
   Mic,
-  Minimize2,
   Megaphone,
   Pause,
   Play,
@@ -1157,17 +1156,22 @@ export function DebatePageLayout({
               className={`debate-topic grid shrink-0 gap-2 rounded-[1.1rem] border border-blue-100 bg-white/85 px-3 py-2 shadow-[0_10px_30px_rgba(44,85,132,0.06)] sm:grid-cols-[9rem_minmax(0,1fr)_auto] sm:items-center sm:px-4 ${presentationMode ? 'bg-white/95' : ''}`}
             >
               <div className="rounded-lg border border-blue-100 bg-[#f7fbff] px-2.5 py-1.5">
-                {presentationMode ? <JixiaLogo compact /> : null}
-                <p className="text-[10px] font-black tracking-[0.14em] text-slate-600">
-                  {t('roomCode')}
-                </p>
-                <p className="font-mono text-base font-black tracking-[0.08em] text-slate-900">
-                  {room.code}
-                </p>
-                <p className="truncate text-[10px] font-bold text-blue-700">
-                  {String(room.rule.name ?? '')} · {String(room.rule.side_size ?? 1)}v
-                  {String(room.rule.side_size ?? 1)}
-                </p>
+                {presentationMode ? (
+                  <JixiaLogo compact />
+                ) : (
+                  <>
+                    <p className="text-[10px] font-black tracking-[0.14em] text-slate-600">
+                      {t('roomCode')}
+                    </p>
+                    <p className="font-mono text-base font-black tracking-[0.08em] text-slate-900">
+                      {room.code}
+                    </p>
+                    <p className="truncate text-[10px] font-bold text-blue-700">
+                      {String(room.rule.name ?? '')} · {String(room.rule.side_size ?? 1)}v
+                      {String(room.rule.side_size ?? 1)}
+                    </p>
+                  </>
+                )}
               </div>
               <div className="min-w-0 px-1 sm:px-3">
                 <p className="text-xs font-black tracking-[0.16em] text-blue-600">{t('topic')}</p>
@@ -1181,30 +1185,26 @@ export function DebatePageLayout({
                 >
                   {matchStatusLabel(snapshot.status, snapshot.action_state, t)}
                 </span>
-                <Button
-                  className="min-[1580px]:hidden"
-                  onClick={onOpenDrawer}
-                  ref={transcriptTriggerRef}
-                  size="sm"
-                  variant="secondary"
-                >
-                  <FileText className="size-4" /> {t('transcript')}
-                </Button>
-                {onTogglePresentation ? (
+                {!presentationMode ? (
+                  <Button
+                    className="min-[1580px]:hidden"
+                    onClick={onOpenDrawer}
+                    ref={transcriptTriggerRef}
+                    size="sm"
+                    variant="secondary"
+                  >
+                    <FileText className="size-4" /> {t('transcript')}
+                  </Button>
+                ) : null}
+                {!presentationMode && onTogglePresentation ? (
                   <Button
                     aria-label={t('presentationAria')}
                     onClick={onTogglePresentation}
                     size="sm"
-                    variant={presentationMode ? 'primary' : 'secondary'}
+                    variant="secondary"
                   >
-                    {presentationMode ? (
-                      <Minimize2 className="size-4" />
-                    ) : (
-                      <Maximize2 className="size-4" />
-                    )}
-                    <span className="hidden sm:inline">
-                      {presentationMode ? t('exitPresentation') : t('presentation')}
-                    </span>
+                    <Maximize2 className="size-4" />
+                    <span className="hidden sm:inline">{t('presentation')}</span>
                   </Button>
                 ) : null}
               </div>
