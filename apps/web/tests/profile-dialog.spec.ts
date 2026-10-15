@@ -106,7 +106,7 @@ test('legacy profile opens the single profile dialog and updates user data', asy
       if (!source) return null;
       return new URL(source, page.url()).searchParams.get('url') ?? source;
     })
-    .toBe('/assets/logo-ui.webp');
+    .toBe('/assets/logo-new.jpeg');
 
   await dialog.getByLabel('真实姓名').fill('');
   await dialog.getByRole('button', { name: '保存姓名' }).click();

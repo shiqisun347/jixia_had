@@ -785,6 +785,131 @@ async def test_host_elapsed_advances_without_browser_command() -> None:
 
 
 @pytest.mark.asyncio
+async def test_free_debate_exhaustion_advances_through_both_fourth_speakers() -> None:
+    free_action = MatchAction(
+        stage_position=7,
+        action_position=1,
+        action_kind="FREE_DEBATE",
+        duration_seconds=5,
+        participants=(),
+        free_max_speech_seconds=5,
+    )
+    negative_fourth = uuid4()
+    affirmative_fourth = uuid4()
+    actions = (
+        free_action,
+        MatchAction(
+            stage_position=8,
+            action_position=1,
+            action_kind="AGENT_SPEECH",
+            duration_seconds=1,
+            side="NEGATIVE",
+            seat_no=4,
+            speaker_kind="AGENT",
+            agent_profile_id=negative_fourth,
+        ),
+        MatchAction(
+            stage_position=9,
+            action_position=1,
+            action_kind="AGENT_SPEECH",
+            duration_seconds=1,
+            side="AFFIRMATIVE",
+            seat_no=4,
+            speaker_kind="AGENT",
+            agent_profile_id=affirmative_fourth,
+        ),
+        MatchAction(
+            stage_position=9,
+            action_position=2,
+            action_kind="HOST_AUDIO",
+            duration_seconds=0,
+            host_audio_path="rules/end.ogg",
+            host_audio_duration_ms=1_000,
+        ),
+    )
+    free_speech_id = uuid4()
+    actor = MatchActor(
+        MatchRuntimeState(
+            match_id=uuid4(),
+            status="RUNNING",
+            action_state="AGENT_FINALIZING",
+            actions=actions,
+            current_speech_id=free_speech_id,
+            current_agent_profile_id=uuid4(),
+            current_speaker_side="NEGATIVE",
+            current_speaker_seat_no=1,
+            speech_remaining_ms=5_000,
+            free_affirmative_remaining_ms=0,
+            free_negative_remaining_ms=5_000,
+            formal_4v4=True,
+        ),
+        sleep=lambda _: asyncio.sleep(60),
+    )
+    await actor.start()
+
+    async def finish_agent(agent_id: UUID, prefix: str) -> None:
+        speech_id = uuid4()
+        started = await actor.submit(
+            MatchCommand(
+                type="agent.playback_started",
+                message_id=f"{prefix}-started",
+                payload={"agent_profile_id": str(agent_id), "speech_id": str(speech_id)},
+            )
+        )
+        assert started.state.current_speech_id == speech_id
+        await actor.submit(
+            MatchCommand(
+                type="agent.playback_finished",
+                message_id=f"{prefix}-played",
+                payload={"speech_id": str(speech_id)},
+            )
+        )
+        await actor.submit(
+            MatchCommand(
+                type="agent.finalized",
+                message_id=f"{prefix}-finalized",
+                payload={"speech_id": str(speech_id), "audio_duration_ms": 1_000},
+            )
+        )
+
+    try:
+        first = await actor.submit(
+            MatchCommand(
+                type="agent.finalized",
+                message_id="free-exhausted",
+                payload={"speech_id": str(free_speech_id), "audio_duration_ms": 5_000},
+            )
+        )
+        assert first.state.status == "RUNNING"
+        assert first.state.current_action_index == 1
+        assert first.state.action_state == "AGENT_PREPARING"
+        assert first.events[-1].type == "agent.preparing"
+        assert all(event.type != "match.finished" for event in first.events)
+
+        await finish_agent(negative_fourth, "negative-fourth")
+        assert actor.state.current_action_index == 2
+        assert actor.state.action_state == "AGENT_PREPARING"
+        assert actor.state.current_agent_profile_id == affirmative_fourth
+
+        await finish_agent(affirmative_fourth, "affirmative-fourth")
+        assert actor.state.current_action_index == 3
+        assert actor.state.action_state == "HOST_ANNOUNCING"
+
+        ended = await actor.submit(
+            MatchCommand(
+                type="host.finished",
+                message_id="yxh-end-host",
+                payload={"authorized": True},
+            )
+        )
+        assert ended.state.status == "FINISHED"
+        assert ended.state.action_state == "MATCH_FINISHED"
+        assert [event.type for event in ended.events].count("match.finished") == 1
+    finally:
+        await actor.close()
+
+
+@pytest.mark.asyncio
 async def test_human_start_window_pauses_at_60_seconds_but_not_at_59_9() -> None:
     user_id = uuid4()
     now = [100.0]
@@ -1056,7 +1181,7 @@ async def test_interruptions_cancel_human_start_timeout(
 
 
 @pytest.mark.asyncio
-async def test_host_pause_and_resume_freezes_authoritative_remaining_time() -> None:
+async def test_host_pause_freezes_offset_and_resume_restarts_complete_asset() -> None:
     clock = [100.0]
     action = MatchAction(
         stage_position=1,
@@ -1093,7 +1218,8 @@ async def test_host_pause_and_resume_freezes_authoritative_remaining_time() -> N
             MatchCommand(type="resume.elapsed", message_id="host-resume-elapsed")
         )
         assert resumed.state.action_state == "HOST_ANNOUNCING"
-        assert resumed.state.host_audio_deadline_mono == 110.0
+        assert resumed.state.host_audio_remaining_ms == 10_000
+        assert resumed.state.host_audio_deadline_mono == 113.0
     finally:
         await actor.close()
 
@@ -1710,6 +1836,93 @@ async def test_free_decision_resume_starts_new_round_and_rejects_old_result() ->
 
 
 @pytest.mark.asyncio
+async def test_agent_speech_resume_clears_stale_decision_state() -> None:
+    agent_id = uuid4()
+    old_round_id = uuid4()
+    old_opportunity_id = uuid4()
+    actor = MatchActor(
+        MatchRuntimeState(
+            match_id=uuid4(),
+            status="RUNNING",
+            action_state="AGENT_SPEAKING",
+            actions=(
+                MatchAction(
+                    stage_position=1,
+                    action_position=1,
+                    action_kind="AGENT_SPEECH",
+                    duration_seconds=30,
+                    side="NEGATIVE",
+                    seat_no=1,
+                    speaker_kind="AGENT",
+                    agent_profile_id=agent_id,
+                ),
+            ),
+            current_agent_profile_id=agent_id,
+            current_speaker_side="NEGATIVE",
+            current_speaker_seat_no=1,
+            speech_remaining_ms=30_000,
+            current_speech_id=uuid4(),
+            interim_text="stale interim",
+            hand_queue=(uuid4(),),
+            agent_hand_queue=(agent_id,),
+            agent_decision_round_id=old_round_id,
+            agent_decisions=(AgentDecisionState(agent_id, "NEGATIVE", 1, status="HAND"),),
+            selection_phase="COMPETING",
+            agent_effective_status="RAISE",
+            opportunity_id=old_opportunity_id,
+        ),
+        sleep=lambda _: asyncio.sleep(60),
+    )
+    await actor.start()
+    try:
+        await actor.submit(
+            MatchCommand(
+                type="match.pause",
+                message_id="agent-speech-pause-stale-state",
+                payload={"authorized": True},
+            )
+        )
+        await actor.submit(
+            MatchCommand(
+                type="match.resume",
+                message_id="agent-speech-resume-stale-state",
+                payload={"privileged": True, "reasons": []},
+            )
+        )
+        resumed = await actor.submit(
+            MatchCommand(type="resume.elapsed", message_id="agent-speech-resume-elapsed")
+        )
+
+        assert resumed.state.action_state == "AGENT_PREPARING"
+        assert resumed.state.current_speech_id is None
+        assert resumed.state.interim_text == ""
+        assert resumed.state.hand_queue == ()
+        assert resumed.state.agent_hand_queue == ()
+        assert resumed.state.agent_decision_round_id is None
+        assert resumed.state.agent_decisions == ()
+        assert resumed.state.selection_phase is None
+        assert resumed.state.agent_effective_status is None
+        with pytest.raises(MatchDomainError, match="stale_callback"):
+            await actor.submit(
+                MatchCommand(
+                    type="free.agent_decision_result",
+                    message_id="late-agent-decision-after-speech-recovery",
+                    payload={
+                        "action_key": actor.state.current_action.action_key,
+                        "agent_profile_id": str(agent_id),
+                        "decision_round_id": str(old_round_id),
+                        "should_speak": True,
+                        "willingness": 1.0,
+                    },
+                )
+            )
+        assert actor.state.opportunity_id is None
+        assert actor.state.allocated_opportunity_id is None
+    finally:
+        await actor.close()
+
+
+@pytest.mark.asyncio
 async def test_free_debate_does_not_start_a_sub_three_second_final_turn() -> None:
     negative_agent = uuid4()
     speech_id = uuid4()
@@ -1930,6 +2143,7 @@ async def test_two_agent_theories_and_free_debate_complete_the_match() -> None:
         ),
         free_action,
     )
+    now = [100.0]
     actor = MatchActor(
         MatchRuntimeState(
             match_id=uuid4(),
@@ -1943,6 +2157,8 @@ async def test_two_agent_theories_and_free_debate_complete_the_match() -> None:
             speech_remaining_ms=5_000,
             formal_4v4=True,
         ),
+        clock=lambda: now[0],
+        wall_clock=lambda: now[0],
         sleep=lambda _: asyncio.sleep(60),
     )
 
@@ -1962,6 +2178,7 @@ async def test_two_agent_theories_and_free_debate_complete_the_match() -> None:
                 },
             )
         )
+        now[0] += 5.0
         await actor.submit(
             MatchCommand(
                 type="agent.playback_finished",
@@ -2111,6 +2328,7 @@ async def test_formal_4v4_mixed_human_agent_flow_pauses_resumes_and_finishes() -
         ),
         free_action,
     )
+    now = [100.0]
     actor = MatchActor(
         MatchRuntimeState(
             match_id=uuid4(),
@@ -2124,6 +2342,8 @@ async def test_formal_4v4_mixed_human_agent_flow_pauses_resumes_and_finishes() -
             speech_remaining_ms=5_000,
             formal_4v4=True,
         ),
+        clock=lambda: now[0],
+        wall_clock=lambda: now[0],
         sleep=lambda _: asyncio.sleep(60),
     )
 
@@ -2141,6 +2361,7 @@ async def test_formal_4v4_mixed_human_agent_flow_pauses_resumes_and_finishes() -
                 },
             )
         )
+        now[0] += 5.0
         await actor.submit(
             MatchCommand(
                 type="agent.playback_finished",
@@ -2243,6 +2464,7 @@ async def test_formal_4v4_mixed_human_agent_flow_pauses_resumes_and_finishes() -
         )
         free_speech_id = human_free_start.state.current_speech_id
         assert free_speech_id is not None
+        now[0] += 5.0
         await actor.submit(
             MatchCommand(
                 type="speech.finish",
@@ -2749,8 +2971,9 @@ async def test_system_recovery_preserves_host_audio_before_a_human_action() -> N
         )
         assert resumed.state.status == "RUNNING"
         assert resumed.state.action_state == "HOST_ANNOUNCING"
-        assert resumed.state.host_audio_deadline_mono == 107.0
-        assert resumed.state.host_audio_deadline_ms == 1_007_000
+        assert resumed.state.host_audio_remaining_ms == 10_000
+        assert resumed.state.host_audio_deadline_mono == 110.0
+        assert resumed.state.host_audio_deadline_ms == 1_010_000
         assert [event.type for event in resumed.events] == ["match.resumed"]
     finally:
         await actor.close()
@@ -3073,7 +3296,7 @@ async def test_human_can_raise_after_human_only_wait_recovery() -> None:
 
 
 @pytest.mark.asyncio
-async def test_resume_at_zero_remaining_rebuilds_immediate_host_timer() -> None:
+async def test_resume_at_zero_host_remaining_restarts_complete_asset() -> None:
     action = MatchAction(
         stage_position=1,
         action_position=1,
@@ -3111,8 +3334,9 @@ async def test_resume_at_zero_remaining_rebuilds_immediate_host_timer() -> None:
 
         assert resumed.state.status == "RUNNING"
         assert resumed.state.action_state == "HOST_ANNOUNCING"
-        assert resumed.state.host_audio_deadline_mono == 100.0
-        assert resumed.state.host_audio_deadline_ms == 1_000_000
+        assert resumed.state.host_audio_remaining_ms == 10_000
+        assert resumed.state.host_audio_deadline_mono == 110.0
+        assert resumed.state.host_audio_deadline_ms == 1_010_000
         assert actor._timer_command_type == "host.elapsed"
     finally:
         await actor.close()
@@ -3789,6 +4013,57 @@ async def test_system_error_clears_transient_interim_text() -> None:
         assert result.state.interim_text == ""
     finally:
         await actor.close()
+
+
+@pytest.mark.asyncio
+async def test_actor_close_cancels_inflight_and_queued_submissions() -> None:
+    entered = asyncio.Event()
+    never_finishes = asyncio.Event()
+
+    async def pre_commit(*_: object) -> None:
+        entered.set()
+        await never_finishes.wait()
+
+    actor = MatchActor(
+        MatchRuntimeState(
+            match_id=uuid4(),
+            status="RUNNING",
+            action_state="AGENT_SPEAKING",
+            actions=(),
+            current_speech_id=uuid4(),
+            current_agent_profile_id=uuid4(),
+        ),
+        pre_commit=pre_commit,
+        sleep=lambda _: asyncio.sleep(60),
+    )
+    await actor.start()
+    first = asyncio.create_task(
+        actor.submit(
+            MatchCommand(
+                type="system.error",
+                message_id="close-inflight",
+                payload={"error_code": "test"},
+            )
+        )
+    )
+    await entered.wait()
+    second = asyncio.create_task(
+        actor.submit(
+            MatchCommand(
+                type="system.error",
+                message_id="close-queued",
+                payload={"error_code": "test"},
+            )
+        )
+    )
+    await asyncio.sleep(0)
+
+    await actor.close()
+    await asyncio.sleep(0)
+
+    assert first.done() and first.cancelled()
+    assert second.done() and second.cancelled()
+    assert actor._queue.empty()
 
 
 @pytest.mark.asyncio

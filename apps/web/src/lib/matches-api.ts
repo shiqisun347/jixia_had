@@ -8,6 +8,8 @@ export type MatchLiveKitToken = components['schemas']['MatchLiveKitTokenResponse
 export type MatchTranscript = components['schemas']['TranscriptResponse'];
 
 export const matchesApi = {
+  prepare: (roomId: string) =>
+    requestJson<MatchSnapshot>(`/api/rooms/${roomId}/prepare-match`, { method: 'POST' }),
   startRuntime: (roomId: string) =>
     requestJson<MatchSnapshot>(`/api/rooms/${roomId}/runtime-start`, { method: 'POST' }),
   snapshot: (matchId: string) => requestJson<MatchSnapshot>(`/api/matches/${matchId}/snapshot`),

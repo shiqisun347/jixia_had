@@ -7,8 +7,12 @@ import asyncio
 import signal
 import sys
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import cast
+
+from jx_core.data_capture.provider_writer import ProviderCaptureWriter, new_provider_capture
+from jx_core.models import WorkerHeartbeat
 
 from .audio_worker import process_one_file_cleanup, process_one_postmatch_audio
 from .config import Settings, load_settings
@@ -89,132 +93,171 @@ def main(
     async def execute() -> int:
         concrete_database = cast(Database, database)
         runtime_log_writer: RuntimeLogWriter | None = None
-        if isinstance(database, Database):
-            runtime_log_writer = RuntimeLogWriter(concrete_database.session_factory)
-            await runtime_log_writer.start()
+        capture_writer: ProviderCaptureWriter | None = None
+
+        async def write_heartbeat() -> None:
+            if not isinstance(database, Database):
+                return
+            async with concrete_database.session_factory() as session:
+                async with session.begin():
+                    heartbeat = await session.get(WorkerHeartbeat, "jx-jobs", with_for_update=True)
+                    if heartbeat is None:
+                        heartbeat = WorkerHeartbeat(service="jx-jobs", capabilities={})
+                        session.add(heartbeat)
+                    heartbeat.capabilities = {
+                        "host_tts": settings.tts_api_key is not None,
+                        "tts_model": settings.tts_model,
+                        "tts_websocket_configured": bool(settings.tts_ws_url),
+                    }
+                    heartbeat.updated_at = datetime.now(UTC)
+
         tts_client: DashScopeTTSClient | None = None
         task_processor = None
-        if settings.tts_ws_url and settings.dashscope_api_key is not None:
-            tts_client = DashScopeTTSClient(
-                websocket_url=settings.tts_ws_url,
-                api_key=settings.dashscope_api_key.get_secret_value(),
-                workspace=settings.dashscope_workspace,
-            )
-
-            async def process_tasks() -> bool:
-                await ensure_daily_tasks(concrete_database.session_factory)
-                if await process_one_host_tts(
-                    concrete_database.session_factory,
-                    client=tts_client,
-                    storage_root=Path(settings.host_audio_storage_dir),
-                ):
-                    return True
-                if await process_one_leaderboard(concrete_database.session_factory):
-                    return True
-                if await process_one_transcript_archive(concrete_database.session_factory):
-                    return True
-                if await process_one_runtime_log_retention(concrete_database.session_factory):
-                    return True
-                if await process_one_postmatch_audio(
-                    concrete_database.session_factory,
-                    storage_root=Path(settings.match_audio_storage_dir),
-                    host_storage_root=Path(settings.host_audio_storage_dir),
-                ):
-                    return True
-                if await process_one_match_export(
-                    concrete_database.session_factory,
-                    storage_root=Path(settings.export_storage_dir),
-                    audio_roots=[
-                        Path(settings.match_audio_storage_dir),
-                        Path(settings.human_audio_storage_dir),
-                        Path(settings.host_audio_storage_dir),
-                    ],
-                ):
-                    return True
-                if await process_one_experiment_postmatch(
-                    concrete_database.session_factory
-                ):
-                    return True
-                if await process_one_experiment_export(
-                    concrete_database.session_factory,
-                    storage_root=Path(settings.export_storage_dir),
-                ):
-                    return True
-                if await process_one_experiment_retention(
-                    concrete_database.session_factory
-                ):
-                    return True
-                return await process_one_file_cleanup(
-                    concrete_database.session_factory,
-                    storage_roots=[
-                        Path(settings.match_audio_storage_dir),
-                        Path(settings.human_audio_storage_dir),
-                    ],
-                )
-
-            task_processor = process_tasks
-        elif not args.once:
-            concrete_database = cast(Database, database)
-
-            async def process_tasks_without_tts() -> bool:
-                await ensure_daily_tasks(concrete_database.session_factory)
-                if await process_one_leaderboard(concrete_database.session_factory):
-                    return True
-                if await process_one_transcript_archive(concrete_database.session_factory):
-                    return True
-                if await process_one_runtime_log_retention(concrete_database.session_factory):
-                    return True
-                if await process_one_postmatch_audio(
-                    concrete_database.session_factory,
-                    storage_root=Path(settings.match_audio_storage_dir),
-                    host_storage_root=Path(settings.host_audio_storage_dir),
-                ):
-                    return True
-                if await process_one_match_export(
-                    concrete_database.session_factory,
-                    storage_root=Path(settings.export_storage_dir),
-                    audio_roots=[
-                        Path(settings.match_audio_storage_dir),
-                        Path(settings.human_audio_storage_dir),
-                        Path(settings.host_audio_storage_dir),
-                    ],
-                ):
-                    return True
-                if await process_one_experiment_postmatch(
-                    concrete_database.session_factory
-                ):
-                    return True
-                if await process_one_experiment_export(
-                    concrete_database.session_factory,
-                    storage_root=Path(settings.export_storage_dir),
-                ):
-                    return True
-                if await process_one_experiment_retention(
-                    concrete_database.session_factory
-                ):
-                    return True
-                return await process_one_file_cleanup(
-                    concrete_database.session_factory,
-                    storage_roots=[
-                        Path(settings.match_audio_storage_dir),
-                        Path(settings.human_audio_storage_dir),
-                    ],
-                )
-
-            task_processor = process_tasks_without_tts
-        # Signal handlers must be installed while the event loop is running.
+        run_jobs_started = False
         try:
+            if isinstance(database, Database):
+                runtime_log_writer = RuntimeLogWriter(concrete_database.session_factory)
+                await runtime_log_writer.start()
+                if settings.provider_capture_enabled:
+                    capture_writer = ProviderCaptureWriter(
+                        settings.database_url_value, service="jx-jobs"
+                    )
+                    await capture_writer.start()
+                await write_heartbeat()
+            if settings.tts_ws_url and settings.tts_api_key is not None:
+                tts_client = DashScopeTTSClient(
+                    websocket_url=settings.tts_ws_url,
+                    api_key=settings.tts_api_key.get_secret_value(),
+                    workspace=settings.tts_workspace_id,
+                    model=settings.tts_model,
+                    capture_factory=capture_writer.new_capture
+                    if capture_writer is not None
+                    else lambda: new_provider_capture(None),
+                )
+
+                async def process_tasks() -> bool:
+                    await write_heartbeat()
+                    await ensure_daily_tasks(concrete_database.session_factory)
+                    if await process_one_host_tts(
+                        concrete_database.session_factory,
+                        client=tts_client,
+                        storage_root=Path(settings.host_audio_storage_dir),
+                        capture_writer=capture_writer,
+                    ):
+                        return True
+                    if await process_one_leaderboard(concrete_database.session_factory):
+                        return True
+                    if await process_one_transcript_archive(concrete_database.session_factory):
+                        return True
+                    if await process_one_runtime_log_retention(concrete_database.session_factory):
+                        return True
+                    if await process_one_postmatch_audio(
+                        concrete_database.session_factory,
+                        storage_root=Path(settings.match_audio_storage_dir),
+                        host_storage_root=Path(settings.host_audio_storage_dir),
+                        speech_storage_root=Path(settings.human_audio_storage_dir),
+                    ):
+                        return True
+                    if await process_one_match_export(
+                        concrete_database.session_factory,
+                        storage_root=Path(settings.export_storage_dir),
+                        audio_roots=[
+                            Path(settings.match_audio_storage_dir),
+                            Path(settings.human_audio_storage_dir),
+                            Path(settings.host_audio_storage_dir),
+                        ],
+                    ):
+                        return True
+                    if await process_one_experiment_postmatch(concrete_database.session_factory):
+                        return True
+                    if await process_one_experiment_export(
+                        concrete_database.session_factory,
+                        storage_root=Path(settings.export_storage_dir),
+                    ):
+                        return True
+                    if await process_one_experiment_retention(concrete_database.session_factory):
+                        return True
+                    return await process_one_file_cleanup(
+                        concrete_database.session_factory,
+                        storage_roots=[
+                            Path(settings.match_audio_storage_dir),
+                            Path(settings.human_audio_storage_dir),
+                        ],
+                    )
+
+                task_processor = process_tasks
+            elif not args.once:
+                concrete_database = cast(Database, database)
+
+                async def process_tasks_without_tts() -> bool:
+                    await write_heartbeat()
+                    await ensure_daily_tasks(concrete_database.session_factory)
+                    if await process_one_leaderboard(concrete_database.session_factory):
+                        return True
+                    if await process_one_transcript_archive(concrete_database.session_factory):
+                        return True
+                    if await process_one_runtime_log_retention(concrete_database.session_factory):
+                        return True
+                    if await process_one_postmatch_audio(
+                        concrete_database.session_factory,
+                        storage_root=Path(settings.match_audio_storage_dir),
+                        host_storage_root=Path(settings.host_audio_storage_dir),
+                        speech_storage_root=Path(settings.human_audio_storage_dir),
+                    ):
+                        return True
+                    if await process_one_match_export(
+                        concrete_database.session_factory,
+                        storage_root=Path(settings.export_storage_dir),
+                        audio_roots=[
+                            Path(settings.match_audio_storage_dir),
+                            Path(settings.human_audio_storage_dir),
+                            Path(settings.host_audio_storage_dir),
+                        ],
+                    ):
+                        return True
+                    if await process_one_experiment_postmatch(concrete_database.session_factory):
+                        return True
+                    if await process_one_experiment_export(
+                        concrete_database.session_factory,
+                        storage_root=Path(settings.export_storage_dir),
+                    ):
+                        return True
+                    if await process_one_experiment_retention(concrete_database.session_factory):
+                        return True
+                    return await process_one_file_cleanup(
+                        concrete_database.session_factory,
+                        storage_roots=[
+                            Path(settings.match_audio_storage_dir),
+                            Path(settings.human_audio_storage_dir),
+                        ],
+                    )
+
+                task_processor = process_tasks_without_tts
+            # Install signal handlers before handing database cleanup to the runner.
+            stop_event = None if args.once else _stop_event()
+            run_jobs_started = True
             return await run_jobs(
                 once=args.once,
                 database=database,
-                stop_event=None if args.once else _stop_event(),
+                stop_event=stop_event,
                 task_processor=task_processor,
             )
         finally:
-            if tts_client is not None:
-                await tts_client.close()
-            if runtime_log_writer is not None:
-                await runtime_log_writer.stop()
+            # Each owner is released even if an earlier cleanup step fails.
+            try:
+                if tts_client is not None:
+                    await tts_client.close()
+            finally:
+                try:
+                    if capture_writer is not None:
+                        await capture_writer.close()
+                finally:
+                    try:
+                        if runtime_log_writer is not None:
+                            await runtime_log_writer.stop()
+                    finally:
+                        if not run_jobs_started:
+                            await database.dispose()
 
     try:
         exit_code = asyncio.run(execute())

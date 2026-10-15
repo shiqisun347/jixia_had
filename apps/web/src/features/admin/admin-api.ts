@@ -24,6 +24,8 @@ import type {
   DiagnosticTaskRow,
   IncidentRow,
   WorkbenchTimelineItem,
+  MatchControlRequest,
+  MatchControlTarget,
 } from './admin-types';
 
 function listPath(path: string, query: AdminListQuery = {}) {
@@ -92,11 +94,21 @@ export const adminApi = {
   storage: () => requestJson<StorageStatus>('/api/admin/storage'),
   matchWorkbenchOverview: (matchId: string) =>
     requestJson<MatchWorkbenchOverview>(`/api/admin/matches/${matchId}/workbench/overview`),
-  controlMatch: (matchId: string, action: 'terminate' | 'resume' | 'recover' | 'reset_speech') =>
+  controlMatch: (
+    matchId: string,
+    action: 'pause' | 'terminate' | 'resume' | 'recover' | 'reset_speech',
+  ) =>
     requestJson<{ status: string; action_state: string; sequence: number }>(
       `/api/admin/matches/${matchId}/control`,
       { method: 'POST', body: JSON.stringify({ action }) },
     ),
+  matchControlTarget: (matchId: string) =>
+    requestJson<MatchControlTarget>(`/api/admin/matches/${matchId}/control-target`),
+  emergencyControlMatch: (matchId: string, payload: MatchControlRequest) =>
+    requestJson<Record<string, unknown>>(`/api/admin/matches/${matchId}/control`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
   matchWorkbenchParticipants: (matchId: string) =>
     requestJson<Record<string, unknown>[]>(`/api/admin/matches/${matchId}/workbench/participants`),
   matchWorkbenchTranscript: (matchId: string, page = 1) =>

@@ -2,19 +2,22 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import io
 import json
 import zipfile
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from uuid import UUID, uuid4
 
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
+from .checksums import sha256_file
 from .task_queue import claim_next, complete, fail
 
 
@@ -22,6 +25,25 @@ class ExperimentTaskError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+# Batch exports are written directly into the ZIP archive.  These limits apply
+# to uncompressed entry bytes, which are the bytes held by the exporter before
+# the ZIP compressor runs.  They keep a malformed or unexpectedly large batch
+# from turning a background worker into an unbounded memory sink.
+EXPERIMENT_EXPORT_MAX_FILE_BYTES = 64 * 1024 * 1024
+EXPERIMENT_EXPORT_MAX_TOTAL_BYTES = 256 * 1024 * 1024
+EXPERIMENT_EXPORT_MAX_ROW_BYTES = 4 * 1024 * 1024
+EXPERIMENT_EXPORT_MAX_ROWS = 1_000_000
+
+# Post-match annotation materialization is a separate bounded path from the
+# streaming batch exporter below.  A malformed match must fail the task before
+# it can multiply speech history into every opportunity/expert payload.
+EXPERIMENT_POSTMATCH_MAX_SPEECH_ROWS = 4_096
+EXPERIMENT_POSTMATCH_MAX_OPPORTUNITY_ROWS = 4_096
+EXPERIMENT_POSTMATCH_MAX_SPEECH_TEXT_BYTES = 64 * 1024 * 1024
+EXPERIMENT_POSTMATCH_MAX_CONTEXT_BYTES = 8 * 1024 * 1024
+EXPERIMENT_POSTMATCH_MAX_TOTAL_CONTEXT_BYTES = 64 * 1024 * 1024
 
 
 def _frozen_history(
@@ -57,6 +79,97 @@ def _frozen_history(
         }
         for speech in eligible
     ]
+
+
+def _utf8_json_bytes(value: Any) -> bytes:
+    """Encode JSON once so byte budgets match the payload written to PostgreSQL."""
+
+    return json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str
+    ).encode("utf-8")
+
+
+def _check_postmatch_payload_budget(
+    *,
+    speeches: Sequence[Mapping[Any, Any]],
+    opportunities: Sequence[Mapping[Any, Any]],
+) -> None:
+    if len(speeches) > EXPERIMENT_POSTMATCH_MAX_SPEECH_ROWS:
+        raise ExperimentTaskError("experiment_postmatch_payload_too_large")
+    if len(opportunities) > EXPERIMENT_POSTMATCH_MAX_OPPORTUNITY_ROWS:
+        raise ExperimentTaskError("experiment_postmatch_payload_too_large")
+    speech_text_bytes = sum(
+        len(str(speech.get("display_text") or "").encode("utf-8")) for speech in speeches
+    )
+    if speech_text_bytes > EXPERIMENT_POSTMATCH_MAX_SPEECH_TEXT_BYTES:
+        raise ExperimentTaskError("experiment_postmatch_payload_too_large")
+
+
+def _bounded_context_json(context: Any) -> tuple[dict[str, Any], bytes]:
+    if not isinstance(context, Mapping):
+        raise ExperimentTaskError("experiment_postmatch_payload_too_large")
+    payload: dict[str, Any] = dict(cast(Mapping[str, Any], context))
+    encoded = _utf8_json_bytes(payload)
+    if len(encoded) > EXPERIMENT_POSTMATCH_MAX_CONTEXT_BYTES:
+        raise ExperimentTaskError("experiment_postmatch_payload_too_large")
+    return payload, encoded
+
+
+async def _check_postmatch_database_budget(
+    session: AsyncSession, *, match_id: UUID, attempt_id: UUID
+) -> None:
+    """Reject oversized source rows before fetching their payload columns.
+
+    The follow-up sentinel queries below are still retained as a race-safe
+    defence, but this preflight prevents a malformed transcript or JSONB
+    context from being materialized into Python before the bounded path fails.
+    ``::text`` deliberately measures logical JSON bytes; ``pg_column_size``
+    measures the compressed JSONB representation and can under-report highly
+    repetitive payloads.
+    """
+
+    speech_budget = (
+        await session.execute(
+            text(
+                """
+                SELECT count(*) AS row_count,
+                       coalesce(sum(octet_length(coalesce(display_text, ''))), 0)
+                         AS text_bytes
+                FROM speeches
+                WHERE match_id=:match_id AND status='FINALIZED'
+                  AND opportunity_id IS NOT NULL
+                """
+            ),
+            {"match_id": match_id},
+        )
+    ).mappings().one()
+    opportunity_budget = (
+        await session.execute(
+            text(
+                """
+                SELECT count(*) AS row_count,
+                       coalesce(sum(octet_length(frozen_context::text)), 0)
+                         AS context_bytes,
+                       coalesce(max(octet_length(frozen_context::text)), 0)
+                         AS max_context_bytes
+                FROM free_debate_opportunities
+                WHERE experiment_attempt_id=:attempt_id
+                """
+            ),
+            {"attempt_id": attempt_id},
+        )
+    ).mappings().one()
+    if (
+        int(speech_budget["row_count"] or 0) > EXPERIMENT_POSTMATCH_MAX_SPEECH_ROWS
+        or int(speech_budget["text_bytes"] or 0) > EXPERIMENT_POSTMATCH_MAX_SPEECH_TEXT_BYTES
+        or int(opportunity_budget["row_count"] or 0)
+        > EXPERIMENT_POSTMATCH_MAX_OPPORTUNITY_ROWS
+        or int(opportunity_budget["context_bytes"] or 0)
+        > EXPERIMENT_POSTMATCH_MAX_TOTAL_CONTEXT_BYTES
+        or int(opportunity_budget["max_context_bytes"] or 0)
+        > EXPERIMENT_POSTMATCH_MAX_CONTEXT_BYTES
+    ):
+        raise ExperimentTaskError("experiment_postmatch_payload_too_large")
 
 
 async def process_one_experiment_postmatch(
@@ -121,6 +234,9 @@ async def process_one_experiment_postmatch(
                 )
                 if len(seats) != 6:
                     raise ExperimentTaskError("experiment_participant_roster_invalid")
+                await _check_postmatch_database_budget(
+                    session, match_id=match_id, attempt_id=attempt_id
+                )
                 for seat in seats:
                     await session.execute(
                         text(
@@ -150,13 +266,19 @@ async def process_one_experiment_postmatch(
                                        seat_no, display_text, started_at, finalized_at
                                 FROM speeches
                                 WHERE match_id=:match_id AND status='FINALIZED'
+                                  AND opportunity_id IS NOT NULL
                                 ORDER BY started_at, id
+                                LIMIT :limit
                                 """
                             ),
-                            {"match_id": match_id},
+                            {
+                                "match_id": match_id,
+                                "limit": EXPERIMENT_POSTMATCH_MAX_SPEECH_ROWS + 1,
+                            },
                         )
                     ).mappings()
                 )
+                _check_postmatch_payload_budget(speeches=speeches, opportunities=[])
                 for seat in seats:
                     task_id = await session.scalar(
                         text(
@@ -220,6 +342,31 @@ async def process_one_experiment_postmatch(
                         )
                     ).mappings()
                 )
+                opportunity_budget = (
+                    await session.execute(
+                        text(
+                            """
+                            SELECT count(*) AS row_count,
+                                   coalesce(sum(octet_length(frozen_context::text)), 0)
+                                     AS context_bytes,
+                                   coalesce(max(octet_length(frozen_context::text)), 0)
+                                     AS max_context_bytes
+                            FROM free_debate_opportunities
+                            WHERE experiment_attempt_id=:attempt_id
+                            """
+                        ),
+                        {"attempt_id": attempt_id},
+                    )
+                ).mappings().one()
+                if (
+                    int(opportunity_budget["row_count"] or 0)
+                    > EXPERIMENT_POSTMATCH_MAX_OPPORTUNITY_ROWS
+                    or int(opportunity_budget["context_bytes"] or 0)
+                    > EXPERIMENT_POSTMATCH_MAX_TOTAL_CONTEXT_BYTES
+                    or int(opportunity_budget["max_context_bytes"] or 0)
+                    > EXPERIMENT_POSTMATCH_MAX_CONTEXT_BYTES
+                ):
+                    raise ExperimentTaskError("experiment_postmatch_payload_too_large")
                 opportunities = list(
                     (
                         await session.execute(
@@ -231,18 +378,28 @@ async def process_one_experiment_postmatch(
                                 FROM free_debate_opportunities
                                 WHERE experiment_attempt_id=:attempt_id
                                 ORDER BY sequence_no
+                                LIMIT :limit
                                 """
                             ),
-                            {"attempt_id": attempt_id},
+                            {
+                                "attempt_id": attempt_id,
+                                "limit": EXPERIMENT_POSTMATCH_MAX_OPPORTUNITY_ROWS + 1,
+                            },
                         )
                     ).mappings()
                 )
+                _check_postmatch_payload_budget(speeches=speeches, opportunities=opportunities)
                 enriched_contexts: dict[UUID, dict[str, Any]] = {}
                 speech_rows = [dict(speech) for speech in speeches]
+                total_context_bytes = 0
                 for opportunity in opportunities:
                     opportunity_row = dict(opportunity)
-                    context = dict(opportunity["frozen_context"] or {})
+                    context, _ = _bounded_context_json(opportunity["frozen_context"] or {})
                     context["history"] = _frozen_history(speech_rows, opportunity_row)
+                    context, context_encoded = _bounded_context_json(context)
+                    total_context_bytes += len(context_encoded)
+                    if total_context_bytes > EXPERIMENT_POSTMATCH_MAX_TOTAL_CONTEXT_BYTES:
+                        raise ExperimentTaskError("experiment_postmatch_payload_too_large")
                     enriched_contexts[UUID(str(opportunity["id"]))] = context
                     await session.execute(
                         text(
@@ -298,12 +455,9 @@ async def process_one_experiment_postmatch(
                             "context_version": opportunity["context_version"],
                             "context": enriched_contexts[UUID(str(opportunity["id"]))],
                         }
-                        encoded = json.dumps(
-                            frozen_payload,
-                            ensure_ascii=False,
-                            sort_keys=True,
-                            separators=(",", ":"),
-                        ).encode()
+                        encoded = _utf8_json_bytes(frozen_payload)
+                        if len(encoded) > EXPERIMENT_POSTMATCH_MAX_CONTEXT_BYTES:
+                            raise ExperimentTaskError("experiment_postmatch_payload_too_large")
                         await session.execute(
                             text(
                                 """
@@ -348,7 +502,10 @@ def _csv_bytes(rows: list[dict[str, Any]], columns: list[str]) -> bytes:
     writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
     writer.writeheader()
     writer.writerows({column: _safe_text(row.get(column)) for column in columns} for row in rows)
-    return ("\ufeff" + buffer.getvalue()).encode()
+    payload = ("\ufeff" + buffer.getvalue()).encode()
+    if len(payload) > EXPERIMENT_EXPORT_MAX_FILE_BYTES:
+        raise ExperimentTaskError("experiment_export_file_too_large")
+    return payload
 
 
 _EXPORT_COLUMNS: dict[str, list[str]] = {
@@ -488,14 +645,352 @@ _EXPORT_COLUMNS: dict[str, list[str]] = {
 }
 
 
+# Keep the export statements in one table so the production path can stream
+# them one at a time.  ``_build_batch_files`` below remains as a bounded
+# compatibility helper for callers/tests that need an in-memory package.
+_BATCH_EXPORT_QUERIES: dict[str, tuple[str, list[str] | None]] = {
+    "schedule.csv": (
+        """
+        SELECT sm.id AS scheduled_match_id, sm.round_no, sm.match_no, sm.kind,
+               sm.status, sm.schedule_version, sm.topic_id,
+               t.title AS topic_title, t.affirmative_text AS affirmative_stance,
+               t.negative_text AS negative_stance, t.source_text, t.cedar_id,
+               affirmative.team_code AS affirmative_team,
+               negative.team_code AS negative_team,
+               sm.scheduled_at, ema.id AS effective_attempt_id, ema.attempt_no,
+               ema.status AS attempt_status, ema.started_at, ema.ended_at, ema.public_at
+        FROM scheduled_matches sm
+        JOIN topics t ON t.id=sm.topic_id
+        JOIN experiment_teams affirmative ON affirmative.id=sm.affirmative_team_id
+        JOIN experiment_teams negative ON negative.id=sm.negative_team_id
+        LEFT JOIN experiment_match_attempts ema ON ema.id=sm.effective_attempt_id
+        WHERE sm.batch_id=:batch_id AND sm.created_at <= :cutoff_at
+        ORDER BY sm.round_no, sm.match_no
+        """,
+        _EXPORT_COLUMNS["schedule.csv"],
+    ),
+    "opportunities.csv": (
+        """
+        SELECT sm.id AS scheduled_match_id, ema.attempt_no, fdo.id AS opportunity_id,
+               fdo.sequence_no, fdo.side, fdo.trigger_kind, fdo.source_speech_id,
+               fdo.context_version, fdo.opportunity_generation, fdo.status,
+               fdo.selection_phase, fdo.decision_fact, fdo.allocation_fact,
+               fdo.execution_fact, fdo.opened_at, fdo.source_ended_at,
+               fdo.selection_deadline_at, fdo.human_wait_deadline_at,
+               fdo.invalidated_reason, fdo.completed_at
+        FROM free_debate_opportunities fdo
+        JOIN experiment_match_attempts ema ON ema.id=fdo.experiment_attempt_id
+        JOIN scheduled_matches sm ON sm.id=ema.scheduled_match_id
+        WHERE sm.batch_id=:batch_id AND fdo.opened_at <= :cutoff_at
+        ORDER BY sm.round_no, sm.match_no, fdo.sequence_no
+        """,
+        _EXPORT_COLUMNS["opportunities.csv"],
+    ),
+    "human_hand_events.csv": (
+        """
+        SELECT sm.id AS scheduled_match_id, fdo.id AS opportunity_id,
+               etm.participant_code, hhe.event_type, hhe.server_sequence,
+               hhe.connection_epoch, hhe.accepted_at
+        FROM human_hand_events hhe
+        JOIN free_debate_opportunities fdo ON fdo.id=hhe.opportunity_id
+        JOIN experiment_match_attempts ema ON ema.id=fdo.experiment_attempt_id
+        JOIN scheduled_matches sm ON sm.id=ema.scheduled_match_id
+        JOIN experiment_team_members etm
+          ON etm.batch_id=sm.batch_id AND etm.user_id=hhe.user_id
+        WHERE sm.batch_id=:batch_id AND hhe.accepted_at <= :cutoff_at
+        ORDER BY sm.round_no, sm.match_no, fdo.sequence_no, hhe.server_sequence
+        """,
+        _EXPORT_COLUMNS["human_hand_events.csv"],
+    ),
+    "agent_decisions.jsonl": (
+        """
+        SELECT sm.id AS scheduled_match_id, afd.opportunity_id,
+               afd.decision_round_id, afd.side, afd.seat_no, afd.status,
+               afd.should_speak, afd.attempt_no, afd.duration_ms, afd.error_code,
+               afd.effective_status, afd.deadline_at, afd.trigger_kind,
+               afd.late, afd.stale, afd.invalidated_reason,
+               afd.human_hand_snapshot, afd.started_at, afd.completed_at
+        FROM agent_free_debate_decisions afd
+        JOIN free_debate_opportunities fdo ON fdo.id=afd.opportunity_id
+        JOIN experiment_match_attempts ema ON ema.id=fdo.experiment_attempt_id
+        JOIN scheduled_matches sm ON sm.id=ema.scheduled_match_id
+        WHERE sm.batch_id=:batch_id AND afd.created_at <= :cutoff_at
+        ORDER BY sm.round_no, sm.match_no, fdo.sequence_no, afd.created_at
+        """,
+        None,
+    ),
+    "speaker_allocations.csv": (
+        """
+        SELECT sm.id AS scheduled_match_id, sa.opportunity_id, sa.speaker_kind,
+               etm.participant_code,
+               CASE WHEN sa.agent_profile_id IS NULL THEN NULL
+                    ELSE team.team_code || '-AI' END AS agent_code,
+               sa.reason, sa.effective, sa.allocated_at
+        FROM speaker_allocations sa
+        JOIN free_debate_opportunities fdo ON fdo.id=sa.opportunity_id
+        JOIN experiment_match_attempts ema ON ema.id=fdo.experiment_attempt_id
+        JOIN scheduled_matches sm ON sm.id=ema.scheduled_match_id
+        LEFT JOIN experiment_team_members etm
+          ON etm.batch_id=sm.batch_id AND etm.user_id=sa.user_id
+        LEFT JOIN experiment_teams team
+          ON team.batch_id=sm.batch_id AND team.agent_profile_id=sa.agent_profile_id
+        WHERE sm.batch_id=:batch_id AND sa.allocated_at <= :cutoff_at
+        ORDER BY sm.round_no, sm.match_no, fdo.sequence_no, sa.allocated_at
+        """,
+        _EXPORT_COLUMNS["speaker_allocations.csv"],
+    ),
+    "speeches.csv": (
+        """
+        SELECT sm.id AS scheduled_match_id, s.id AS speech_id, s.opportunity_id,
+               s.action_key, s.speaker_kind, etm.participant_code,
+               CASE WHEN s.agent_profile_id IS NULL THEN NULL
+                    ELSE team.team_code || '-AI' END AS agent_code,
+               s.side, s.seat_no, s.status, s.attempt_no, s.finish_reason,
+               s.asr_raw_final_text, s.display_text, s.llm_draft_text,
+               s.first_interim_latency_ms, s.final_latency_ms,
+               s.audio_duration_ms, s.audio_truncated,
+               s.playback_started_at, s.started_at, s.ended_at, s.finalized_at
+        FROM speeches s
+        JOIN experiment_match_attempts ema ON ema.match_id=s.match_id
+        JOIN scheduled_matches sm ON sm.id=ema.scheduled_match_id
+        LEFT JOIN experiment_team_members etm
+          ON etm.batch_id=sm.batch_id AND etm.user_id=s.user_id
+        LEFT JOIN experiment_teams team
+          ON team.batch_id=sm.batch_id AND team.agent_profile_id=s.agent_profile_id
+        WHERE sm.batch_id=:batch_id AND s.created_at <= :cutoff_at
+        ORDER BY sm.round_no, sm.match_no, s.created_at
+        """,
+        _EXPORT_COLUMNS["speeches.csv"],
+    ),
+    "participant_annotations.csv": (
+        """
+        SELECT sm.id AS scheduled_match_id, etm.participant_code,
+               pat.status AS task_status, pat.due_at, pat.late, pat.submitted_at,
+               pai.opportunity_id, pai.subject_kind, pai.speech_id, pai.position,
+               pai.stage1_locked_at, pai.revealed_at, paa.stage,
+               paa.question_key, paa.answer, paa.response_duration_ms,
+               paa.audio_play_count, paa.client_version, paa.saved_at
+        FROM participant_annotation_tasks pat
+        JOIN experiment_match_attempts ema ON ema.id=pat.experiment_attempt_id
+        JOIN scheduled_matches sm ON sm.id=ema.scheduled_match_id
+        JOIN experiment_team_members etm
+          ON etm.batch_id=sm.batch_id AND etm.user_id=pat.user_id
+        LEFT JOIN participant_annotation_items pai ON pai.task_id=pat.id
+        LEFT JOIN participant_annotation_answers paa
+          ON paa.task_id=pat.id AND paa.opportunity_id=pai.opportunity_id
+             AND paa.subject_kind=pai.subject_kind
+        WHERE sm.batch_id=:batch_id AND pat.created_at <= :cutoff_at
+        ORDER BY sm.round_no, sm.match_no, etm.participant_code, pai.position,
+                 paa.stage, paa.question_key
+        """,
+        _EXPORT_COLUMNS["participant_annotations.csv"],
+    ),
+    "match_questionnaires.csv": (
+        """
+        SELECT sm.id AS scheduled_match_id, etm.participant_code,
+               pat.questionnaire_version, mq.q1, mq.q2, mq.q3, mq.q4, mq.q5,
+               mq.q6, mq.submitted_at
+        FROM match_questionnaires mq
+        JOIN participant_annotation_tasks pat ON pat.id=mq.task_id
+        JOIN experiment_match_attempts ema ON ema.id=pat.experiment_attempt_id
+        JOIN scheduled_matches sm ON sm.id=ema.scheduled_match_id
+        JOIN experiment_team_members etm
+          ON etm.batch_id=sm.batch_id AND etm.user_id=pat.user_id
+        WHERE sm.batch_id=:batch_id AND mq.submitted_at <= :cutoff_at
+        ORDER BY sm.round_no, sm.match_no, etm.participant_code
+        """,
+        _EXPORT_COLUMNS["match_questionnaires.csv"],
+    ),
+    "expert_annotations.csv": (
+        """
+        SELECT ee.expert_code, eaa.opportunity_id, eaa.payload_sha256,
+               eaa.q1, eaa.q2, eaa.q3, eaa.client_version,
+               eaa.saved_at, eaa.submitted_at
+        FROM expert_annotation_answers eaa
+        JOIN expert_annotation_tasks eat ON eat.id=eaa.task_id
+        JOIN experiment_experts ee
+          ON ee.batch_id=eat.batch_id AND ee.user_id=eat.expert_user_id
+        WHERE eat.batch_id=:batch_id AND eaa.saved_at <= :cutoff_at
+        ORDER BY ee.expert_code, eaa.saved_at, eaa.opportunity_id
+        """,
+        _EXPORT_COLUMNS["expert_annotations.csv"],
+    ),
+}
+
+
+class _ExportBudget:
+    def __init__(self) -> None:
+        self.total_bytes = 0
+
+    def charge(self, size: int) -> None:
+        if size < 0 or self.total_bytes + size > EXPERIMENT_EXPORT_MAX_TOTAL_BYTES:
+            raise ExperimentTaskError("experiment_export_total_too_large")
+        self.total_bytes += size
+
+
+class _ArchiveEntryWriter:
+    """Hash and bound one uncompressed ZIP entry without buffering it."""
+
+    def __init__(self, raw: Any, budget: _ExportBudget) -> None:
+        self._raw = raw
+        self._budget = budget
+        self._digest = hashlib.sha256()
+        self.byte_count = 0
+
+    def write(self, payload: bytes) -> int:
+        size = len(payload)
+        if size > EXPERIMENT_EXPORT_MAX_ROW_BYTES:
+            raise ExperimentTaskError("experiment_export_row_too_large")
+        if self.byte_count + size > EXPERIMENT_EXPORT_MAX_FILE_BYTES:
+            raise ExperimentTaskError("experiment_export_file_too_large")
+        self._budget.charge(size)
+        written = self._raw.write(payload)
+        if written != size:
+            raise ExperimentTaskError("experiment_export_write_failed")
+        self.byte_count += size
+        self._digest.update(payload)
+        return written
+
+    def sha256(self) -> str:
+        return self._digest.hexdigest()
+
+
+def _csv_header_bytes(columns: list[str]) -> bytes:
+    buffer = io.StringIO()
+    csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore").writeheader()
+    return buffer.getvalue().encode()
+
+
+def _csv_row_bytes(row: Mapping[Any, Any], columns: list[str]) -> bytes:
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=columns, extrasaction="ignore")
+    writer.writerow({column: _safe_text(row.get(column)) for column in columns})
+    return buffer.getvalue().encode()
+
+
+async def _close_stream_result(result: Any) -> None:
+    close = getattr(result, "close", None)
+    if close is None:
+        return
+    outcome = close()
+    if hasattr(outcome, "__await__"):
+        await outcome
+
+
+async def _stream_entry(
+    session: AsyncSession,
+    archive: zipfile.ZipFile,
+    *,
+    name: str,
+    statement: str,
+    parameters: dict[str, Any],
+    columns: list[str] | None,
+    budget: _ExportBudget,
+) -> dict[str, Any]:
+    """Stream one SQL result directly to a ZIP member and return its metadata."""
+
+    result = await session.stream(text(statement), parameters)
+    count = 0
+    try:
+        mappings = result.mappings()
+        with archive.open(name, "w", force_zip64=True) as raw:
+            writer = _ArchiveEntryWriter(raw, budget)
+            if columns is not None:
+                writer.write("\ufeff".encode())
+                writer.write(_csv_header_bytes(columns))
+            async for row in mappings:
+                payload = (
+                    _csv_row_bytes(row, columns)
+                    if columns is not None
+                    else (_json(dict(row)) + "\n").encode()
+                )
+                writer.write(payload)
+                count += 1
+                if count % 256 == 0:
+                    await asyncio.sleep(0)
+            metadata = {
+                "row_count": count,
+                "byte_count": writer.byte_count,
+                "sha256": writer.sha256(),
+                "schema_version": "2.0",
+            }
+    finally:
+        await _close_stream_result(result)
+    return metadata
+
+
+async def _stream_batch_files(
+    session: AsyncSession,
+    archive: zipfile.ZipFile,
+    *,
+    batch_id: UUID,
+    cutoff_at: datetime,
+) -> dict[str, Any]:
+    """Write a batch export without materializing result sets or file bytes."""
+
+    batch = (
+        (
+            await session.execute(
+                text(
+                    "SELECT id, code, title, status, schedule_version FROM experiment_batches "
+                    "WHERE id=:batch_id"
+                ),
+                {"batch_id": batch_id},
+            )
+        )
+        .mappings()
+        .one_or_none()
+    )
+    if batch is None:
+        raise ExperimentTaskError("experiment_batch_not_found")
+
+    budget = _ExportBudget()
+    manifest: dict[str, Any] = {
+        "export_schema_version": "2.0",
+        "data_dictionary_version": "paper-experiment-2026-08-21",
+        "batch": {
+            "id": str(batch["id"]),
+            "code": batch["code"],
+            "title": batch["title"],
+            "status": batch["status"],
+            "schedule_version": batch["schedule_version"],
+        },
+        "generated_at": datetime.now(UTC).isoformat(),
+        "cutoff_at": cutoff_at.isoformat(),
+        "identity_mapping_included": False,
+        "files": {},
+    }
+    for name, (statement, columns) in _BATCH_EXPORT_QUERIES.items():
+        manifest["files"][name] = await _stream_entry(
+            session,
+            archive,
+            name=name,
+            statement=statement,
+            parameters={"batch_id": batch_id, "cutoff_at": cutoff_at},
+            columns=columns,
+            budget=budget,
+        )
+    manifest_bytes = (_json(manifest) + "\n").encode()
+    if len(manifest_bytes) > EXPERIMENT_EXPORT_MAX_ROW_BYTES:
+        raise ExperimentTaskError("experiment_export_manifest_too_large")
+    with archive.open("manifest.json", "w", force_zip64=True) as raw:
+        _ArchiveEntryWriter(raw, budget).write(manifest_bytes)
+    return manifest
+
+
 async def _rows(
     session: AsyncSession, statement: str, *, batch_id: UUID, cutoff_at: datetime
 ) -> list[dict[str, Any]]:
     result = await session.execute(text(statement), {"batch_id": batch_id, "cutoff_at": cutoff_at})
-    return [dict(row) for row in result.mappings()]
+    rows: list[dict[str, Any]] = []
+    for row in result.mappings():
+        if len(rows) >= EXPERIMENT_EXPORT_MAX_ROWS:
+            raise ExperimentTaskError("experiment_export_rows_too_many")
+        rows.append(dict(row))
+    return rows
 
 
-async def _build_batch_files(
+async def _build_batch_files(  # pyright: ignore[reportUnusedFunction]
     session: AsyncSession, *, batch_id: UUID, cutoff_at: datetime
 ) -> tuple[dict[str, bytes], dict[str, Any]]:
     batch = (
@@ -713,6 +1208,10 @@ async def _build_batch_files(
     files["agent_decisions.jsonl"] = (
         "\n".join(_json(row) for row in decisions) + ("\n" if decisions else "")
     ).encode()
+    if len(files["agent_decisions.jsonl"]) > EXPERIMENT_EXPORT_MAX_FILE_BYTES:
+        raise ExperimentTaskError("experiment_export_file_too_large")
+    if sum(len(content) for content in files.values()) > EXPERIMENT_EXPORT_MAX_TOTAL_BYTES:
+        raise ExperimentTaskError("experiment_export_total_too_large")
     row_counts = {name: len(rows) for name, rows in datasets.items()}
     row_counts["agent_decisions.jsonl"] = len(decisions)
     manifest: dict[str, Any] = {
@@ -756,13 +1255,8 @@ async def process_one_experiment_export(
             cutoff_at = cutoff_at.replace(tzinfo=UTC)
         storage_root.mkdir(parents=True, exist_ok=True)
         async with session_factory() as session:
-            files, manifest = await _build_batch_files(
-                session, batch_id=batch_id, cutoff_at=cutoff_at
-            )
-        with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            for name, content in files.items():
-                archive.writestr(name, content)
-            archive.writestr("manifest.json", (_json(manifest) + "\n").encode())
+            with zipfile.ZipFile(temporary, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+                await _stream_batch_files(session, archive, batch_id=batch_id, cutoff_at=cutoff_at)
         temporary.replace(output)
         async with session_factory() as session:
             await session.execute(
@@ -774,7 +1268,7 @@ async def process_one_experiment_export(
                 {
                     "id": claim.task_id,
                     "artifact_name": output.name,
-                    "sha256": hashlib.sha256(output.read_bytes()).hexdigest(),
+                    "sha256": await asyncio.to_thread(sha256_file, output),
                 },
             )
             await session.commit()

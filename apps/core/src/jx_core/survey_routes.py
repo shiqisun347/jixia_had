@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import csv
 import io
 import json
+from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from typing import Annotated, Any, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends
-from fastapi.responses import Response
-from sqlalchemy import select
+from fastapi import APIRouter, Depends, Query
+from fastapi import Response as FastAPIResponse
+from fastapi.encoders import jsonable_encoder
+from fastapi.responses import Response, StreamingResponse
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .audit.service import AuditService
@@ -24,9 +29,11 @@ from .auth.dependencies import (
 from .auth.session import AuthContext
 from .models import PersonalAiSurveyResponse, PersonalAiSurveyVersion, PostmatchSurveyTask
 from .survey_service import (
+    POSTMATCH_TASK_PAGE_DEFAULT,
+    POSTMATCH_TASK_PAGE_MAX,
     ensure_personal_version,
     get_postmatch_task,
-    list_postmatch_tasks,
+    list_postmatch_tasks_page,
     personal_response,
     postmatch_task_status,
     save_personal_response,
@@ -36,6 +43,129 @@ from .survey_service import (
 )
 
 router = APIRouter(tags=["surveys"])
+
+
+def _encode_postmatch_cursor(value: tuple[datetime, UUID]) -> str:
+    payload = f"{value[0].isoformat()}|{value[1]}"
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_postmatch_cursor(value: str) -> tuple[datetime, UUID]:
+    from .auth.errors import APIError
+
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        timestamp, task_id = base64.urlsafe_b64decode(padded).decode("utf-8").rsplit("|", 1)
+        parsed_timestamp = datetime.fromisoformat(timestamp)
+        if parsed_timestamp.tzinfo is None:
+            raise ValueError
+        return parsed_timestamp, UUID(task_id)
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        raise APIError("survey_query_invalid") from None
+
+
+def _json_bytes(value: Any) -> bytes:
+    """Encode one bounded JSON value without retaining an export in memory."""
+
+    return json.dumps(
+        jsonable_encoder(value), ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+
+
+def _personal_response_export_row(item: PersonalAiSurveyResponse) -> dict[str, Any]:
+    return {
+        "response_id": str(item.id),
+        "user_id": str(item.user_id),
+        "version_id": str(item.version_id),
+        "status": item.status,
+        "answers": item.answers,
+        "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+        "submitted_at": item.submitted_at.isoformat() if item.submitted_at else None,
+    }
+
+
+def _postmatch_response_export_row(item: PostmatchSurveyTask) -> dict[str, Any]:
+    return {
+        "task_id": str(item.id),
+        "match_id": str(item.match_id),
+        "user_id": str(item.user_id),
+        "questionnaire_version": item.questionnaire_version,
+        "status": item.status,
+        "answers": item.answers,
+        "updated_at": item.updated_at.isoformat() if item.updated_at else None,
+        "submitted_at": item.submitted_at.isoformat() if item.submitted_at else None,
+    }
+
+
+async def _stream_personal_admin_payload(
+    session: AsyncSession, version_payload: dict[str, Any]
+) -> AsyncIterator[bytes]:
+    """Stream the legacy admin personal-survey object without a result list."""
+
+    yield b'{"version":'
+    yield _json_bytes(version_payload)
+    yield b',"responses":['
+    result = await session.stream_scalars(
+        select(PersonalAiSurveyResponse).order_by(PersonalAiSurveyResponse.updated_at.desc())
+    )
+    first = True
+    try:
+        async for item in result:
+            if not first:
+                yield b","
+            first = False
+            yield _json_bytes(
+                {
+                    "id": str(item.id),
+                    "user_id": str(item.user_id),
+                    "status": item.status,
+                    "answers": item.answers,
+                    "updated_at": item.updated_at,
+                    "submitted_at": item.submitted_at,
+                }
+            )
+    finally:
+        await result.close()
+    yield b"]}"
+
+
+async def _stream_survey_export(
+    session: AsyncSession,
+    statement: Any,
+    *,
+    format: str,
+    fields: list[str],
+    row_encoder: Any,
+) -> AsyncIterator[bytes]:
+    """Stream CSV or JSON survey rows while keeping one DB row at a time."""
+
+    result = await session.stream_scalars(statement)
+    try:
+        if format == "json":
+            yield b"["
+            first = True
+            async for item in result:
+                if not first:
+                    yield b","
+                first = False
+                yield _json_bytes(row_encoder(item))
+            yield b"]"
+            return
+
+        # CSV's writer is intentionally recreated for each row so the output
+        # buffer never grows with the number of survey responses.
+        header = io.StringIO()
+        csv.DictWriter(header, fieldnames=fields).writeheader()
+        yield header.getvalue().encode("utf-8")
+        async for item in result:
+            row = row_encoder(item)
+            output = io.StringIO()
+            csv.DictWriter(output, fieldnames=fields).writerow(
+                {**row, "answers": json.dumps(row["answers"], ensure_ascii=False)}
+            )
+            yield output.getvalue().encode("utf-8")
+    finally:
+        await result.close()
 
 
 @router.get("/api/me/ai-experience")
@@ -69,8 +199,22 @@ async def save_ai_experience(
 async def get_postmatch_surveys(
     auth: Annotated[AuthContext, Depends(get_changed_password_auth)],
     session: Annotated[AsyncSession, Depends(get_database_session)],
+    response: FastAPIResponse,
+    limit: int = Query(default=POSTMATCH_TASK_PAGE_DEFAULT, ge=1, le=POSTMATCH_TASK_PAGE_MAX),
+    cursor: str = Query(default="", max_length=256),
+    include_items: bool = Query(default=False),
 ) -> list[dict[str, Any]]:
-    return await list_postmatch_tasks(session, user_id=auth.user_id)
+    cursor_value = _decode_postmatch_cursor(cursor) if cursor else None
+    tasks, next_cursor = await list_postmatch_tasks_page(
+        session,
+        user_id=auth.user_id,
+        limit=limit,
+        cursor=cursor_value,
+        include_items=include_items,
+    )
+    if next_cursor is not None:
+        response.headers["X-Next-Cursor"] = _encode_postmatch_cursor(next_cursor)
+    return tasks
 
 
 @router.get("/api/me/postmatch-surveys/matches/{match_id}/status")
@@ -159,15 +303,6 @@ async def admin_personal_survey(
     )
     if version is None:
         version = await ensure_personal_version(session, actor_user_id=auth.user_id)
-    responses = list(
-        (
-            await session.scalars(
-                select(PersonalAiSurveyResponse).order_by(
-                    PersonalAiSurveyResponse.updated_at.desc()
-                )
-            )
-        ).all()
-    )
     AuditService().record(
         session,
         actor_user_id=auth.user_id,
@@ -176,27 +311,23 @@ async def admin_personal_survey(
         target_id=str(version.id),
     )
     await session.commit()
-    return {
-        "version": {
-            "id": str(version.id),
-            "version": version.version,
-            "title": version.title,
-            "description": version.description,
-            "questions": version.questions,
-            "status": version.status,
-        },
-        "responses": [
-            {
-                "id": str(item.id),
-                "user_id": str(item.user_id),
-                "status": item.status,
-                "answers": item.answers,
-                "updated_at": item.updated_at,
-                "submitted_at": item.submitted_at,
-            }
-            for item in responses
-        ],
-    }
+    return cast(
+        Any,
+        StreamingResponse(
+            _stream_personal_admin_payload(
+                session,
+                {
+                    "id": str(version.id),
+                    "version": version.version,
+                    "title": version.title,
+                    "description": version.description,
+                    "questions": version.questions,
+                    "status": version.status,
+                },
+            ),
+            media_type="application/json",
+        ),
+    )
 
 
 @router.put("/api/admin/surveys/personal", dependencies=[Depends(require_browser_origin)])
@@ -322,60 +453,39 @@ async def export_personal_surveys(
         from .auth.errors import APIError
 
         raise APIError("survey_export_format_invalid")
-    responses = list(
-        (
-            await session.scalars(
-                select(PersonalAiSurveyResponse).order_by(PersonalAiSurveyResponse.updated_at)
-            )
-        ).all()
+    count = int(
+        await session.scalar(select(func.count()).select_from(PersonalAiSurveyResponse)) or 0
     )
-    rows = [
-        {
-            "response_id": str(item.id),
-            "user_id": str(item.user_id),
-            "version_id": str(item.version_id),
-            "status": item.status,
-            "answers": item.answers,
-            "updated_at": item.updated_at.isoformat() if item.updated_at else None,
-            "submitted_at": item.submitted_at.isoformat() if item.submitted_at else None,
-        }
-        for item in responses
-    ]
     AuditService().record(
         session,
         actor_user_id=auth.user_id,
         action="admin.survey.responses_exported",
         target_type="personal_ai_survey",
         target_id=None,
-        details={"format": format, "count": len(rows)},
+        details={"format": format, "count": count},
     )
     await session.commit()
-    if format == "json":
-        return Response(
-            content=json.dumps(rows, ensure_ascii=False),
-            media_type="application/json",
-            headers={"Content-Disposition": "attachment; filename=personal-ai-surveys.json"},
-        )
-    output = io.StringIO()
-    writer = csv.DictWriter(
-        output,
-        fieldnames=[
-            "response_id",
-            "user_id",
-            "version_id",
-            "status",
-            "answers",
-            "updated_at",
-            "submitted_at",
-        ],
-    )
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({**row, "answers": json.dumps(row["answers"], ensure_ascii=False)})
-    return Response(
-        content=output.getvalue(),
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=personal-ai-surveys.csv"},
+    fields = [
+        "response_id",
+        "user_id",
+        "version_id",
+        "status",
+        "answers",
+        "updated_at",
+        "submitted_at",
+    ]
+    media_type = "application/json" if format == "json" else "text/csv; charset=utf-8"
+    filename = "personal-ai-surveys.json" if format == "json" else "personal-ai-surveys.csv"
+    return StreamingResponse(
+        _stream_survey_export(
+            session,
+            select(PersonalAiSurveyResponse).order_by(PersonalAiSurveyResponse.updated_at),
+            format=format,
+            fields=fields,
+            row_encoder=_personal_response_export_row,
+        ),
+        media_type=media_type,
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )
 
 
@@ -389,42 +499,16 @@ async def export_postmatch_surveys(
         from .auth.errors import APIError
 
         raise APIError("survey_export_format_invalid")
-    tasks = list(
-        (
-            await session.scalars(
-                select(PostmatchSurveyTask).order_by(PostmatchSurveyTask.updated_at)
-            )
-        ).all()
-    )
-    rows = [
-        {
-            "task_id": str(item.id),
-            "match_id": str(item.match_id),
-            "user_id": str(item.user_id),
-            "questionnaire_version": item.questionnaire_version,
-            "status": item.status,
-            "answers": item.answers,
-            "updated_at": item.updated_at.isoformat() if item.updated_at else None,
-            "submitted_at": item.submitted_at.isoformat() if item.submitted_at else None,
-        }
-        for item in tasks
-    ]
+    count = int(await session.scalar(select(func.count()).select_from(PostmatchSurveyTask)) or 0)
     AuditService().record(
         session,
         actor_user_id=auth.user_id,
         action="admin.survey.postmatch_exported",
         target_type="postmatch_survey",
         target_id=None,
-        details={"format": format, "count": len(rows)},
+        details={"format": format, "count": count},
     )
     await session.commit()
-    if format == "json":
-        return Response(
-            content=json.dumps(rows, ensure_ascii=False),
-            media_type="application/json",
-            headers={"Content-Disposition": "attachment; filename=postmatch-surveys.json"},
-        )
-    output = io.StringIO()
     fields = [
         "task_id",
         "match_id",
@@ -435,12 +519,16 @@ async def export_postmatch_surveys(
         "updated_at",
         "submitted_at",
     ]
-    writer = csv.DictWriter(output, fieldnames=fields)
-    writer.writeheader()
-    for row in rows:
-        writer.writerow({**row, "answers": json.dumps(row["answers"], ensure_ascii=False)})
-    return Response(
-        content=output.getvalue(),
-        media_type="text/csv; charset=utf-8",
-        headers={"Content-Disposition": "attachment; filename=postmatch-surveys.csv"},
+    media_type = "application/json" if format == "json" else "text/csv; charset=utf-8"
+    filename = "postmatch-surveys.json" if format == "json" else "postmatch-surveys.csv"
+    return StreamingResponse(
+        _stream_survey_export(
+            session,
+            select(PostmatchSurveyTask).order_by(PostmatchSurveyTask.updated_at),
+            format=format,
+            fields=fields,
+            row_encoder=_postmatch_response_export_row,
+        ),
+        media_type=media_type,
+        headers={"Content-Disposition": f"attachment; filename={filename}"},
     )

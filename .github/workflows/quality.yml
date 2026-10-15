@@ -44,8 +44,19 @@ jobs:
       - run: pnpm check
         env:
           DATABASE_URL: postgresql+psycopg://jx:change-me@127.0.0.1:5432/jx_debate
+      - name: Create isolated integration database
+        run: |
+          uv run --package jx-core python - <<'PY'
+          import psycopg
+
+          with psycopg.connect(
+              "postgresql://jx:change-me@127.0.0.1:5432/postgres", autocommit=True
+          ) as connection:
+              connection.execute("CREATE DATABASE jx_debate_qa_agent_faults")
+          PY
       - run: pnpm test:db
         env:
           DATABASE_URL: postgresql+psycopg://jx:change-me@127.0.0.1:5432/jx_debate
+          TEST_DATABASE_URL: postgresql+psycopg://jx:change-me@127.0.0.1:5432/jx_debate_qa_agent_faults
       - run: pnpm --filter @jx/web exec playwright install --with-deps chromium
       - run: pnpm test:browser

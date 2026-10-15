@@ -12,7 +12,8 @@ from uuid import UUID, uuid4
 
 from websockets.asyncio.client import connect
 
-from ..data_capture.provider import ProviderCallCapture
+from ..data_capture.provider import CaptureEventBuffer, ProviderCallCapture
+from ..provider_cleanup import close_provider_socket_bounded
 
 
 class TtsProviderError(RuntimeError):
@@ -33,6 +34,9 @@ SocketFactory = Callable[[str, dict[str, str]], Awaitable[WebSocketLike]]
 AudioCallback = Callable[[bytes], Awaitable[None]]
 EventCallback = Callable[[dict[str, Any]], Awaitable[None]]
 TTS_START_INTERVAL_SECONDS = 0.35
+TTS_TASK_TIMEOUT_SECONDS = 180.0
+TTS_MAX_AUDIO_BYTES = 16 * 1024 * 1024
+TTS_MAX_CAPTURE_EVENTS = 128
 
 
 class TtsStartRateLimiter:
@@ -70,6 +74,8 @@ async def _socket_factory(url: str, headers: dict[str, str]) -> WebSocketLike:
 
 
 class QwenTtsConnection:
+    _CLOSE_TIMEOUT_SECONDS = 2.0
+
     def __init__(
         self,
         *,
@@ -79,6 +85,8 @@ class QwenTtsConnection:
         workspace_id: str | None = None,
         socket_factory: SocketFactory = _socket_factory,
         timeout_seconds: float = 10.0,
+        task_timeout_seconds: float = TTS_TASK_TIMEOUT_SECONDS,
+        max_audio_bytes: int = TTS_MAX_AUDIO_BYTES,
         start_rate_limiter: TtsStartRateLimiter = _DEFAULT_START_RATE_LIMITER,
     ) -> None:
         self._url = url
@@ -88,6 +96,8 @@ class QwenTtsConnection:
         self._model = model
         self._socket_factory = socket_factory
         self._timeout_seconds = timeout_seconds
+        self._task_timeout_seconds = task_timeout_seconds
+        self._max_audio_bytes = max_audio_bytes
         self._start_rate_limiter = start_rate_limiter
         self._socket: WebSocketLike | None = None
         self._lock = asyncio.Lock()
@@ -95,7 +105,7 @@ class QwenTtsConnection:
     async def close(self) -> None:
         socket, self._socket = self._socket, None
         if socket is not None:
-            await socket.close()
+            await self._close_socket_bounded(socket)
 
     async def synthesize(
         self,
@@ -110,15 +120,29 @@ class QwenTtsConnection:
     ) -> TtsStreamResult:
         async with self._lock:
             current_task = task_id or uuid4()
-            socket = await self._ensure_socket()
-            await self._start_rate_limiter.wait()
-            sent_events: list[dict[str, Any]] = []
-            received_events: list[dict[str, Any]] = []
-            run_task = self._run_task(current_task, voice, rate)
-            sent_events.append(run_task)
-            await self._send(socket, run_task)
-            started_event = await self._wait_started(socket, current_task)
-            received_events.append(started_event)
+            task_deadline = monotonic() + self._task_timeout_seconds
+            socket = await self._ensure_socket(timeout=self._remaining(task_deadline))
+            sent_events = capture.event_buffer() if capture is not None else []
+            received_events = capture.event_buffer() if capture is not None else []
+            try:
+                await asyncio.wait_for(
+                    self._start_rate_limiter.wait(), timeout=self._remaining(task_deadline)
+                )
+                run_task = self._run_task(current_task, voice, rate)
+                _record_event(sent_events, run_task)
+                await self._send(socket, run_task, timeout=self._remaining(task_deadline))
+                started_event = await self._wait_started(
+                    socket, current_task, deadline=task_deadline
+                )
+                _record_event(received_events, started_event)
+            except TimeoutError as error:
+                await self._discard_socket(socket)
+                _capture_tts(capture, self._url, sent_events, received_events, 0, current_task)
+                raise TtsProviderError("tts_task_timeout") from error
+            except BaseException:
+                await self._discard_socket(socket)
+                _capture_tts(capture, self._url, sent_events, received_events, 0, current_task)
+                raise
             started = monotonic()
             first_audio_ms: int | None = None
             byte_count = 0
@@ -137,8 +161,8 @@ class QwenTtsConnection:
                         },
                         "payload": {"input": {"text": chunk}},
                     }
-                    sent_events.append(payload)
-                    await self._send(socket, payload)
+                    _record_event(sent_events, payload)
+                    await self._send(socket, payload, timeout=self._remaining(task_deadline))
                 if not sent:
                     raise TtsProviderError("tts_text_empty")
                 payload = {
@@ -149,20 +173,30 @@ class QwenTtsConnection:
                     },
                     "payload": {"input": {}},
                 }
-                sent_events.append(payload)
-                await self._send(socket, payload)
+                _record_event(sent_events, payload)
+                await self._send(socket, payload, timeout=self._remaining(task_deadline))
 
             sender = asyncio.create_task(send_text(), name=f"tts-text-{current_task}")
             try:
                 while True:
                     try:
-                        raw = await asyncio.wait_for(socket.recv(), timeout=self._timeout_seconds)
+                        timeout = min(self._timeout_seconds, self._remaining(task_deadline))
+                        if timeout <= 0:
+                            raise TtsProviderError("tts_task_timeout")
+                        raw = await asyncio.wait_for(socket.recv(), timeout=timeout)
                     except TimeoutError as error:
-                        raise TtsProviderError("tts_stream_stalled") from error
+                        code = (
+                            "tts_task_timeout"
+                            if self._remaining(task_deadline) <= 0
+                            else "tts_stream_stalled"
+                        )
+                        raise TtsProviderError(code) from error
                     if isinstance(raw, bytes):
                         if first_audio_ms is None:
                             first_audio_ms = int((monotonic() - started) * 1000)
                         byte_count += len(raw)
+                        if byte_count > self._max_audio_bytes:
+                            raise TtsProviderError("tts_audio_too_large")
                         await on_audio(raw)
                         continue
                     event = _event(raw)
@@ -170,11 +204,10 @@ class QwenTtsConnection:
                     if header.get("task_id") != str(current_task):
                         continue
                     if header.get("event") == "task-failed":
-                        self._socket = None
-                        await socket.close()
-                        received_events.append(event)
-                        raise TtsProviderError("tts_provider_failed")
-                    received_events.append(event)
+                        await self._discard_socket(socket)
+                        _record_event(received_events, event)
+                        raise TtsProviderError(_task_failure_code(header))
+                    _record_event(received_events, event)
                     if on_event is not None:
                         await on_event(event)
                     if header.get("event") == "task-finished":
@@ -184,6 +217,7 @@ class QwenTtsConnection:
                 sender.cancel()
                 await asyncio.gather(sender, return_exceptions=True)
                 await self._cancel(socket, current_task)
+                await self._discard_socket(socket)
                 _capture_tts(
                     capture, self._url, sent_events, received_events, byte_count, current_task
                 )
@@ -191,6 +225,7 @@ class QwenTtsConnection:
             except Exception:
                 sender.cancel()
                 await asyncio.gather(sender, return_exceptions=True)
+                await self._discard_socket(socket)
                 _capture_tts(
                     capture, self._url, sent_events, received_events, byte_count, current_task
                 )
@@ -206,23 +241,33 @@ class QwenTtsConnection:
             _capture_tts(capture, self._url, sent_events, received_events, byte_count, current_task)
             return result
 
-    async def _ensure_socket(self) -> WebSocketLike:
+    @staticmethod
+    def _remaining(deadline: float) -> float:
+        return max(0.0, deadline - monotonic())
+
+    async def _ensure_socket(self, *, timeout: float | None = None) -> WebSocketLike:
         if self._socket is None:
             try:
                 self._socket = await asyncio.wait_for(
                     self._socket_factory(self._url, dict(self._headers)),
-                    timeout=self._timeout_seconds,
+                    timeout=timeout if timeout is not None else self._timeout_seconds,
                 )
             except Exception as error:
                 raise TtsProviderError("tts_connection_failed") from error
         return self._socket
 
-    async def _wait_started(self, socket: WebSocketLike, task_id: UUID) -> dict[str, Any]:
+    async def _wait_started(
+        self, socket: WebSocketLike, task_id: UUID, *, deadline: float
+    ) -> dict[str, Any]:
         while True:
             try:
-                raw = await asyncio.wait_for(socket.recv(), timeout=self._timeout_seconds)
+                timeout = min(self._timeout_seconds, self._remaining(deadline))
+                if timeout <= 0:
+                    raise TtsProviderError("tts_task_timeout")
+                raw = await asyncio.wait_for(socket.recv(), timeout=timeout)
             except TimeoutError as error:
-                raise TtsProviderError("tts_start_timeout") from error
+                code = "tts_task_timeout" if self._remaining(deadline) <= 0 else "tts_start_timeout"
+                raise TtsProviderError(code) from error
             if isinstance(raw, bytes):
                 continue
             event = _event(raw)
@@ -230,15 +275,17 @@ class QwenTtsConnection:
             if header.get("task_id") != str(task_id):
                 continue
             if header.get("event") == "task-failed":
-                raise TtsProviderError("tts_provider_failed")
+                raise TtsProviderError(_task_failure_code(header))
             if header.get("event") == "task-started":
                 return event
 
-    async def _send(self, socket: WebSocketLike, payload: dict[str, Any]) -> None:
+    async def _send(
+        self, socket: WebSocketLike, payload: dict[str, Any], *, timeout: float | None = None
+    ) -> None:
         try:
             await asyncio.wait_for(
                 socket.send(json.dumps(payload, ensure_ascii=False)),
-                timeout=self._timeout_seconds,
+                timeout=timeout if timeout is not None else self._timeout_seconds,
             )
         except TtsProviderError:
             raise
@@ -260,6 +307,19 @@ class QwenTtsConnection:
             )
         except TtsProviderError:
             return
+
+    async def _discard_socket(self, socket: WebSocketLike) -> None:
+        if self._socket is socket:
+            self._socket = None
+        await self._close_socket_bounded(socket)
+
+    @classmethod
+    async def _close_socket_bounded(cls, socket: WebSocketLike) -> None:
+        """Release an unresponsive provider socket without blocking cleanup."""
+
+        await close_provider_socket_bounded(
+            socket, timeout_seconds=cls._CLOSE_TIMEOUT_SECONDS, task_name="tts-socket-close"
+        )
 
     def _run_task(self, task_id: UUID, voice: str, rate: float) -> dict[str, Any]:
         return {
@@ -289,6 +349,14 @@ class QwenTtsConnection:
         }
 
 
+def _task_failure_code(header: dict[str, Any]) -> str:
+    """Map provider failure classes without exposing the provider payload."""
+
+    if header.get("error_code") == "InvalidParameter":
+        return "tts_parameter_invalid"
+    return "tts_provider_failed"
+
+
 def _event(raw: str) -> dict[str, Any]:
     try:
         value = json.loads(raw)
@@ -304,6 +372,22 @@ def _header(event: dict[str, Any]) -> dict[str, Any]:
     if not isinstance(header, dict):
         raise TtsProviderError("tts_protocol_invalid")
     return cast(dict[str, Any], header)
+
+
+def _record_event(events: list[dict[str, Any]], event: dict[str, Any]) -> None:
+    """Keep captures diagnostic without retaining an unbounded provider stream."""
+
+    if isinstance(events, CaptureEventBuffer):
+        events.append(event)
+        return
+    if len(events) < TTS_MAX_CAPTURE_EVENTS:
+        events.append(event)
+        return
+    # Preserve the first half and the latest half; the terminal event is kept
+    # when the provider sends a long heartbeat stream.
+    tail_start = TTS_MAX_CAPTURE_EVENTS // 2
+    events[tail_start - 1 :] = events[tail_start:]
+    events[-1] = event
 
 
 def _capture_tts(

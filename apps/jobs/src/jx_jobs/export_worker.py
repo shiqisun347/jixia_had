@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
-import hashlib
 import io
 import json
 import os
@@ -17,8 +17,17 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from jx_core.data_capture.content import load_content_blob
+from jx_core.data_capture.export_snapshot import (
+    CAPTURE_SNAPSHOT_VERSION,
+    EXPORT_CALL_FIELDS,
+    PROVIDER_EXPORT_MAX_CALL_ROWS,
+    PROVIDER_EXPORT_MAX_ITEMS,
+)
 from jx_core.data_capture.provider import PROVIDER_CAPTURE_VERSION
+from jx_core.data_capture.provider_projection import CAPTURE_RAW_FIELDS, capture_projections
+from jx_core.models import ExternalCall
 
+from .checksums import sha256_file
 from .task_queue import claim_next, complete, fail
 
 
@@ -26,6 +35,52 @@ class ExportError(RuntimeError):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+# Audio is collected into the per-match ``files`` mapping before it is written
+# to the archive. Keep that in-memory collection bounded even when a match has
+# many recorded speeches. The per-file limit matches the TTS provider output
+# budget; the total leaves enough room for a normal 4v4 match while preventing
+# an unexpectedly large export from exhausting the worker process.
+MATCH_EXPORT_MAX_AUDIO_FILE_BYTES = 16 * 1024 * 1024
+MATCH_EXPORT_MAX_AUDIO_BYTES = 64 * 1024 * 1024
+# A normal 4v4 match produces a few hundred rows at most.  Keep the
+# research-export worker from materialising an accidentally unbounded match
+# (for example after a reconnect loop) into several Python lists.  Queries
+# request one sentinel row so an over-limit export fails closed before any
+# archive bytes are written.
+MATCH_EXPORT_MAX_SPEECH_ROWS = 4_096
+MATCH_EXPORT_MAX_EVENT_ROWS = 8_192
+MATCH_EXPORT_MAX_CALL_ROWS = PROVIDER_EXPORT_MAX_CALL_ROWS
+MATCH_EXPORT_MAX_ITEMS = PROVIDER_EXPORT_MAX_ITEMS
+MATCH_EXPORT_MAX_PROVIDER_PAYLOAD_BYTES = 128 * 1024 * 1024
+
+
+def _bounded_rows(rows: Any, *, max_rows: int) -> list[dict[str, Any]]:
+    collected = list(rows)
+    if len(collected) > max_rows:
+        raise ExportError("export_match_rows_too_large")
+    return collected
+
+
+def _read_audio_file(
+    path: Path, *, max_bytes: int, overflow_code: str = "export_audio_file_too_large"
+) -> bytes:
+    """Read at most ``max_bytes`` + 1 bytes and reject oversized files.
+
+    Reading one extra byte makes the size check safe when a file grows after
+    its initial ``stat`` call. ``ExportError`` keeps the failure code stable
+    for task records and callers without exposing local paths.
+    """
+
+    try:
+        with path.open("rb") as stream:
+            payload = stream.read(max_bytes + 1)
+    except OSError as error:
+        raise ExportError("export_audio_unreadable") from error
+    if len(payload) > max_bytes:
+        raise ExportError(overflow_code)
+    return payload
 
 
 def _json(value: Any) -> str:
@@ -48,6 +103,8 @@ async def _match_package(
     cutoff_at: datetime,
     include_audio: bool,
     audio_roots: list[Path],
+    export_item_id: UUID | None = None,
+    capture_snapshot_version: int | None = None,
 ) -> dict[str, bytes]:
     match = (
         (
@@ -65,50 +122,88 @@ async def _match_package(
     )
     if match is None:
         raise ExportError("match_not_found")
-    speeches = list(
+    speeches = _bounded_rows(
         (
             await session.execute(
                 text(
                     "SELECT id, action_key, speaker_kind, user_id, agent_profile_id, side, "
                     "seat_no, status, asr_raw_final_text, display_text, finalized_at, "
                     "audio_duration_ms, audio_storage_path FROM speeches "
-                    "WHERE match_id=:id AND created_at <= :cutoff ORDER BY created_at"
+                    "WHERE match_id=:id AND created_at <= :cutoff ORDER BY created_at "
+                    f"LIMIT {MATCH_EXPORT_MAX_SPEECH_ROWS + 1}"
                 ),
                 {"id": match_id, "cutoff": cutoff_at},
             )
-        ).mappings()
+        ).mappings(),
+        max_rows=MATCH_EXPORT_MAX_SPEECH_ROWS,
     )
-    events = list(
+    events = _bounded_rows(
         (
             await session.execute(
                 text(
                     "SELECT sequence, event_type, payload, created_at FROM match_events "
-                    "WHERE match_id=:id AND sequence <= :sequence ORDER BY sequence"
+                    "WHERE match_id=:id AND sequence <= :sequence ORDER BY sequence "
+                    f"LIMIT {MATCH_EXPORT_MAX_EVENT_ROWS + 1}"
                 ),
                 {"id": match_id, "sequence": cutoff_sequence},
             )
-        ).mappings()
+        ).mappings(),
+        max_rows=MATCH_EXPORT_MAX_EVENT_ROWS,
     )
-    calls = list(
-        (
-            await session.execute(
-                text(
-                    "SELECT id, call_kind, provider, operation, model, voice, attempt_no, "
-                    "status, speech_id, generation_id, decision_round_id, context_version, "
-                    "started_at, first_result_latency_ms, completed_latency_ms, error_code, "
-                    "capture_version, captured_at, source_kind, source_resource_id, "
-                    "logical_call_id, provider_request_id, request_capture_status, "
-                    "response_capture_status, request_original_bytes, response_original_bytes, "
-                    "request_stored_bytes, response_stored_bytes, request_sha256, response_sha256, "
-                    "capture_error_code, request_blob_id, response_blob_id "
-                    "FROM external_calls WHERE match_id=:id AND started_at <= :cutoff "
-                    "AND capture_version IS NOT NULL AND source_kind='MATCH' "
-                    "ORDER BY started_at"
-                ),
-                {"id": match_id, "cutoff": cutoff_at},
-            )
-        ).mappings()
-    )
+    fields = ", ".join((*EXPORT_CALL_FIELDS, *CAPTURE_RAW_FIELDS))
+    if capture_snapshot_version is not None:
+        if capture_snapshot_version != CAPTURE_SNAPSHOT_VERSION or export_item_id is None:
+            raise ExportError("export_capture_snapshot_unsupported")
+        calls = _bounded_rows(
+            (
+                await session.execute(
+                    text(
+                        f"SELECT external_call_id AS id, {fields}, capture_revision "
+                        "FROM export_provider_capture_snapshots WHERE export_item_id=:item_id "
+                        "ORDER BY started_at, external_call_id "
+                        f"LIMIT {MATCH_EXPORT_MAX_CALL_ROWS + 1}"
+                    ),
+                    {"item_id": export_item_id},
+                )
+            ).mappings(),
+            max_rows=MATCH_EXPORT_MAX_CALL_ROWS,
+        )
+    else:
+        # Historical tasks retain their original live cutoff reader, with the
+        # shared projection preventing an ASYNC gap from exposing business blobs.
+        calls = _bounded_rows(
+            (
+                await session.execute(
+                    text(
+                        f"SELECT id, {fields}, capture_storage_mode "
+                        "FROM external_calls WHERE match_id=:id AND started_at <= :cutoff "
+                        "AND (capture_version IS NOT NULL OR capture_storage_mode='ASYNC_V1') "
+                        "AND source_kind='MATCH' ORDER BY started_at, id "
+                        f"LIMIT {MATCH_EXPORT_MAX_CALL_ROWS + 1}"
+                    ),
+                    {"id": match_id, "cutoff": cutoff_at},
+                )
+            ).mappings(),
+            max_rows=MATCH_EXPORT_MAX_CALL_ROWS,
+        )
+        projected = await capture_projections(session, [ExternalCall(**dict(row)) for row in calls])
+        calls = [
+            {
+                **{k: v for k, v in row.items() if k != "capture_storage_mode"},
+                **projected[row["id"]],
+            }
+            for row in calls
+        ]
+    provider_payload_bytes = 0
+    for row in calls:
+        for side in ("request", "response"):
+            raw_bytes = row.get(f"{side}_original_bytes") or row.get(f"{side}_stored_bytes")
+            try:
+                provider_payload_bytes += max(0, int(raw_bytes or 0))
+            except (TypeError, ValueError):
+                continue
+    if provider_payload_bytes > MATCH_EXPORT_MAX_PROVIDER_PAYLOAD_BYTES:
+        raise ExportError("export_provider_payload_too_large")
     transcript_rows = [
         {
             "speech_id": str(row["id"]),
@@ -182,6 +277,7 @@ async def _match_package(
         "incomplete": match["status"] not in {"FINISHED", "TERMINATED"},
         "scope": "single_match",
         "provider_call_capture_schema_version": PROVIDER_CAPTURE_VERSION,
+        "provider_capture_snapshot_version": capture_snapshot_version,
     }
     files: dict[str, bytes] = {
         "manifest.json": (_json(manifest) + "\n").encode(),
@@ -192,6 +288,7 @@ async def _match_package(
         "judge.json": b"{}\n",
     }
     if include_audio:
+        audio_bytes = 0
         for row in speeches:
             path_value = row["audio_storage_path"]
             if not path_value:
@@ -199,8 +296,29 @@ async def _match_package(
             path = Path(str(path_value)).resolve()
             if not any(path.is_relative_to(root.resolve()) for root in audio_roots):
                 continue
-            if path.is_file():
-                files[f"audio/{path.name}"] = path.read_bytes()
+            if not path.is_file():
+                continue
+            try:
+                file_size = path.stat().st_size
+            except OSError as error:
+                raise ExportError("export_audio_unreadable") from error
+            if file_size > MATCH_EXPORT_MAX_AUDIO_FILE_BYTES:
+                raise ExportError("export_audio_file_too_large")
+            remaining_bytes = MATCH_EXPORT_MAX_AUDIO_BYTES - audio_bytes
+            if file_size > remaining_bytes:
+                raise ExportError("export_audio_total_too_large")
+            read_limit = min(MATCH_EXPORT_MAX_AUDIO_FILE_BYTES, remaining_bytes)
+            payload = _read_audio_file(
+                path,
+                max_bytes=read_limit,
+                overflow_code=(
+                    "export_audio_total_too_large"
+                    if read_limit < MATCH_EXPORT_MAX_AUDIO_FILE_BYTES
+                    else "export_audio_file_too_large"
+                ),
+            )
+            files[f"audio/{path.name}"] = payload
+            audio_bytes += len(payload)
     return files
 
 
@@ -228,13 +346,17 @@ async def process_one_match_export(
                 {"id": export_id},
             )
             await session.commit()
-            rows = list(
+            rows = _bounded_rows(
                 (
                     await session.execute(
-                        text("SELECT * FROM match_export_items WHERE export_id=:id ORDER BY id"),
+                        text(
+                            "SELECT * FROM match_export_items WHERE export_id=:id ORDER BY id "
+                            f"LIMIT {MATCH_EXPORT_MAX_ITEMS + 1}"
+                        ),
                         {"id": export_id},
                     )
-                ).mappings()
+                ).mappings(),
+                max_rows=MATCH_EXPORT_MAX_ITEMS,
             )
             export_row = (
                 (
@@ -262,6 +384,8 @@ async def process_one_match_export(
                             cutoff_at=export_row["created_at"],
                             include_audio=bool(export_row["include_audio"]),
                             audio_roots=audio_roots,
+                            export_item_id=UUID(str(item["id"])),
+                            capture_snapshot_version=item["capture_snapshot_version"],
                         )
                     prefix = f"matches/{item['match_id']}/"
                     for name, data in files.items():
@@ -291,7 +415,7 @@ async def process_one_match_export(
                         )
                         await session.commit()
         os.replace(temporary, output)
-        digest = hashlib.sha256(output.read_bytes()).hexdigest()
+        digest = await asyncio.to_thread(sha256_file, output)
         status = "PARTIAL" if failed else "SUCCEEDED"
         async with session_factory() as session:
             await session.execute(

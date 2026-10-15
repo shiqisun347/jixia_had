@@ -23,9 +23,23 @@ export function JixiaLogo({ compact = false, className = '' }: JixiaLogoProps) {
       />
       <span className="jx-brand__copy">
         <strong>
-          {english ? 'JX-Debate' : <>稷下<span className="jx-brand__dot" aria-hidden="true">·</span>争鸣</>}
+          {english ? (
+            'JX-Debate'
+          ) : (
+            <>
+              稷下
+              <span className="jx-brand__dot" aria-hidden="true">
+                ·
+              </span>
+              争鸣
+            </>
+          )}
         </strong>
-        <small>{english ? 'Multi-person, multi-agent live voice debate platform' : '多人多智能体实时语音交互平台'}</small>
+        <small>
+          {english
+            ? 'Multi-person, multi-agent live voice debate platform'
+            : '多人多智能体实时语音交互平台'}
+        </small>
       </span>
     </span>
   );

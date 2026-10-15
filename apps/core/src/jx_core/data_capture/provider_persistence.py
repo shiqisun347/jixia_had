@@ -23,6 +23,9 @@ async def persist_provider_capture(
 ) -> bool:
     """Persist capture inside a savepoint without changing the business transaction outcome."""
 
+    # begin_nested() flushes pending business writes before its savepoint.
+    # Keep those authoritative failures outside the diagnostic error barrier.
+    await session.flush()
     try:
         async with session.begin_nested():
             call.capture_version = PROVIDER_CAPTURE_VERSION
@@ -42,6 +45,10 @@ async def persist_provider_capture(
                 capture.response or unavailable_provider_payload("provider_response_not_observed"),
             )
     except Exception:
+        # Savepoint rollback expires the ORM instance. Reload persisted fields
+        # before a caller synchronously reads timestamps or business status.
+        # A refresh failure remains a transaction error and must propagate.
+        await session.refresh(call)
         call.capture_error_code = "capture_persistence_failed"
         return False
     return True

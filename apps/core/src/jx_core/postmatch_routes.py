@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from .auth.dependencies import (
     get_admin_auth,
@@ -40,6 +41,8 @@ from .postmatch import PostmatchService
 from .users.avatar_catalog import is_avatar_key
 
 router = APIRouter()
+POSTMATCH_MAX_SPEECHES = 1024
+POSTMATCH_MAX_TRANSCRIPT_CHARS = 512_000
 
 
 class ParticipantView(BaseModel):
@@ -123,11 +126,30 @@ async def _response(session: AsyncSession, match: Match, context: AuthContext) -
         (
             await session.scalars(
                 select(Speech)
+                .options(
+                    load_only(
+                        Speech.id,
+                        Speech.action_key,
+                        Speech.user_id,
+                        Speech.speaker_kind,
+                        Speech.side,
+                        Speech.seat_no,
+                        Speech.display_text,
+                        Speech.asr_raw_final_text,
+                        Speech.finalized_at,
+                    )
+                )
                 .where(Speech.match_id == match.id, Speech.status == "FINALIZED")
                 .order_by(Speech.created_at)
+                .limit(POSTMATCH_MAX_SPEECHES + 1)
             )
         ).all()
     )
+    if len(speeches) > POSTMATCH_MAX_SPEECHES or sum(
+        len(speech.display_text or "") + len(speech.asr_raw_final_text or "")
+        for speech in speeches
+    ) > POSTMATCH_MAX_TRANSCRIPT_CHARS:
+        raise APIError("transcript_too_large")
     participants = list(
         (
             await session.scalars(

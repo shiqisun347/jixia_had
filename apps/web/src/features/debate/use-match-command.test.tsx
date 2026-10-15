@@ -58,6 +58,17 @@ describe('useMatchCommand', () => {
     expect(screen.getByRole('alert')).toHaveTextContent(MATCH_COMMAND_FAILURE_MESSAGE);
   });
 
+  it('shows the actionable finalization response without a second generic failure', async () => {
+    const message = '上一段发言仍在整理，麦克风尚未开启。请稍后再次点击开始发言。';
+    const { result } = renderHook(
+      () => useMatchCommand(vi.fn().mockResolvedValue(false), () => message),
+      { wrapper: Wrapper },
+    );
+    await act(() => result.current.command('speech.start'));
+    expect(screen.getByRole('alert')).toHaveTextContent(message);
+    expect(screen.getByRole('alert')).not.toHaveTextContent(MATCH_COMMAND_FAILURE_MESSAGE);
+  });
+
   it('normalizes an unexpected transport rejection into the same visible failure', async () => {
     const { result } = renderHook(
       () => useMatchCommand(vi.fn().mockRejectedValue(new Error('socket send failed'))),

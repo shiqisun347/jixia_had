@@ -14,6 +14,7 @@ import { useToast } from '@/components/ui/toast-provider';
 import { ApiClientError } from '@/lib/auth-api';
 import { roomsApi, type RoomCreatePayload } from '@/lib/rooms-api';
 import { useSubmissionGate } from '@/lib/use-submission-gate';
+import { useCurrentUser } from '../auth/use-auth';
 
 import { selectDefaultRuleId, supportedRoomRules } from './room-experience';
 
@@ -28,6 +29,7 @@ const schema = z
     title: z.string().trim().min(1, '请输入比赛名称').max(200),
     label: z.string().trim().min(1).max(32),
     ruleId: z.string().uuid('请选择赛制'),
+    composition: z.enum(['MIXED', 'HUMAN_ONLY', 'AGENT_ONLY']),
     topicSource: z.enum(['LIBRARY', 'CUSTOM']),
     topicId: z.string().optional(),
     customTitle: z.string().trim().max(500).optional(),
@@ -59,6 +61,7 @@ export function CreateRoomPage() {
   const router = useRouter();
   const { showToast } = useToast();
   const createGate = useSubmissionGate();
+  const currentUserQuery = useCurrentUser();
   const catalogQuery = useQuery({ queryKey: ['rooms', 'catalog'], queryFn: roomsApi.catalog });
   const termsQuery = useQuery({
     queryKey: ['legal', 'human-participation'],
@@ -70,6 +73,7 @@ export function CreateRoomPage() {
       title: '',
       label: '训练赛',
       ruleId: '',
+      composition: 'MIXED',
       topicSource: 'LIBRARY',
       topicId: '',
       customTitle: '',
@@ -78,11 +82,13 @@ export function CreateRoomPage() {
     },
   });
   const topicSource = useWatch({ control: form.control, name: 'topicSource' });
+  const composition = useWatch({ control: form.control, name: 'composition' });
   const selectedRuleId = useWatch({ control: form.control, name: 'ruleId' });
   const selectedTopicId = useWatch({ control: form.control, name: 'topicId' });
   const customTopicTitle = useWatch({ control: form.control, name: 'customTitle' });
   const availableRules = supportedRoomRules(catalogQuery.data?.rules ?? []);
   const selectedRule = availableRules.find((rule) => rule.id === selectedRuleId);
+  const selectedRuleSupportsPureAgents = selectedRule?.pure_agent_available === true;
   const selectedTopic = catalogQuery.data?.topics.find((topic) => topic.id === selectedTopicId);
   const mutation = useMutation({
     mutationFn: roomsApi.create,
@@ -97,12 +103,20 @@ export function CreateRoomPage() {
   });
   const createRoom = useCallback(
     (values: FormValues) => {
+      if (values.composition === 'AGENT_ONLY' && !selectedRuleSupportsPureAgents) {
+        showToast({
+          message: '本赛制当前不足八个合格 Agent，请改用自由入席或纯真人。',
+          tone: 'error',
+        });
+        return;
+      }
       if (!createGate.tryStart()) return;
       const payload: RoomCreatePayload = {
         title: values.title,
         label: values.label,
         rule_id: values.ruleId,
-        is_all_agent: false,
+        is_all_agent: values.composition === 'AGENT_ONLY',
+        auto_fill_agents: values.composition !== 'HUMAN_ONLY',
         topic_id: values.topicSource === 'LIBRARY' ? values.topicId : null,
         custom_topic_title: values.topicSource === 'CUSTOM' ? values.customTitle : null,
         affirmative_text: values.topicSource === 'CUSTOM' ? values.affirmativeText : null,
@@ -111,7 +125,7 @@ export function CreateRoomPage() {
       };
       mutation.mutate(payload);
     },
-    [createGate, mutation, termsQuery.data?.version],
+    [createGate, mutation, selectedRuleSupportsPureAgents, termsQuery.data?.version, showToast],
   );
   const submit = form.handleSubmit(createRoom);
   useEffect(() => {
@@ -165,7 +179,7 @@ export function CreateRoomPage() {
                   <input
                     className={inputClass}
                     {...form.register('title')}
-                    placeholder="例如：春季人机辩论实验"
+                    placeholder="例如：周末人机辩论赛"
                   />
                   {form.formState.errors.title ? (
                     <span className="mt-1 block text-xs text-red-600">
@@ -178,7 +192,6 @@ export function CreateRoomPage() {
                   <select className={inputClass} {...form.register('label')}>
                     <option value="训练赛">训练赛</option>
                     <option value="正式赛">正式赛</option>
-                    <option value="实验场">实验场</option>
                   </select>
                 </label>
               </div>
@@ -201,7 +214,55 @@ export function CreateRoomPage() {
                     {form.formState.errors.ruleId.message}
                   </span>
                 ) : null}
+                <p className="mt-2 text-xs font-normal text-slate-500">
+                  可用 Agent：{selectedRule?.available_agent_count ?? 0}；纯真人和自由入席可用， 纯
+                  Agent {selectedRule?.pure_agent_available ? '可用' : '需八个合格候选'}。
+                </p>
               </label>
+              <fieldset>
+                <legend className="text-sm font-bold text-slate-700">成员组成</legend>
+                <div className="mt-2 grid gap-2 sm:grid-cols-3">
+                  <label className="rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm font-bold">
+                    <input
+                      className="mr-2"
+                      type="radio"
+                      value="MIXED"
+                      {...form.register('composition')}
+                    />
+                    自由入席
+                    <span className="mt-1 block text-xs font-normal text-slate-600">
+                      Agent 自动补位，真人可逐席替换
+                    </span>
+                  </label>
+                  <label className="rounded-xl border border-blue-100 bg-white px-4 py-3 text-sm font-bold">
+                    <input
+                      className="mr-2"
+                      type="radio"
+                      value="HUMAN_ONLY"
+                      {...form.register('composition')}
+                    />
+                    纯真人
+                    <span className="mt-1 block text-xs font-normal text-slate-500">
+                      创建空席，由真人成员自行入席
+                    </span>
+                  </label>
+                  {currentUserQuery.data?.user.role === 'ADMIN' ? (
+                    <label className="rounded-xl border border-violet-100 bg-violet-50 px-4 py-3 text-sm font-bold">
+                      <input
+                        className="mr-2"
+                        type="radio"
+                        value="AGENT_ONLY"
+                        disabled={!selectedRule?.pure_agent_available}
+                        {...form.register('composition')}
+                      />
+                      纯 Agent
+                      <span className="mt-1 block text-xs font-normal text-slate-500">
+                        管理员组织，需八个可用 Agent
+                      </span>
+                    </label>
+                  ) : null}
+                </div>
+              </fieldset>
               <fieldset>
                 <legend className="flex items-center gap-3 border-b border-blue-100 pb-3 text-sm font-bold text-slate-900">
                   <span className="grid size-7 place-items-center rounded-full bg-blue-600 text-xs font-black text-white">
@@ -358,13 +419,21 @@ export function CreateRoomPage() {
               </div>
               <div>
                 <dt className="text-xs font-bold text-slate-500">我的身份</dt>
-                <dd className="mt-1 font-bold text-slate-800">房主 · 创建后选择辩手席位</dd>
+                <dd className="mt-1 font-bold text-slate-800">
+                  {composition === 'AGENT_ONLY'
+                    ? '管理员组织者 · 不占辩手席位'
+                    : '房主 · 创建后选择辩手席位'}
+                </dd>
               </div>
               <div>
                 <dt className="text-xs font-bold text-slate-500">其他席位</dt>
                 <dd className="mt-1 flex items-center gap-2 font-bold text-slate-800">
                   <Bot className="size-4 text-violet-600" />
-                  自动用不同的可用 Agent 填满
+                  {composition === 'HUMAN_ONLY'
+                    ? '等待真人成员填满八个席位'
+                    : composition === 'AGENT_ONLY'
+                      ? '管理员房间由八个可用 Agent 组成'
+                      : '自动用不同的可用 Agent 补位，真人可替换'}
                 </dd>
               </div>
             </dl>

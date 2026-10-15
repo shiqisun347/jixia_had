@@ -21,6 +21,7 @@ from .admin_data_routes import router as admin_data_router
 from .admin_diagnostic_routes import router as admin_diagnostic_router
 from .admin_routes import SystemSettingsPatch
 from .admin_routes import router as admin_router
+from .agent.llm import LlmCapacityLimiter
 from .agent.runtime import AgentRuntime
 from .asr.runtime import AsrRuntime
 from .auth.errors import APIError, error_payload, error_status
@@ -29,6 +30,7 @@ from .auth.service import AuthService
 from .auth.session import SessionService
 from .config import Settings, load_settings
 from .data_capture.diagnostics import DiagnosticWriter
+from .data_capture.provider_writer import ProviderCaptureWriter
 from .devices.routes import router as devices_router
 from .experiments.routes import router as experiments_router
 from .formats.routes import router as formats_router
@@ -40,13 +42,18 @@ from .logging import (
     reset_request_id,
     set_request_id,
 )
+from .matches.emergency import MatchEmergencyCoordinator
 from .matches.routes import router as matches_router
 from .matches.service import MatchRuntimeManager
 from .models import RoomMember, SystemSetting
 from .postmatch import PostmatchService
 from .postmatch_routes import router as postmatch_router
+from .postmatch_showcase_routes import router as postmatch_showcase_router
 from .presence import MatchPresenceCoordinator
-from .room_connections import RoomConnectionService
+from .room_connections import (
+    RoomConnectionService,
+    reconcile_terminal_room_end_times,
+)
 from .rooms.routes import router as rooms_router
 from .rules.routes import router as rules_router
 from .runtime import CoreRuntime, CoreStartupError, Readiness
@@ -92,6 +99,7 @@ def create_app(
     resolved_settings = settings or load_settings()
     configure_logging("jx-core", resolved_settings.log_level)
     resolved_runtime = runtime or CoreRuntime(resolved_settings)
+    llm_capacity_limiter = LlmCapacityLimiter(resolved_settings.llm_global_concurrency)
     http_logger = logging.getLogger("jx-core.http")
 
     @asynccontextmanager
@@ -108,8 +116,13 @@ def create_app(
             # A process restart invalidates every old WebSocket.  Clear only
             # active leases; RoomConnection remains as the epoch high-water.
             async with cast(async_sessionmaker[AsyncSession], session_factory)() as cleanup_session:
-                stale_leases = await RoomConnectionService().clear_active_leases(cleanup_session)
-                if stale_leases:
+                lease_service = RoomConnectionService()
+                stale_lease_count = 0
+                while True:
+                    stale_leases = await lease_service.clear_active_leases(cleanup_session)
+                    if not stale_leases:
+                        break
+                    stale_lease_count += len(stale_leases)
                     async with cleanup_session.begin():
                         for user_id, room_id in set(stale_leases):
                             await cleanup_session.execute(
@@ -121,6 +134,17 @@ def create_app(
                                 )
                                 .values(online=False)
                             )
+                if stale_lease_count:
+                    logging.getLogger("jx-core.lifecycle").info(
+                        "cleared stale room connection leases",
+                        extra={"lease_count": stale_lease_count},
+                    )
+                repaired_rooms = await reconcile_terminal_room_end_times(cleanup_session)
+                if repaired_rooms:
+                    logging.getLogger("jx-core.lifecycle").info(
+                        "repaired terminal room end timestamps",
+                        extra={"room_count": repaired_rooms},
+                    )
             diagnostic_writer = DiagnosticWriter(
                 service="jx-core",
                 session_factory=cast(async_sessionmaker[AsyncSession], session_factory),
@@ -135,46 +159,127 @@ def create_app(
             diagnostic_writer.configure_debug(
                 runtime_controls.debug_expires_at if runtime_controls.debug_enabled else None
             )
-            await diagnostic_writer.start()
-            app.state.diagnostic_writer = diagnostic_writer
-            manager = MatchRuntimeManager(cast(async_sessionmaker[AsyncSession], session_factory))
-            agent_runtime: AgentRuntime | None = None
-            if resolved_settings.asr_api_key is not None:
-                manager.set_speech_runtime(
-                    AsrRuntime(settings=resolved_settings, callbacks=manager)
+            provider_capture_writer: ProviderCaptureWriter | None = None
+            manager: MatchRuntimeManager | None = None
+            postmatch_service: PostmatchService | None = None
+            emergency_coordinator: MatchEmergencyCoordinator | None = None
+            try:
+                await diagnostic_writer.start()
+                app.state.diagnostic_writer = diagnostic_writer
+                provider_capture_writer = (
+                    ProviderCaptureWriter(
+                        resolved_settings.database_url.get_secret_value(), service="jx-core"
+                    )
+                    if resolved_settings.provider_capture_enabled
+                    else None
                 )
-            if resolved_settings.llm_key_encryption_key is not None:
-                agent_runtime = AgentRuntime(
+                if provider_capture_writer is not None:
+                    await provider_capture_writer.start()
+                app.state.provider_capture_writer = provider_capture_writer
+                manager = MatchRuntimeManager(
+                    cast(async_sessionmaker[AsyncSession], session_factory),
+                    capture_writer=provider_capture_writer,
+                )
+                agent_runtime: AgentRuntime | None = None
+                if resolved_settings.asr_api_key is not None:
+                    manager.set_speech_runtime(
+                        AsrRuntime(
+                            settings=resolved_settings,
+                            callbacks=manager,
+                            capture_writer=provider_capture_writer,
+                        )
+                    )
+                if resolved_settings.llm_key_encryption_key is not None:
+                    agent_runtime = AgentRuntime(
+                        settings=resolved_settings,
+                        session_factory=cast(async_sessionmaker[AsyncSession], session_factory),
+                        callbacks=manager,
+                        limiter=llm_capacity_limiter,
+                        capture_writer=provider_capture_writer,
+                    )
+                    manager.set_agent_runtime(agent_runtime)
+                postmatch_service = PostmatchService(
                     settings=resolved_settings,
                     session_factory=cast(async_sessionmaker[AsyncSession], session_factory),
-                    callbacks=manager,
+                    limiter=llm_capacity_limiter,
+                    capture_writer=provider_capture_writer,
                 )
-                manager.set_agent_runtime(agent_runtime)
-            postmatch_service = PostmatchService(
-                settings=resolved_settings,
-                session_factory=cast(async_sessionmaker[AsyncSession], session_factory),
-                limiter=agent_runtime.capacity_limiter if agent_runtime is not None else None,
-            )
-            manager.set_postmatch_runtime(postmatch_service)
-            app.state.postmatch_service = postmatch_service
-            await manager.recover_unfinished()
-            app.state.match_runtime_manager = manager
-            app.state.presence = MatchPresenceCoordinator(
-                cast(async_sessionmaker[AsyncSession], session_factory), manager
-            )
+                manager.set_postmatch_runtime(postmatch_service)
+                app.state.postmatch_service = postmatch_service
+                emergency_coordinator = MatchEmergencyCoordinator(
+                    settings=resolved_settings,
+                    session_factory=cast(async_sessionmaker[AsyncSession], session_factory),
+                    manager=manager,
+                    limiter=llm_capacity_limiter,
+                    capture_writer=provider_capture_writer,
+                )
+                manager.set_terminal_callback(emergency_coordinator.cancel)
+                app.state.match_emergency_coordinator = emergency_coordinator
+                await manager.recover_unfinished()
+                await emergency_coordinator.recover_unfinished()
+                app.state.match_runtime_manager = manager
+                app.state.presence = MatchPresenceCoordinator(
+                    cast(async_sessionmaker[AsyncSession], session_factory), manager
+                )
+                manager.set_presence_runtime(app.state.presence)
+            except BaseException:
+                cleanup: list[tuple[str, Callable[[], Awaitable[object]]]] = []
+                if emergency_coordinator is not None:
+                    cleanup.append(("match_emergency", emergency_coordinator.close))
+                if manager is not None:
+                    cleanup.append(("match_runtime", manager.close))
+                if postmatch_service is not None:
+                    cleanup.append(("postmatch", postmatch_service.close))
+                if provider_capture_writer is not None:
+                    cleanup.append(("provider_capture", provider_capture_writer.close))
+                cleanup.append(("diagnostic", diagnostic_writer.stop))
+                cleanup.append(("runtime", resolved_runtime.stop))
+                for resource, close in cleanup:
+                    try:
+                        await close()
+                    except BaseException as cleanup_error:
+                        logging.getLogger("jx-core.lifecycle").warning(
+                            "startup cleanup failed",
+                            extra={
+                                "error_code": "core_startup_cleanup_failed",
+                                "resource": resource,
+                                "exception_type": type(cleanup_error).__name__,
+                            },
+                        )
+                raise
         try:
             yield
         finally:
             manager = cast(MatchRuntimeManager | None, app.state.match_runtime_manager)
-            if manager is not None:
-                await manager.close()
             postmatch_service = cast(PostmatchService | None, app.state.postmatch_service)
-            if postmatch_service is not None:
-                await postmatch_service.close()
-            diagnostic_writer = cast(DiagnosticWriter | None, app.state.diagnostic_writer)
-            if diagnostic_writer is not None:
-                await diagnostic_writer.stop()
-            await resolved_runtime.stop()
+            emergency_coordinator = cast(
+                MatchEmergencyCoordinator | None, app.state.match_emergency_coordinator
+            )
+            try:
+                try:
+                    try:
+                        if emergency_coordinator is not None:
+                            await emergency_coordinator.close()
+                    finally:
+                        if manager is not None:
+                            await manager.close()
+                finally:
+                    if postmatch_service is not None:
+                        await postmatch_service.close()
+            finally:
+                provider_capture_writer = cast(
+                    ProviderCaptureWriter | None, app.state.provider_capture_writer
+                )
+                diagnostic_writer = cast(DiagnosticWriter | None, app.state.diagnostic_writer)
+                try:
+                    if provider_capture_writer is not None:
+                        await provider_capture_writer.close()
+                finally:
+                    try:
+                        if diagnostic_writer is not None:
+                            await diagnostic_writer.stop()
+                    finally:
+                        await resolved_runtime.stop()
 
     app = FastAPI(
         title="Jixia Debate Core",
@@ -185,6 +290,7 @@ def create_app(
     )
     app.state.runtime = resolved_runtime
     app.state.settings = resolved_settings
+    app.state.llm_capacity_limiter = llm_capacity_limiter
     app.state.auth_service = AuthService(
         session_service=SessionService(
             ttl_seconds=resolved_settings.session_ttl_seconds,
@@ -195,7 +301,9 @@ def create_app(
     app.state.match_runtime_manager = None
     app.state.presence = None
     app.state.postmatch_service = None
+    app.state.match_emergency_coordinator = None
     app.state.diagnostic_writer = None
+    app.state.provider_capture_writer = None
     app.add_middleware(
         CORSMiddleware,
         allow_origins=resolved_settings.cors_origin_list,
@@ -286,6 +394,7 @@ def create_app(
     app.include_router(matches_router)
     app.include_router(livekit_router)
     app.include_router(postmatch_router)
+    app.include_router(postmatch_showcase_router)
     app.include_router(admin_router)
     app.include_router(admin_data_router)
     app.include_router(admin_diagnostic_router)

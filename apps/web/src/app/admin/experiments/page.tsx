@@ -1,9 +1,8 @@
 import type { Metadata } from 'next';
+import { redirect } from 'next/navigation';
 
-import { AdminExperimentPage } from '@/features/experiments/admin-experiment-page';
-
-export const metadata: Metadata = { title: '论文实验管理' };
+export const metadata: Metadata = { title: '比赛管理' };
 
 export default function AdminExperimentsPage() {
-  return <AdminExperimentPage />;
+  redirect('/admin/matches');
 }

@@ -6,7 +6,7 @@ from collections.abc import Callable
 from typing import Literal, cast
 from urllib.parse import urlsplit
 
-from pydantic import SecretStr, field_validator
+from pydantic import AliasChoices, Field, SecretStr, field_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 LogLevel = Literal["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
@@ -24,9 +24,20 @@ class Settings(BaseSettings):
     app_env: AppEnvironment = "development"
     log_level: LogLevel = "INFO"
     database_url: SecretStr
-    tts_ws_url: str = ""
-    dashscope_api_key: SecretStr | None = None
-    dashscope_workspace: str = ""
+    provider_capture_enabled: bool = True
+    tts_ws_url: str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
+    tts_api_key: SecretStr | None = Field(
+        default=None,
+        validation_alias=AliasChoices("TTS_API_KEY", "DASHSCOPE_API_KEY"),
+    )
+    tts_model: str = Field(
+        default="qwen-audio-3.1-tts-flash",
+        validation_alias=AliasChoices("TTS_MODEL", "DASHSCOPE_TTS_MODEL"),
+    )
+    tts_workspace_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("TTS_WORKSPACE_ID", "DASHSCOPE_WORKSPACE"),
+    )
     host_audio_storage_dir: str = "./data/host-audio"
     match_audio_storage_dir: str = "./data/match-audio"
     human_audio_storage_dir: str = "./data/agent-audio"

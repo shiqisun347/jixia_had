@@ -14,5 +14,11 @@ test('LLM runtime keeps separate normal and fast-decision timeout policies', asy
   assert.match(runtime, /connection_timeout_seconds=LLM_FAST_DECISION_TIMEOUT_SECONDS/);
   assert.match(runtime, /first_token_timeout_seconds=LLM_FAST_DECISION_TIMEOUT_SECONDS/);
   assert.match(runtime, /idle_timeout_seconds=LLM_FAST_DECISION_TIMEOUT_SECONDS/);
-  assert.match(llm, /timeout=httpx\.Timeout\(None, connect=self\._connection_timeout_seconds\)/);
+  assert.match(
+    llm,
+    /timeout=httpx\.Timeout\(\s*None,\s*connect=self\._connection_timeout_seconds\s*\)/,
+  );
+  assert.match(llm, /first_token_deadline\s*=\s*started\s*\+\s*self\._first_token_timeout_seconds/);
+  assert.match(llm, /stream_completed\s*=\s*True/);
+  assert.match(llm, /llm_stream_interrupted/);
 });

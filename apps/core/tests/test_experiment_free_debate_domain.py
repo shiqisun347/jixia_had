@@ -549,8 +549,6 @@ async def test_initial_experiment_decision_starts_with_host_and_cutoff_starts_af
     await actor.start()
     try:
         entered = actor._enter_current_action()
-        opportunity_id = actor.state.opportunity_id
-        round_id = actor.state.agent_decision_round_id
         assert actor.state.action_state == "HOST_ANNOUNCING"
         assert actor.state.free_holder_side == "AFFIRMATIVE"
         assert actor.state.agent_effective_status == "DECIDING"
@@ -561,14 +559,13 @@ async def test_initial_experiment_decision_starts_with_host_and_cutoff_starts_af
             "hand.window_opened",
             "agent.decision_started",
         ]
-
         now[0] = 52.0
         elapsed = actor._host_elapsed(
             MatchCommand(type="host.elapsed", message_id="host-elapsed")
         )
         assert actor.state.action_state == "FREE_SELECTING"
-        assert actor.state.opportunity_id == opportunity_id
-        assert actor.state.agent_decision_round_id == round_id
+        assert actor.state.free_holder_side == "AFFIRMATIVE"
+        assert actor.state.agent_effective_status == "DECIDING"
         assert actor.state.selection_deadline_mono == 55.0
         assert [event.type for event in elapsed] == ["host.finished", "hand.window_opened"]
     finally:

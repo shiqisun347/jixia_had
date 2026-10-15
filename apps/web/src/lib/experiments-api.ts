@@ -1,6 +1,6 @@
 import type { components } from '@jx/contracts';
 
-import { requestJson } from './auth-api';
+import { requestJson, requestJsonWithHeaders } from './auth-api';
 
 export type ExperimentAppointment = components['schemas']['ExperimentAppointmentResponse'];
 export type ExperimentEnter = components['schemas']['ExperimentEnterResponse'];
@@ -22,15 +22,99 @@ export type ExperimentScheduleCsvImport =
   components['schemas']['ExperimentScheduleCsvImportResponse'];
 export type ExperimentPromptTemplates = components['schemas']['ExperimentPromptTemplatesResponse'];
 
+const ANNOTATION_PAGE_SIZE = 25;
+const ANNOTATION_MAX_PAGES = 4;
+const ANNOTATION_MAX_ITEMS = ANNOTATION_PAGE_SIZE * ANNOTATION_MAX_PAGES;
+const ANNOTATION_MAX_BYTES = 64 * 1024 * 1024;
+const annotationTaskTooLargeMessage = '实验标注任务超过单次加载上限，请使用分页查看或联系管理员';
+const annotationTaskInvalidResponseMessage = '实验标注任务响应格式异常，请刷新后重试';
+const EXPERIMENT_INDEX_PAGE_SIZE = 50;
+const EXPERIMENT_INDEX_MAX_PAGES = 200;
+const EXPERIMENT_INDEX_MAX_ITEMS = 10_000;
+const EXPERIMENT_INDEX_MAX_BYTES = 16 * 1024 * 1024;
+const experimentHistoryTooLargeMessage = '实验历史超过单次加载上限，请使用分页查看或联系管理员';
+const experimentHistoryInvalidResponseMessage = '实验历史响应格式异常，请刷新后重试';
+const experimentHistoryEncoder = new TextEncoder();
+
+async function fetchTaskPages<T>(path: string): Promise<T[]> {
+  const rows: T[] = [];
+  let cursor: string | undefined;
+  const seen = new Set<string>();
+  let pageCount = 0;
+  let payloadBytes = 0;
+  do {
+    if (pageCount >= ANNOTATION_MAX_PAGES) {
+      throw new Error(annotationTaskTooLargeMessage);
+    }
+    pageCount += 1;
+    const query = new URLSearchParams({ limit: String(ANNOTATION_PAGE_SIZE) });
+    if (cursor) query.set('cursor', cursor);
+    const result = await requestJsonWithHeaders<T[]>(`${path}?${query.toString()}`);
+    if (!Array.isArray(result.data)) {
+      throw new Error(annotationTaskInvalidResponseMessage);
+    }
+    const pageBytes = experimentHistoryEncoder.encode(JSON.stringify(result.data)).byteLength;
+    if (
+      rows.length + result.data.length > ANNOTATION_MAX_ITEMS ||
+      payloadBytes + pageBytes > ANNOTATION_MAX_BYTES
+    ) {
+      throw new Error(annotationTaskTooLargeMessage);
+    }
+    payloadBytes += pageBytes;
+    rows.push(...result.data);
+    const next = result.headers.get('X-Next-Cursor') ?? undefined;
+    if (next && seen.has(next)) throw new Error('实验分页游标重复');
+    if (next) seen.add(next);
+    cursor = next;
+  } while (cursor);
+  return rows;
+}
+
+async function fetchAllExperimentPages<T>(path: string): Promise<T[]> {
+  const items: T[] = [];
+  const seen = new Set<string>();
+  let cursor: string | null = null;
+  let pageCount = 0;
+  let payloadBytes = 0;
+  do {
+    if (pageCount >= EXPERIMENT_INDEX_MAX_PAGES) {
+      throw new Error(experimentHistoryTooLargeMessage);
+    }
+    const params = new URLSearchParams({ limit: String(EXPERIMENT_INDEX_PAGE_SIZE) });
+    if (cursor) params.set('cursor', cursor);
+    const result = await requestJsonWithHeaders<T[]>(`${path}?${params.toString()}`);
+    if (!Array.isArray(result.data)) {
+      throw new Error(experimentHistoryInvalidResponseMessage);
+    }
+    const pageBytes = experimentHistoryEncoder.encode(JSON.stringify(result.data)).byteLength;
+    if (
+      items.length + result.data.length > EXPERIMENT_INDEX_MAX_ITEMS ||
+      payloadBytes + pageBytes > EXPERIMENT_INDEX_MAX_BYTES
+    ) {
+      throw new Error(experimentHistoryTooLargeMessage);
+    }
+    pageCount += 1;
+    payloadBytes += pageBytes;
+    items.push(...result.data);
+    const next = result.headers.get('X-Next-Cursor');
+    if (!next) return items;
+    if (next === cursor || seen.has(next)) throw new Error('实验分页游标重复');
+    seen.add(next);
+    cursor = next;
+  } while (cursor);
+  return items;
+}
+
 export const experimentsApi = {
-  appointments: () => requestJson<ExperimentAppointment[]>('/api/experiments/appointments'),
+  appointments: () =>
+    fetchAllExperimentPages<ExperimentAppointment>('/api/experiments/appointments'),
   enter: (scheduledMatchId: string, termsVersion: string) =>
     requestJson<ExperimentEnter>(`/api/experiments/appointments/${scheduledMatchId}/enter`, {
       method: 'POST',
       body: JSON.stringify({ human_participation_terms_version: termsVersion }),
     }),
   participantTasks: () =>
-    requestJson<ParticipantAnnotationTask[]>('/api/experiments/annotation-tasks'),
+    fetchTaskPages<ParticipantAnnotationTask>('/api/experiments/annotation-tasks'),
   saveParticipantItem: (
     taskId: string,
     itemId: string,
@@ -52,7 +136,7 @@ export const experimentsApi = {
     requestJson<ParticipantAnnotationTask>(`/api/experiments/annotation-tasks/${taskId}/submit`, {
       method: 'POST',
     }),
-  expertTasks: () => requestJson<ExpertAnnotationTask[]>('/api/experiments/expert-tasks'),
+  expertTasks: () => fetchTaskPages<ExpertAnnotationTask>('/api/experiments/expert-tasks'),
   saveExpertItem: (
     taskId: string,
     opportunityId: string,
@@ -66,7 +150,7 @@ export const experimentsApi = {
     requestJson<ExpertAnnotationTask>(`/api/experiments/expert-tasks/${taskId}/submit`, {
       method: 'POST',
     }),
-  adminBatches: () => requestJson<ExperimentBatch[]>('/api/admin/experiments/batches'),
+  adminBatches: () => fetchAllExperimentPages<ExperimentBatch>('/api/admin/experiments/batches'),
   generateAccounts: () =>
     requestJson<ExperimentAccountGeneration>('/api/admin/experiments/accounts/generate', {
       method: 'POST',
@@ -196,6 +280,11 @@ export type PostmatchSurveyTask = {
   } | null;
 };
 
+export type PostmatchSurveyPage = {
+  items: PostmatchSurveyTask[];
+  nextCursor: string | null;
+};
+
 export type SurveyChoiceQuestion = {
   type: 'single_choice' | 'multiple_choice';
   text: string;
@@ -219,6 +308,17 @@ export const surveyApi = {
       body: JSON.stringify({ answers, submit }),
     }),
   postmatch: () => requestJson<PostmatchSurveyTask[]>('/api/me/postmatch-surveys'),
+  postmatchPage: async (cursor: string | null = null): Promise<PostmatchSurveyPage> => {
+    const params = new URLSearchParams({ limit: '25' });
+    if (cursor) params.set('cursor', cursor);
+    const result = await requestJsonWithHeaders<PostmatchSurveyTask[]>(
+      `/api/me/postmatch-surveys?${params.toString()}`,
+    );
+    return {
+      items: result.data,
+      nextCursor: result.headers.get('X-Next-Cursor'),
+    };
+  },
   postmatchTask: (taskId: string) =>
     requestJson<PostmatchSurveyTask>(`/api/me/postmatch-surveys/${taskId}`),
   postmatchStatus: (matchId: string) =>

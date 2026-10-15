@@ -226,6 +226,12 @@ const snapshot = http.get('*/api/rooms/:roomId/snapshot', () => HttpResponse.jso
 const noSeatSwapRequests = http.get('*/api/rooms/:roomId/seat-swap-requests', () =>
   HttpResponse.json([]),
 );
+const noDeviceCheckReuse = http.post('*/api/rooms/:roomId/device-check/reuse', () =>
+  HttpResponse.json(
+    { error: { code: 'device_check_not_found', message: '没有可复用的设备检测，请重新检测。' } },
+    { status: 404 },
+  ),
+);
 
 const meta = {
   title: 'Rooms/004 Flows',
@@ -279,7 +285,9 @@ export const CreateRoom: Story = {
     const canvas = within(canvasElement);
     await expect(await canvas.findByRole('heading', { name: '创建一场辩论' })).toBeVisible();
     await waitFor(async () => {
-      await expect(await canvas.findByLabelText('赛制')).toHaveValue(formal4v4Rule.id);
+      await expect(await canvas.findByRole('combobox', { name: /^赛制/ })).toHaveValue(
+        formal4v4Rule.id,
+      );
     });
     await expect(canvas.queryByRole('option', { name: '选择已启用赛制' })).not.toBeInTheDocument();
     await expect(
@@ -300,7 +308,16 @@ export const WaitingRoom: Story = {
   render: () => <RoomPage roomId={roomId} />,
   parameters: {
     toastPath: '/rooms/story',
-    msw: { handlers: [authenticated, terms, userAvatar, snapshot, noSeatSwapRequests] },
+    msw: {
+      handlers: [
+        authenticated,
+        terms,
+        userAvatar,
+        snapshot,
+        noSeatSwapRequests,
+        noDeviceCheckReuse,
+      ],
+    },
   },
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
@@ -321,6 +338,7 @@ export const Mixed4v4Preparation: Story = {
         terms,
         userAvatar,
         noSeatSwapRequests,
+        noDeviceCheckReuse,
         http.get('*/api/rooms/:roomId/snapshot', () => HttpResponse.json(mixed4v4Room)),
       ],
     },
@@ -332,7 +350,7 @@ export const Mixed4v4Preparation: Story = {
       await canvas.findAllByRole('button', { name: /[正反]方 [1-4] 辩，/ }),
     ).toHaveLength(8);
     await expect(await canvas.findByRole('button', { name: /开始设备检测/ })).toBeVisible();
-    await expect(canvas.getByRole('button', { name: '开始比赛' })).toBeDisabled();
+    await expect(canvas.getByRole('button', { name: '进入候场' })).toBeDisabled();
     await expect(canvas.getByText('林知行尚未完成设备检测与准备')).toBeVisible();
   },
 };
@@ -347,13 +365,14 @@ export const FormalExperimentPreparation: Story = {
         terms,
         userAvatar,
         noSeatSwapRequests,
+        noDeviceCheckReuse,
         http.get('*/api/rooms/:roomId/snapshot', () => HttpResponse.json(formalExperimentRoom)),
       ],
     },
   },
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText('论文实验 · 固定席位')).toBeVisible();
+    await expect(await canvas.findByText('正式赛 · 固定席位')).toBeVisible();
     await expect(canvas.queryByRole('button', { name: '切换为观众' })).not.toBeInTheDocument();
     await expect(canvas.queryByRole('button', { name: '退出房间' })).not.toBeInTheDocument();
   },
@@ -369,13 +388,14 @@ export const TrainingExperimentPreparation: Story = {
         terms,
         userAvatar,
         noSeatSwapRequests,
+        noDeviceCheckReuse,
         http.get('*/api/rooms/:roomId/snapshot', () => HttpResponse.json(trainingExperimentRoom)),
       ],
     },
   },
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByText('论文实验 · 训练房间')).toBeVisible();
+    await expect(await canvas.findByText('正式 4v4')).toBeVisible();
     await expect(await canvas.findByRole('button', { name: '切换为观众' })).toBeVisible();
     await expect(await canvas.findByRole('button', { name: '退出房间' })).toBeVisible();
     await userEvent.click(await canvas.findByRole('button', { name: '邀请加入' }));
@@ -389,7 +409,16 @@ export const InviteExpandedAfterCreation: Story = {
   render: () => <RoomPage created roomId={roomId} />,
   parameters: {
     toastPath: '/rooms/story',
-    msw: { handlers: [authenticated, terms, userAvatar, snapshot, noSeatSwapRequests] },
+    msw: {
+      handlers: [
+        authenticated,
+        terms,
+        userAvatar,
+        snapshot,
+        noSeatSwapRequests,
+        noDeviceCheckReuse,
+      ],
+    },
   },
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
@@ -411,6 +440,7 @@ export const OneClickDevicePass: Story = {
         userAvatar,
         snapshot,
         noSeatSwapRequests,
+        noDeviceCheckReuse,
         http.post('*/api/rooms/:roomId/device-check', () =>
           HttpResponse.json({
             ...room,
@@ -455,7 +485,16 @@ export const DeviceWarningNeedsConfirmation: Story = {
   render: () => <RoomPage roomId={roomId} />,
   parameters: {
     toastPath: '/rooms/story',
-    msw: { handlers: [authenticated, terms, userAvatar, snapshot, noSeatSwapRequests] },
+    msw: {
+      handlers: [
+        authenticated,
+        terms,
+        userAvatar,
+        snapshot,
+        noSeatSwapRequests,
+        noDeviceCheckReuse,
+      ],
+    },
   },
   async play({ canvasElement }) {
     window.__JX_DEVICE_PROBE_OVERRIDE__ = async () => ({
@@ -479,7 +518,16 @@ export const DeviceFailureCanRetry: Story = {
   render: () => <RoomPage roomId={roomId} />,
   parameters: {
     toastPath: '/rooms/story',
-    msw: { handlers: [authenticated, terms, userAvatar, snapshot, noSeatSwapRequests] },
+    msw: {
+      handlers: [
+        authenticated,
+        terms,
+        userAvatar,
+        snapshot,
+        noSeatSwapRequests,
+        noDeviceCheckReuse,
+      ],
+    },
   },
   async play({ canvasElement }) {
     window.__JX_DEVICE_PROBE_OVERRIDE__ = async () => ({
@@ -530,6 +578,7 @@ export const ReenteredWithValidDeviceCheck: Story = {
         terms,
         userAvatar,
         noSeatSwapRequests,
+        noDeviceCheckReuse,
         http.get('*/api/rooms/:roomId/snapshot', () =>
           HttpResponse.json({
             ...room,
@@ -561,6 +610,7 @@ export const RunningRoomSpectatorGateway: Story = {
         authenticated,
         terms,
         noSeatSwapRequests,
+        noDeviceCheckReuse,
         http.get('*/api/rooms/:roomId/snapshot', () =>
           HttpResponse.json({
             ...room,

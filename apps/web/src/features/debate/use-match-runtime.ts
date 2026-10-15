@@ -33,13 +33,20 @@ export function matchSocketErrorText(
   t?: (key: string, values?: Record<string, string | number | Date>) => string,
 ): string | null | undefined {
   if (event.type === 'command.error') {
+    if (event.code === 'asr_finalization_pending') {
+      return (
+        t?.('runtime.finalizationPending') ??
+        '上一段发言仍在整理，麦克风尚未开启。请稍后再次点击开始发言。'
+      );
+    }
     return event.message ?? t?.('runtime.commandFailed') ?? '比赛指令未执行，请刷新后重试。';
   }
   if (event.type === 'match.resume_check_failed') {
     const reasons = event.payload?.reasons?.filter(Boolean) ?? [];
     return reasons.length > 0
-      ? t?.('runtime.recoveryRequirements', { reasons: reasons.join('；') }) ?? `恢复条件未满足：${reasons.join('；')}`
-      : t?.('runtime.recoveryFallback') ?? '恢复条件未满足，请检查辩手在线状态与设备。';
+      ? (t?.('runtime.recoveryRequirements', { reasons: reasons.join('；') }) ??
+          `恢复条件未满足：${reasons.join('；')}`)
+      : (t?.('runtime.recoveryFallback') ?? '恢复条件未满足，请检查辩手在线状态与设备。');
   }
   if (event.type === 'match.resume_countdown') return null;
   return undefined;
@@ -94,6 +101,8 @@ export function useMatchRuntime(matchId: string) {
   const [connectionEpoch, setConnectionEpoch] = useState<number | null>(null);
   const [latestSequence, setLatestSequence] = useState(0);
   const [socketError, setSocketError] = useState<string | null>(null);
+  const [commandErrorCode, setCommandErrorCode] = useState<string | null>(null);
+  const commandErrorRef = useRef<string | null>(null);
   const [resumeReasons, setResumeReasons] = useState<string[]>(query.data?.resume_reasons ?? []);
   const [interimText, setInterimText] = useState(() => query.data?.interim_text ?? '');
   const hasInitialSnapshot = Boolean(query.data);
@@ -157,6 +166,7 @@ export function useMatchRuntime(matchId: string) {
             queryKey: ['rooms', snapshot.room_id, 'snapshot'],
           });
         } else if (event.type === 'command.ack' && event.message_id) {
+          setCommandErrorCode(null);
           if (event.snapshot) {
             const acknowledged = event.snapshot;
             observeSequence(acknowledged.sequence);
@@ -173,8 +183,11 @@ export function useMatchRuntime(matchId: string) {
             pendingRef.current.delete(event.message_id);
           }
         } else if (event.type === 'command.error' && event.message_id) {
+          setCommandErrorCode(event.code ?? null);
           const translate = tRef.current;
-          setSocketError(matchSocketErrorText(event, translate) ?? translate('runtime.commandFailed'));
+          commandErrorRef.current =
+            matchSocketErrorText(event, translate) ?? translate('runtime.commandFailed');
+          setSocketError(commandErrorRef.current);
           const pending = pendingRef.current.get(event.message_id);
           if (pending) {
             clearTimeout(pending.timeout);
@@ -184,7 +197,9 @@ export function useMatchRuntime(matchId: string) {
         } else if (event.type === 'match.resume_check_failed') {
           setResumeReasons(event.payload?.reasons?.filter(Boolean) ?? []);
           const translate = tRef.current;
-          setSocketError(matchSocketErrorText(event, translate) ?? translate('runtime.recoveryFallback'));
+          setSocketError(
+            matchSocketErrorText(event, translate) ?? translate('runtime.recoveryFallback'),
+          );
         } else if (event.type === 'match.resume_countdown') {
           setResumeReasons([]);
           setSocketError(null);
@@ -289,6 +304,8 @@ export function useMatchRuntime(matchId: string) {
 
   const sendCommand = useCallback(
     async (command: Omit<MatchCommand, 'expected_sequence' | 'connection_epoch'>) => {
+      commandErrorRef.current = null;
+      setCommandErrorCode(null);
       const queryKey = ['matches', matchId, 'snapshot'] as const;
       let snapshot = queryClient.getQueryData<MatchSnapshot>(queryKey);
 
@@ -351,6 +368,7 @@ export function useMatchRuntime(matchId: string) {
       socketStatus,
       connectionEpoch,
       socketError,
+      commandErrorCode,
       resumeReasons,
       interimText,
       commandReady:
@@ -358,6 +376,7 @@ export function useMatchRuntime(matchId: string) {
         connectionEpoch !== null &&
         Boolean(query.data && query.data.sequence >= latestSequence),
       sendCommand,
+      commandFailureMessage: () => commandErrorRef.current,
     }),
     [
       connectionEpoch,
@@ -367,6 +386,7 @@ export function useMatchRuntime(matchId: string) {
       sendCommand,
       resumeReasons,
       socketError,
+      commandErrorCode,
       interimText,
       latestSequence,
       socketStatus,

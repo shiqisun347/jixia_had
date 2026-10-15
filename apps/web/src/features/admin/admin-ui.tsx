@@ -30,13 +30,19 @@ export function AdminPageHeader({
         aria-hidden="true"
       />
       <div className="max-w-3xl">
-        <p className="text-[0.65rem] font-black tracking-[0.16em] text-blue-600">{translateAdminText(eyebrow, locale)}</p>
+        <p className="text-[0.65rem] font-black tracking-[0.16em] text-blue-600">
+          {translateAdminText(eyebrow, locale)}
+        </p>
         <h1 className="mt-2 text-[1.8rem] font-black tracking-[-0.035em] text-slate-950">
           {translateAdminText(title, locale)}
         </h1>
-        <p className="mt-1.5 max-w-2xl text-sm leading-6 text-slate-600">{translateAdminText(description, locale)}</p>
+        <p className="mt-1.5 max-w-2xl text-sm leading-6 text-slate-600">
+          {translateAdminText(description, locale)}
+        </p>
       </div>
-      {actions ? <div className="flex flex-wrap gap-2">{translateAdminNode(actions, locale)}</div> : null}
+      {actions ? (
+        <div className="flex flex-wrap gap-2">{translateAdminNode(actions, locale)}</div>
+      ) : null}
     </header>
   );
 }
@@ -64,9 +70,13 @@ export function AdminPanel({
     >
       <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 px-5 py-4">
         <div>
-          <h2 className="text-sm font-black tracking-[-0.015em] text-slate-950">{translateAdminText(title, locale)}</h2>
+          <h2 className="text-sm font-black tracking-[-0.015em] text-slate-950">
+            {translateAdminText(title, locale)}
+          </h2>
           {description ? (
-            <p className="mt-1 text-xs leading-5 text-slate-500">{translateAdminText(description, locale)}</p>
+            <p className="mt-1 text-xs leading-5 text-slate-500">
+              {translateAdminText(description, locale)}
+            </p>
           ) : null}
         </div>
         {translateAdminNode(action, locale)}

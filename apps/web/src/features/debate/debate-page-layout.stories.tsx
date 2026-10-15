@@ -186,6 +186,7 @@ const snapshot = (actionState: string, overrides: Partial<MatchSnapshot> = {}) =
     match_id: 'match-013',
     room_id: room.id,
     status: 'RUNNING',
+    formal_4v4: true,
     action_state: actionState,
     sequence: 12,
     current_action_index: 2,
@@ -409,8 +410,8 @@ export const HumanAudioControls: Story = {
     const menuTrigger = canvas.getByRole('button', { name: '真人声音设置' });
     await userEvent.click(menuTrigger);
     const page = within(document.body);
-    const affirmativeHuman = page.getByRole('menuitemcheckbox', { name: /周明远.*正方 2 辩/ });
-    const negativeHuman = page.getByRole('menuitemcheckbox', { name: /顾清和.*反方 1 辩/ });
+    const affirmativeHuman = page.getByRole('menuitemcheckbox', { name: /周明远.*正方 2$/ });
+    const negativeHuman = page.getByRole('menuitemcheckbox', { name: /顾清和.*反方 1$/ });
     await expect(affirmativeHuman).toBeVisible();
     await expect(negativeHuman).toBeVisible();
 
@@ -520,7 +521,7 @@ export const TranscriptReadingOrder: Story = {
     const page = within(document.body);
     const dialog = page.getByRole('dialog', { name: '文字记录' });
     await expect(within(dialog).getByText('正方一辩立论')).toBeVisible();
-    await expect(within(dialog).getByText('正在进行 · 正方 1 辩')).toBeVisible();
+    await expect(within(dialog).getByText('正在进行 · 正方 1')).toBeVisible();
     await expect(within(dialog).getByRole('button', { name: '复制全部记录' })).toBeVisible();
     const closeButton = within(dialog).getByRole('button', { name: '关闭文字记录' });
     await expect(closeButton).toHaveFocus();
@@ -563,7 +564,7 @@ export const NetworkModalFocus: Story = {
     await expect(closeButton).toHaveFocus();
     await userEvent.keyboard('{Escape}');
     await expect(page.queryByRole('dialog', { name: '网络状态' })).not.toBeInTheDocument();
-    await expect(canvas.getByRole('button', { name: '查看网络状态' })).toHaveFocus();
+    await expect(canvas.getByRole('button', { name: '网络状态' })).toHaveFocus();
   },
 };
 
@@ -773,8 +774,8 @@ export const FreeDebateAgentDecisionProgress: Story = {
   },
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(canvas.getByLabelText('Agent 决策中')).toBeVisible();
-    await expect(canvas.getByLabelText('Agent 举手第 1 名')).toBeVisible();
+    await expect(canvas.getByRole('status', { name: '决策中' })).toBeVisible();
+    await expect(canvas.getByText('第 1 名')).toBeVisible();
     await expect(canvas.getByText('跳过')).toBeVisible();
   },
 };
@@ -900,7 +901,13 @@ export const FreeDebateAgentVolunteers: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(canvas.getByTestId('current-debate-stage')).toHaveTextContent('自由辩论');
-    await expect(canvas.getByLabelText('Agent 举手第 1 名')).toHaveTextContent('将发言');
+    const selectedSeat = canvas
+      .getAllByRole('article')
+      .find((element) => element.textContent?.includes('Agent·反一'));
+    expect(selectedSeat).toBeTruthy();
+    await expect(selectedSeat).toHaveClass(/jx-active-seat-shadow/);
+    await expect(within(selectedSeat!).getByText('第 1 名')).toBeVisible();
+    await expect(canvas.getByText('第 2 名')).toBeVisible();
   },
 };
 
@@ -1011,6 +1018,42 @@ export const Terminated: Story = {
     await expect(canvas.getByText('本场比赛已终止')).toBeVisible();
     await expect(canvas.getByRole('link', { name: /查看终止记录/ })).toBeVisible();
     await expect(canvas.queryByRole('button', { name: /开启比赛声音/ })).not.toBeInTheDocument();
+  },
+};
+export const FinishedWithRetainedFreeFields: Story = {
+  args: {
+    ...baseArgs,
+    snapshot: snapshot('MATCH_FINISHED', {
+      status: 'FINISHED',
+      speech_remaining_ms: null,
+      free_holder_side: 'NEGATIVE',
+      free_affirmative_remaining_ms: 0,
+      free_negative_remaining_ms: 1200,
+    }),
+    currentSeat: undefined,
+    presentation: {
+      eyebrow: '比赛结束',
+      title: '本场辩论已完成',
+      detail: '查看本场记录与评分进度。',
+    },
+  },
+  async play({ canvasElement }) {
+    const center = within(within(canvasElement).getByTestId('debate-center-stage'));
+    await expect(center.getByTestId('terminal-stage')).toBeVisible();
+    await expect(center.queryByText('等待发言者')).not.toBeInTheDocument();
+    await expect(center.queryByText('--:--')).not.toBeInTheDocument();
+    await expect(center.queryByTestId('free-debate-clock')).not.toBeInTheDocument();
+    await expect(center.getByRole('link', { name: '查看赛后记录' })).toBeVisible();
+  },
+};
+export const PresentationFinished: Story = {
+  ...FinishedWithRetainedFreeFields,
+  args: { ...FinishedWithRetainedFreeFields.args, presentationMode: true },
+  async play({ canvasElement }) {
+    const canvas = within(canvasElement);
+    await expect(canvas.getByRole('img', { name: '稷下' })).toBeVisible();
+    await expect(canvas.queryByTestId('match-controls-speech')).not.toBeInTheDocument();
+    await expect(canvas.getByTestId('terminal-stage')).toBeVisible();
   },
 };
 export const SystemError: Story = {

@@ -4,14 +4,15 @@ import {
   CheckCircle2,
   Download,
   FileArchive,
+  Pause,
   Play,
   RefreshCcw,
-  RotateCcw,
   Square,
   XCircle,
 } from 'lucide-react';
 import { useState } from 'react';
 import { useQuery } from '@tanstack/react-query';
+import Link from 'next/link';
 
 import { useOptionalToast } from '@/components/ui/toast-provider';
 
@@ -19,6 +20,7 @@ import { AdminButton, AdminConfirmDialog, StatusBadge } from './admin-controls';
 import { AdminEmpty, AdminFeedback, AdminPageHeader, AdminPanel } from './admin-ui';
 import type { ExternalCallRow, MatchWorkbenchOverview, WorkbenchTimelineItem } from './admin-types';
 import { adminApi, readableAdminError } from './admin-api';
+import { AdminEmergencyControls } from './admin-emergency-controls';
 
 type Tab = 'overview' | 'participants' | 'transcript' | 'timeline' | 'events' | 'calls' | 'export';
 
@@ -30,6 +32,10 @@ export function AdminMatchWorkbench({ matchId }: Readonly<{ matchId: string }>) 
   const overview = useQuery({
     queryKey: ['admin', 'workbench', matchId, 'overview'],
     queryFn: () => adminApi.matchWorkbenchOverview(matchId),
+    refetchInterval: (query) => {
+      const status = query.state.data?.match.status;
+      return status && !['FINISHED', 'TERMINATED'].includes(status) ? 2000 : false;
+    },
   });
   const participants = useQuery({
     queryKey: ['admin', 'workbench', matchId, 'participants'],
@@ -80,7 +86,7 @@ export function AdminMatchWorkbench({ matchId }: Readonly<{ matchId: string }>) 
     ['calls', '请求日志'],
     ['export', '导出'],
   ];
-  const control = async (action: 'terminate' | 'resume' | 'recover' | 'reset_speech') => {
+  const control = async (action: 'pause' | 'terminate' | 'resume' | 'recover' | 'reset_speech') => {
     try {
       await adminApi.controlMatch(matchId, action);
       await overview.refetch();
@@ -91,15 +97,27 @@ export function AdminMatchWorkbench({ matchId }: Readonly<{ matchId: string }>) 
   return (
     <div className="space-y-6">
       <AdminPageHeader
-        eyebrow="MATCH WORKBENCH"
+        eyebrow="LIVE INCIDENT CONSOLE"
         title={match.label || '比赛工作台'}
-        description={`${match.status} / ${match.action_state} · sequence ${match.sequence} · context v${match.context_version}${match.error_code ? ` · ${match.error_code}` : ''}`}
+        description={`现场控制台 · ${match.status} / ${match.action_state} · sequence ${match.sequence} · context v${match.context_version}${match.error_code ? ` · ${match.error_code}` : ''}`}
         actions={
           <div className="flex flex-wrap gap-2">
+            <Link
+              className="inline-flex min-h-10 items-center justify-center gap-2 rounded-lg border border-blue-200 bg-blue-50 px-3 text-sm font-black text-blue-800 hover:bg-blue-100"
+              href={`/matches/${match.id}`}
+            >
+              大屏展示
+            </Link>
             <AdminButton onClick={() => void overview.refetch()}>
               <RefreshCcw className="size-4" />
               刷新
             </AdminButton>
+            {match.status === 'RUNNING' ? (
+              <AdminButton onClick={() => void control('pause')} tone="secondary">
+                <Pause className="size-4" />
+                立即暂停
+              </AdminButton>
+            ) : null}
             {['PAUSED', 'SYSTEM_RECOVERY', 'ERROR'].includes(match.status) ? (
               <AdminButton onClick={() => void control('resume')} tone="secondary">
                 <Play className="size-4" />
@@ -119,15 +137,10 @@ export function AdminMatchWorkbench({ matchId }: Readonly<{ matchId: string }>) 
                 强制终止
               </AdminButton>
             ) : null}
-            {match.status === 'RUNNING' ? (
-              <AdminButton onClick={() => void control('reset_speech')} tone="secondary">
-                <RotateCcw className="size-4" />
-                重置当前发言
-              </AdminButton>
-            ) : null}
           </div>
         }
       />
+      <AdminEmergencyControls matchId={matchId} />
       <div className="flex flex-wrap gap-2 border-b border-slate-200 pb-2">
         {tabs.map(([key, label]) => (
           <button

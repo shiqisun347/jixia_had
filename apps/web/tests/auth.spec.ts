@@ -18,17 +18,22 @@ test('real registration, profile, logout, login and protected debate flow', asyn
   await expect(page.getByText('浏览器测试用户')).toBeVisible();
 
   await page.goto('/profile');
-  await expect(page.getByRole('heading', { name: '个人资料' })).toBeVisible();
-  await page.getByLabel('真实姓名').fill('浏览器更新用户');
-  await page.getByRole('button', { name: '保存姓名' }).click();
-  await expect(page.getByRole('status')).toHaveText('资料已保存。');
+  await expect(page).toHaveURL(/\/me\?edit=profile$/);
+  const profileDialog = page.getByRole('dialog', { name: '编辑资料与头像' });
+  await expect(profileDialog).toBeVisible();
+  await profileDialog.getByLabel('真实姓名').fill('浏览器更新用户');
+  await profileDialog.getByRole('button', { name: '保存姓名' }).click();
+  await expect(profileDialog.getByText('浏览器更新用户')).toBeVisible();
+  await profileDialog.getByRole('button', { name: '关闭资料编辑' }).click();
+  await expect(profileDialog).toHaveCount(0);
 
-  await page.getByRole('main').getByRole('button', { name: '退出登录' }).click();
+  const siteHeader = page.locator('header.site-header');
+  await siteHeader.getByRole('button', { name: '退出登录' }).click();
   const logoutDialog = page.getByRole('alertdialog', { name: '确认退出登录？' });
   await expect(logoutDialog).toBeVisible();
   await logoutDialog.getByRole('button', { name: '取消' }).click();
-  await expect(page).toHaveURL(/\/profile$/);
-  await page.getByRole('main').getByRole('button', { name: '退出登录' }).click();
+  await expect(page).toHaveURL(/\/me\?edit=profile$/);
+  await siteHeader.getByRole('button', { name: '退出登录' }).click();
   await page
     .getByRole('alertdialog', { name: '确认退出登录？' })
     .getByRole('button', { name: '退出登录' })

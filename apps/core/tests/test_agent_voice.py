@@ -13,6 +13,7 @@ import av
 import httpx
 import numpy as np
 import pytest
+from pydantic import SecretStr
 
 import jx_core.agent.runtime as agent_runtime_module
 import jx_core.agent.tts as tts_module
@@ -22,6 +23,7 @@ from jx_core.agent.llm import (
     LLM_FAST_DECISION_TIMEOUT_SECONDS,
     LLM_FIRST_TOKEN_TIMEOUT_SECONDS,
     LLM_IDLE_TIMEOUT_SECONDS,
+    LLM_MAX_TEXT_CHARS,
     LlmProviderError,
     OpenAIStreamingClient,
 )
@@ -29,6 +31,8 @@ from jx_core.agent.runtime import (
     AgentConfig,
     AgentRun,
     AgentRuntime,
+    HostAudioRun,
+    _bound_history,
     _current_and_next_stage,
     _debate_position,
     _parse_decision,
@@ -39,6 +43,10 @@ from jx_core.agent.runtime import (
     _stage_name_for_action,
 )
 from jx_core.agent.tts import QwenTtsConnection, TtsProviderError, TtsStartRateLimiter
+from jx_core.agent.voice_compatibility import (
+    QWEN_31_LEGACY_VOICE_CORRECTIONS,
+    effective_tts_voice,
+)
 from jx_core.config import Settings
 from jx_core.data_capture.provider import ProviderCallCapture
 from jx_core.matches.domain import (
@@ -47,7 +55,18 @@ from jx_core.matches.domain import (
     MatchRuntimeState,
     compile_linear_actions,
 )
+from jx_core.rules.schemas import VoiceProfileCreate
 from jx_core.runtime_identity import CallbackEnvelope
+
+# This suite deliberately exercises internal media/provider boundaries.
+# pyright: reportPrivateUsage=false
+
+
+def _test_settings() -> Settings:
+    return Settings(
+        _env_file=None,  # pyright: ignore[reportCallIssue]
+        database_url=SecretStr("postgresql+psycopg://test:test@localhost/test"),
+    )
 
 
 def _rule_with_agent() -> dict[str, object]:
@@ -80,9 +99,10 @@ def test_free_decision_requires_strict_json_and_clamps_willingness() -> None:
 
 
 def test_experiment_decision_requires_bounded_reason() -> None:
-    assert _parse_experiment_decision(
-        '{"should_speak":true,"decision_reason":"需要回应"}'
-    ) == (True, "需要回应")
+    assert _parse_experiment_decision('{"should_speak":true,"decision_reason":"需要回应"}') == (
+        True,
+        "需要回应",
+    )
     assert _parse_experiment_decision(
         '{"should_speak":false,"decision_reason":"暂无新增价值"}'
     ) == (False, "暂无新增价值")
@@ -98,7 +118,7 @@ async def test_midstream_provider_failure_is_reported_before_media_cleanup(
 ) -> None:
     callbacks = AsyncMock()
     runtime = AgentRuntime(
-        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        settings=_test_settings(),
         session_factory=cast(Any, None),
         callbacks=callbacks,
     )
@@ -155,6 +175,7 @@ async def test_midstream_provider_failure_is_reported_before_media_cleanup(
     monkeypatch.setattr(runtime, "_discard_tts_connection", AsyncMock())
     monkeypatch.setattr(runtime, "_cleanup_attempt", stalled_cleanup)
 
+    runtime._runs[match_id] = run
     task = asyncio.create_task(runtime._run_with_retry(run))
     await asyncio.wait_for(cleanup_started.wait(), timeout=0.2)
 
@@ -170,10 +191,80 @@ async def test_midstream_provider_failure_is_reported_before_media_cleanup(
 
 
 @pytest.mark.asyncio
+async def test_agent_retry_waits_before_second_provider_attempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks = AsyncMock()
+    runtime = AgentRuntime(
+        settings=_test_settings(),
+        session_factory=cast(Any, None),
+        callbacks=callbacks,
+    )
+    match_id = uuid4()
+    run = AgentRun(
+        match_id=match_id,
+        action_key="1:0",
+        agent_profile_id=uuid4(),
+        duration_ms=90_000,
+    )
+    config = AgentConfig(
+        match_id=match_id,
+        action_key=run.action_key,
+        agent_profile_id=run.agent_profile_id,
+        context_version=1,
+        match_seed=1,
+        model_key="test",
+        base_url="https://llm.test/v1",
+        model_id="test",
+        api_key="test",
+        model_limit=1,
+        generation_params={},
+        max_tokens=64,
+        messages=[],
+        voice="test",
+        rate=1.0,
+        chars_per_second=4.0,
+        playback_gain=1.0,
+    )
+    generation_ids = [uuid4(), uuid4()]
+    monkeypatch.setattr(runtime, "_load_config", AsyncMock(return_value=config))
+    monkeypatch.setattr(runtime, "_create_generation", AsyncMock(side_effect=generation_ids))
+    monkeypatch.setattr(
+        runtime,
+        "_execute",
+        AsyncMock(
+            side_effect=[
+                LlmProviderError("llm_first_token_timeout"),
+                LlmProviderError("llm_first_token_timeout"),
+            ]
+        ),
+    )
+    monkeypatch.setattr(runtime, "_mark_generation_failed", AsyncMock())
+    monkeypatch.setattr(runtime, "_cleanup_attempt", AsyncMock())
+    monkeypatch.setattr(runtime, "_discard_tts_connection", AsyncMock())
+    sleeps: list[float] = []
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    runtime._runs[match_id] = run
+    await runtime._run_with_retry(run)
+
+    assert sleeps == [agent_runtime_module.AGENT_PROVIDER_RETRY_BACKOFF_SECONDS]
+    callbacks.publish_agent_retry.assert_awaited_once()
+    callbacks.handle_agent_failure.assert_awaited_once()
+    assert callbacks.handle_agent_failure.await_args.kwargs["error_code"] == (
+        "llm_first_token_timeout"
+    )
+
+
+@pytest.mark.asyncio
 async def test_media_fence_rejects_frames_from_interrupted_generation() -> None:
     callbacks = AsyncMock()
     runtime = AgentRuntime(
-        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        settings=_test_settings(),
         session_factory=cast(Any, None),
         callbacks=callbacks,
     )
@@ -199,6 +290,7 @@ async def test_media_fence_rejects_frames_from_interrupted_generation() -> None:
     run.decoder = cast(Any, Decoder())
     run.source = cast(Any, Source())
     runtime._runs[run.match_id] = run
+    assert run.generation_id is not None
     await runtime._play_pcm(run, run.generation_id)
 
     assert cast(Any, run.source).captures == 0
@@ -212,7 +304,7 @@ async def test_free_decisions_report_each_agent_independently_and_degrade_failur
     second = uuid4()
     callbacks = AsyncMock()
     runtime = AgentRuntime(
-        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        settings=_test_settings(),
         session_factory=cast(Any, None),
         callbacks=callbacks,
     )
@@ -350,7 +442,7 @@ def test_agent_subtitle_leads_buffered_audio_without_exceeding_draft() -> None:
 
 
 def test_agent_prompt_context_has_readable_stage_position_and_next_stage() -> None:
-    rule = {
+    rule: dict[str, Any] = {
         "stages": [
             {
                 "position": 1,
@@ -420,7 +512,8 @@ def _decode_ogg_pcm(encoded: bytes) -> np.ndarray[Any, np.dtype[np.int16]]:
 def test_offline_voice_preview_gain_matches_runtime_semantics(tmp_path: Path) -> None:
     source_path = tmp_path / "gain-source.ogg"
     with av.open(str(source_path), mode="w", format="ogg") as container:
-        stream = container.add_stream("libopus", rate=48_000)
+        # PyAV's add_stream stub leaves its optional **kwargs untyped.
+        stream = container.add_stream("libopus", rate=48_000)  # pyright: ignore[reportUnknownMemberType]
         stream.layout = "mono"
         for phase in range(8):
             values = (np.sin(np.linspace(phase, phase + np.pi * 2, 960)) * 4_000).astype(np.int16)
@@ -506,7 +599,7 @@ async def test_agent_playback_start_callback_retries_once() -> None:
     callbacks = AsyncMock()
     callbacks.start_agent_playback.side_effect = [RuntimeError("transient"), None]
     runtime = AgentRuntime(
-        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        settings=_test_settings(),
         session_factory=cast(Any, None),
         callbacks=callbacks,
     )
@@ -582,6 +675,20 @@ class _DelayedSseStream(httpx.AsyncByteStream):
         return None
 
 
+class _DelayedResponseTransport(httpx.AsyncBaseTransport):
+    def __init__(self, delay: float) -> None:
+        self._delay = delay
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        await asyncio.sleep(self._delay)
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b"data: [DONE]\n\n",
+            request=request,
+        )
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     ("events", "first_timeout", "idle_timeout", "expected_code"),
@@ -636,8 +743,218 @@ async def test_openai_sse_stream_maps_first_and_idle_timeouts(
     await http_client.aclose()
 
 
+@pytest.mark.asyncio
+async def test_openai_sse_empty_completion_maps_to_first_token_timeout() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b"data: [DONE]\n\n",
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OpenAIStreamingClient(
+        base_url="https://llm.test/v1", api_key="test", model="demo", client=http_client
+    )
+    with pytest.raises(LlmProviderError, match="llm_first_token_timeout"):
+        await adapter.stream_chat(
+            messages=[{"role": "user", "content": "x"}],
+            max_tokens=32,
+            generation_params={},
+            on_delta=lambda _: _append([], ""),
+        )
+    await http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_sse_heartbeat_cannot_extend_first_token_deadline() -> None:
+    events = [(0.005, b": keepalive\n\n")] * 20
+
+    async def handler(_: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            stream=_DelayedSseStream(events),
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OpenAIStreamingClient(
+        base_url="https://llm.test/v1",
+        api_key="test",
+        model="demo",
+        client=http_client,
+        first_token_timeout_seconds=0.02,
+        idle_timeout_seconds=0.02,
+    )
+    with pytest.raises(LlmProviderError, match="llm_first_token_timeout"):
+        await adapter.stream_chat(
+            messages=[{"role": "user", "content": "x"}],
+            max_tokens=32,
+            generation_params={},
+            on_delta=lambda _: _append([], ""),
+        )
+    await http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_sse_truncated_completion_is_rejected() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        # Some compatible endpoints send a final finish_reason but omit the
+        # protocol-level [DONE] sentinel. It is still a truncated stream.
+        event = {"choices": [{"delta": {"content": "截断"}, "finish_reason": "stop"}]}
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=f"data: {json.dumps(event)}\n\n",
+        )
+
+    http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    adapter = OpenAIStreamingClient(
+        base_url="https://llm.test/v1", api_key="test", model="demo", client=http_client
+    )
+    with pytest.raises(LlmProviderError, match="llm_stream_interrupted"):
+        await adapter.stream_chat(
+            messages=[{"role": "user", "content": "x"}],
+            max_tokens=32,
+            generation_params={},
+            on_delta=lambda _: _append([], ""),
+        )
+    await http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_sse_output_budget_rejects_oversized_delta() -> None:
+    async def handler(_: httpx.Request) -> httpx.Response:
+        event = {"choices": [{"delta": {"content": "x" * (LLM_MAX_TEXT_CHARS + 1)}}]}
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n",
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = OpenAIStreamingClient(
+            base_url="https://llm.test/v1", api_key="test", model="test", client=client
+        )
+        with pytest.raises(LlmProviderError, match="llm_output_too_large"):
+            await adapter.stream_chat(
+                messages=[], max_tokens=32, generation_params={}, on_delta=lambda _: _append([], "")
+            )
+
+
+@pytest.mark.asyncio
+async def test_openai_sse_response_headers_have_a_bounded_deadline() -> None:
+    http_client = httpx.AsyncClient(transport=_DelayedResponseTransport(0.05))
+    adapter = OpenAIStreamingClient(
+        base_url="https://llm.test/v1",
+        api_key="test",
+        model="demo",
+        client=http_client,
+        connection_timeout_seconds=0.01,
+    )
+    with pytest.raises(LlmProviderError, match="llm_provider_failed"):
+        await adapter.stream_chat(
+            messages=[{"role": "user", "content": "x"}],
+            max_tokens=32,
+            generation_params={},
+            on_delta=lambda _: _append([], ""),
+        )
+    await http_client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_openai_sse_runtime_token_budget_cannot_be_overridden() -> None:
+    seen: dict[str, Any] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            content=b'data: {"choices":[{"delta":{"content":"ok"}}]}\n\ndata: [DONE]\n\n',
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = OpenAIStreamingClient(
+            base_url="https://llm.test/v1", api_key="test", model="test", client=client
+        )
+        await adapter.stream_chat(
+            messages=[],
+            max_tokens=64,
+            generation_params={"max_tokens": 999_999, "temperature": 0.2},
+            on_delta=lambda _: _append([], ""),
+        )
+    assert seen["max_tokens"] == 64
+    assert seen["temperature"] == 0.2
+
+
 async def _append(target: list[str], value: str) -> None:
     target.append(value)
+
+
+def test_agent_history_is_bounded_to_recent_complete_entries() -> None:
+    history = [
+        {
+            "stage": "自由辩论",
+            "speaker": f"辩手 {index}",
+            "side": "AFFIRMATIVE",
+            "seat_no": 1,
+            "speaker_kind": "HUMAN",
+            "agent_profile_id": None,
+            "content": "论据" * 2_000,
+        }
+        for index in range(20)
+    ]
+    bounded, truncated = _bound_history(history)
+    assert truncated is True
+    assert bounded[0]["speaker_kind"] == "SYSTEM"
+    assert bounded[-1]["speaker"] == "辩手 19"
+    assert len(bounded) < len(history)
+
+
+@pytest.mark.asyncio
+async def test_llm_consumer_failure_preserves_tts_error_and_capture() -> None:
+    def handler(_: httpx.Request) -> httpx.Response:
+        event = {"choices": [{"delta": {"content": "正文"}}]}
+        return httpx.Response(200, content=f"data: {json.dumps(event)}\n\ndata: [DONE]\n\n")
+
+    failure = TtsProviderError("tts_parameter_invalid")
+
+    async def consume(_: str) -> None:
+        raise failure
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        adapter = OpenAIStreamingClient(
+            base_url="https://llm.test/v1", api_key="test", model="test", client=client
+        )
+        capture = ProviderCallCapture()
+        with pytest.raises(TtsProviderError) as caught:
+            await adapter.stream_chat(
+                messages=[], max_tokens=32, generation_params={}, on_delta=consume, capture=capture
+            )
+    assert caught.value is failure
+    assert capture.error_code == "provider_consumer_failed"
+    assert capture.response is not None
+    assert capture.response.payload["capture"]["error_code"] == "provider_consumer_failed"
+
+
+@pytest.mark.parametrize("legacy,corrected", QWEN_31_LEGACY_VOICE_CORRECTIONS.items())
+def test_known_unusable_voice_is_corrected_only_for_qwen_31(legacy: str, corrected: str) -> None:
+    assert effective_tts_voice("qwen-audio-3.1-tts-flash", legacy) == corrected
+    assert effective_tts_voice("qwen-audio-3.0-tts-flash", legacy) == legacy
+    with pytest.raises(ValueError, match=corrected):
+        VoiceProfileCreate(name="测试", kind="AGENT", provider_voice=legacy, avatar_key="agent-01")
+
+
+@pytest.mark.parametrize("voice", ["yuxiaoyun_v3.1", "custom-voice-id", "test-voice"])
+def test_compatible_and_custom_voices_are_preserved(voice: str) -> None:
+    assert effective_tts_voice("qwen-audio-3.1-tts-flash", voice) == voice
+    assert (
+        VoiceProfileCreate(
+            name="测试", kind="AGENT", provider_voice=voice, avatar_key="agent-01"
+        ).provider_voice
+        == voice
+    )
 
 
 class _FakeSocket:
@@ -655,6 +972,138 @@ class _FakeSocket:
 
     async def close(self) -> None:
         return None
+
+
+class _HeartbeatTtsSocket(_FakeSocket):
+    async def recv(self) -> str | bytes:
+        await asyncio.sleep(0.005)
+        task_id = json.loads(str(self.sent[0]))["header"]["task_id"]
+        return json.dumps({"header": {"task_id": task_id, "event": "heartbeat"}})
+
+
+class _HangingCloseTtsSocket(_FakeSocket):
+    async def close(self) -> None:
+        await asyncio.Event().wait()
+
+
+async def _text_chunks(text: str):
+    yield text
+
+
+async def _ignore_audio(_: bytes) -> None:
+    return
+
+
+@pytest.mark.asyncio
+async def test_tts_heartbeat_cannot_extend_task_start_deadline() -> None:
+    socket = _HeartbeatTtsSocket([])
+
+    async def factory(_: str, __: dict[str, str]) -> _HeartbeatTtsSocket:
+        return socket
+
+    adapter = QwenTtsConnection(
+        url="wss://tts.test",
+        api_key="test",
+        socket_factory=factory,
+        timeout_seconds=0.02,
+        task_timeout_seconds=0.025,
+        start_rate_limiter=TtsStartRateLimiter(interval_seconds=0),
+    )
+    with pytest.raises(TtsProviderError, match="tts_task_timeout"):
+        await adapter.synthesize(
+            _text_chunks("测试"),
+            voice="voice",
+            rate=1.0,
+            on_audio=_ignore_audio,
+        )
+
+
+@pytest.mark.asyncio
+async def test_tts_close_is_bounded_when_provider_close_hangs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    socket = _HangingCloseTtsSocket([])
+    adapter = QwenTtsConnection(url="wss://tts.test", api_key="test")
+    adapter._socket = socket
+    monkeypatch.setattr(QwenTtsConnection, "_CLOSE_TIMEOUT_SECONDS", 0.01)
+
+    await asyncio.wait_for(adapter.close(), timeout=0.2)
+
+    assert adapter._socket is None
+
+
+@pytest.mark.asyncio
+async def test_tts_audio_budget_closes_stream() -> None:
+    task_id = uuid4()
+    socket = _FakeSocket(
+        [
+            json.dumps({"header": {"task_id": str(task_id), "event": "task-started"}}),
+            b"0123456789",
+        ]
+    )
+
+    async def factory(_: str, __: dict[str, str]) -> _FakeSocket:
+        return socket
+
+    adapter = QwenTtsConnection(
+        url="wss://tts.test",
+        api_key="test",
+        socket_factory=factory,
+        max_audio_bytes=4,
+        start_rate_limiter=TtsStartRateLimiter(interval_seconds=0),
+    )
+    with pytest.raises(TtsProviderError, match="tts_audio_too_large"):
+        await adapter.synthesize(
+            _text_chunks("测试"),
+            voice="voice",
+            rate=1.0,
+            task_id=task_id,
+            on_audio=_ignore_audio,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("before_started", [True, False])
+@pytest.mark.parametrize(
+    "provider_code,expected",
+    [("InvalidParameter", "tts_parameter_invalid"), ("InternalError", "tts_provider_failed")],
+)
+async def test_tts_provider_failure_keeps_parameter_category(
+    before_started: bool, provider_code: str, expected: str
+) -> None:
+    task_id = uuid4()
+    events: list[str | bytes] = []
+    if not before_started:
+        events.append(json.dumps({"header": {"task_id": str(task_id), "event": "task-started"}}))
+    events.append(
+        json.dumps(
+            {
+                "header": {
+                    "task_id": str(task_id),
+                    "event": "task-failed",
+                    "error_code": provider_code,
+                }
+            }
+        )
+    )
+    socket = _FakeSocket(events)
+
+    async def factory(_: str, __: dict[str, str]) -> _FakeSocket:
+        return socket
+
+    async def chunks():
+        yield "测试正文"
+
+    adapter = QwenTtsConnection(url="wss://tts.test", api_key="test", socket_factory=factory)
+    with pytest.raises(TtsProviderError) as caught:
+        await adapter.synthesize(
+            chunks(),
+            voice="test",
+            rate=1,
+            task_id=task_id,
+            on_audio=lambda value: _append_bytes([], value),
+        )
+    assert caught.value.code == expected
 
 
 @pytest.mark.asyncio
@@ -714,7 +1163,7 @@ async def test_tts_start_rate_limiter_spaces_task_submissions(
         clock[0] += delay
 
     monkeypatch.setattr(tts_module, "monotonic", lambda: clock[0])
-    monkeypatch.setattr(tts_module.asyncio, "sleep", advance)
+    monkeypatch.setattr(asyncio, "sleep", advance)
     limiter = TtsStartRateLimiter(interval_seconds=0.35)
     await limiter.wait()
     await limiter.wait()
@@ -722,9 +1171,187 @@ async def test_tts_start_rate_limiter_spaces_task_submissions(
     assert clock[0] == pytest.approx(0.7)
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("chunk", ["next", None])
+async def test_tts_failure_unblocks_delta_when_text_queue_is_full(chunk: str | None) -> None:
+    callbacks = AsyncMock()
+    runtime = AgentRuntime(
+        settings=_test_settings(),
+        session_factory=cast(Any, None),
+        callbacks=callbacks,
+    )
+    run = AgentRun(
+        match_id=uuid4(),
+        action_key="1:0",
+        agent_profile_id=uuid4(),
+        duration_ms=5_000,
+        text_queue=asyncio.Queue(maxsize=agent_runtime_module.AGENT_TTS_QUEUE_SIZE),
+    )
+    assert run.text_queue is not None
+    for index in range(agent_runtime_module.AGENT_TTS_QUEUE_SIZE):
+        run.text_queue.put_nowait(str(index))
+
+    fail_tts = asyncio.Event()
+
+    async def failed_tts() -> tts_module.TtsStreamResult:
+        await fail_tts.wait()
+        raise TtsProviderError("tts_provider_failed")
+
+    run.tts_task = asyncio.create_task(failed_tts())
+    fail_tts.set()
+
+    with pytest.raises(TtsProviderError, match="tts_provider_failed"):
+        await asyncio.wait_for(runtime._enqueue_tts_text(run, chunk), timeout=0.2)
+
+    await asyncio.gather(run.tts_task, return_exceptions=True)
+
+
+@pytest.mark.asyncio
+async def test_cancel_run_discards_match_scoped_tts_connection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks = AsyncMock()
+    runtime = AgentRuntime(
+        settings=_test_settings(),
+        session_factory=cast(Any, None),
+        callbacks=callbacks,
+    )
+    match_id = uuid4()
+    run = AgentRun(
+        match_id=match_id,
+        action_key="1:0",
+        agent_profile_id=uuid4(),
+        duration_ms=5_000,
+        generation_id=uuid4(),
+    )
+    connection = AsyncMock()
+    runtime._tts_connections[match_id] = connection
+    monkeypatch.setattr(runtime, "_mark_generation_failed", AsyncMock())
+
+    await runtime._cancel_run(run)
+
+    connection.close.assert_awaited_once()
+    assert match_id not in runtime._tts_connections
+
+
+@pytest.mark.asyncio
+async def test_terminal_match_fence_rejects_late_agent_and_host_starts() -> None:
+    callbacks = AsyncMock()
+    runtime = AgentRuntime(
+        settings=_test_settings(),
+        session_factory=cast(Any, None),
+        callbacks=callbacks,
+    )
+    match_id = uuid4()
+
+    await runtime.close_match(match_id)
+    await runtime.start_agent(
+        match_id=match_id,
+        action_key="1:0",
+        agent_profile_id=uuid4(),
+        duration_ms=5_000,
+    )
+    await runtime.start_host_playback(
+        match_id=match_id,
+        action_key="2:0",
+        storage_path="host.ogg",
+        duration_ms=1_000,
+        context_version=1,
+    )
+
+    assert match_id not in runtime._runs
+    assert match_id not in runtime._host_runs
+
+
+@pytest.mark.asyncio
+async def test_agent_runtime_close_fences_new_match_starts() -> None:
+    callbacks = AsyncMock()
+    runtime = AgentRuntime(
+        settings=_test_settings(),
+        session_factory=cast(Any, None),
+        callbacks=callbacks,
+    )
+    await runtime.close()
+
+    await runtime.start_agent(
+        match_id=uuid4(),
+        action_key="1:0",
+        agent_profile_id=uuid4(),
+        duration_ms=5_000,
+    )
+
+    assert runtime._runs == {}
+
+
+@pytest.mark.asyncio
+async def test_agent_media_cleanup_bounds_stuck_native_resources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks = AsyncMock()
+    runtime = AgentRuntime(
+        settings=_test_settings(),
+        session_factory=cast(Any, None),
+        callbacks=callbacks,
+    )
+    monkeypatch.setattr(agent_runtime_module, "AGENT_RESOURCE_CLEANUP_TIMEOUT_SECONDS", 0.01)
+
+    class HangingDecoder:
+        def finish_input(self) -> None:
+            return
+
+        async def close(self) -> None:
+            await asyncio.Future()
+
+    class HangingSource:
+        def clear_queue(self) -> None:
+            return
+
+        async def aclose(self) -> None:
+            await asyncio.Future()
+
+    class HangingRoom:
+        async def disconnect(self) -> None:
+            await asyncio.Future()
+
+    run = AgentRun(
+        match_id=uuid4(),
+        action_key="1:0",
+        agent_profile_id=uuid4(),
+        duration_ms=5_000,
+        decoder=cast(Any, HangingDecoder()),
+        source=cast(Any, HangingSource()),
+        room=cast(Any, HangingRoom()),
+    )
+
+    await asyncio.wait_for(runtime._close_run(run), timeout=0.2)
+
+    assert run.decoder is None
+    assert run.source is None
+    assert run.room is None
+    # Let cancellation callbacks consume all detached close tasks.
+    await asyncio.sleep(0)
+
+    host = HostAudioRun(
+        match_id=uuid4(),
+        action_key="host:1",
+        storage_path="unused.ogg",
+        duration_ms=1_000,
+        context_version=1,
+        decoder=cast(Any, HangingDecoder()),
+        source=cast(Any, HangingSource()),
+        room=cast(Any, HangingRoom()),
+    )
+    await asyncio.wait_for(runtime._close_host_attempt(host), timeout=0.2)
+    assert host.decoder is None
+    assert host.source is None
+    assert host.room is None
+    await asyncio.sleep(0)
+
+
 def _make_ogg(path: Path) -> bytes:
     with av.open(str(path), mode="w", format="ogg") as container:
-        stream = container.add_stream("libopus", rate=48_000)
+        # PyAV's add_stream stub leaves its optional **kwargs untyped.
+        stream = container.add_stream("libopus", rate=48_000)  # pyright: ignore[reportUnknownMemberType]
         stream.layout = "mono"
         for _ in range(10):
             frame = av.AudioFrame(format="s16", layout="mono", samples=960)
@@ -759,12 +1386,54 @@ async def test_incremental_ogg_decoder_outputs_48k_mono_frames(tmp_path: Path) -
 
 
 @pytest.mark.asyncio
+async def test_host_audio_retries_once_and_reports_drained_completion(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    callbacks = AsyncMock()
+    runtime = AgentRuntime(
+        settings=_test_settings(),
+        session_factory=cast(Any, None),
+        callbacks=callbacks,
+    )
+    match_id = uuid4()
+    run = HostAudioRun(
+        match_id=match_id,
+        action_key="9:2",
+        storage_path="rules/end.ogg",
+        duration_ms=1_000,
+        context_version=7,
+    )
+    runtime._host_runs[match_id] = run
+    attempts = 0
+
+    async def play(_: HostAudioRun) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise TtsProviderError("host_audio_unavailable")
+
+    monkeypatch.setattr(runtime, "_play_host_audio", play)
+    monkeypatch.setattr(runtime, "_close_host_attempt", AsyncMock())
+
+    await runtime._run_host_with_retry(run)
+
+    assert attempts == 2
+    callbacks.host_audio_finished.assert_awaited_once()
+    envelope = callbacks.host_audio_finished.await_args.kwargs["envelope"]
+    assert envelope.match_id == match_id
+    assert envelope.generation_id == run.generation_id
+    assert envelope.context_version == 7
+    assert callbacks.host_audio_failed.await_count == 0
+    assert match_id not in runtime._host_runs
+
+
+@pytest.mark.asyncio
 async def test_truncated_agent_audio_keeps_full_llm_draft_as_official_text(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     callbacks = AsyncMock()
     runtime = AgentRuntime(
-        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        settings=_test_settings(),
         session_factory=cast(Any, None),
         callbacks=callbacks,
     )
@@ -804,7 +1473,7 @@ async def test_truncated_agent_finalization_is_bounded_when_pipeline_cleanup_sta
 ) -> None:
     callbacks = AsyncMock()
     runtime = AgentRuntime(
-        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        settings=_test_settings(),
         session_factory=cast(Any, None),
         callbacks=callbacks,
     )
@@ -856,7 +1525,7 @@ async def test_agent_finalization_failure_reports_authoritative_error(
 ) -> None:
     callbacks = AsyncMock()
     runtime = AgentRuntime(
-        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        settings=_test_settings(),
         session_factory=cast(Any, None),
         callbacks=callbacks,
     )
@@ -901,7 +1570,7 @@ async def test_agent_finalization_retries_callback_after_transient_commit_failur
     callbacks = AsyncMock()
     callbacks.finalize_agent_speech.side_effect = [RuntimeError("transient commit failure"), None]
     runtime = AgentRuntime(
-        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        settings=_test_settings(),
         session_factory=cast(Any, None),
         callbacks=callbacks,
     )
@@ -937,7 +1606,7 @@ async def test_agent_finalization_timeout_reports_authoritative_error(
 ) -> None:
     callbacks = AsyncMock()
     runtime = AgentRuntime(
-        settings=Settings(database_url="postgresql+psycopg://test:test@localhost/test"),
+        settings=_test_settings(),
         session_factory=cast(Any, None),
         callbacks=callbacks,
     )

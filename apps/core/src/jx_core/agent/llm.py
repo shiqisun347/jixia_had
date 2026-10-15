@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import AsyncExitStack
 from dataclasses import dataclass
 from time import monotonic
 from typing import Any, cast
@@ -27,6 +29,12 @@ LLM_FIRST_TOKEN_TIMEOUT_SECONDS = 10.0
 LLM_IDLE_TIMEOUT_SECONDS = 10.0
 LLM_CONNECTION_TIMEOUT_SECONDS = 10.0
 LLM_FAST_DECISION_TIMEOUT_SECONDS = 3.0
+LLM_MAX_COMPLETION_TOKENS = 32_768
+LLM_MAX_TEXT_CHARS = 256_000
+LLM_MAX_ERROR_BODY_BYTES = 64 * 1024
+LLM_CLIENT_CLOSE_TIMEOUT_SECONDS = 0.5
+
+logger = logging.getLogger("jx-core.llm")
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,15 +57,20 @@ class LlmCapacityLimiter:
     async def acquire(
         self, model_key: str, model_limit: int, timeout_seconds: float = 3.0
     ) -> tuple[asyncio.Semaphore, asyncio.Semaphore]:
-        async with self._lock:
-            model = self._models.setdefault(model_key, asyncio.Semaphore(model_limit))
         try:
-            await asyncio.wait_for(self._global.acquire(), timeout=timeout_seconds)
-            try:
-                await asyncio.wait_for(model.acquire(), timeout=timeout_seconds)
-            except Exception:
-                self._global.release()
-                raise
+            # Registry and both capacity waits share one queue budget. Busy
+            # model waiters must not reserve global slots from other models.
+            async with asyncio.timeout(timeout_seconds):
+                async with self._lock:
+                    model = self._models.setdefault(model_key, asyncio.Semaphore(model_limit))
+                await model.acquire()
+                try:
+                    await self._global.acquire()
+                except BaseException:
+                    # CancelledError is a BaseException. Return the already
+                    # acquired model slot before propagating cancellation.
+                    model.release()
+                    raise
         except TimeoutError as error:
             raise LlmProviderError("llm_capacity_full") from error
         return self._global, model
@@ -109,8 +122,10 @@ class OpenAIStreamingClient:
             "messages": messages,
             "stream": True,
             "stream_options": {"include_usage": True},
-            "max_tokens": max_tokens,
             **generation_params,
+            # Runtime duration and model capability determine the hard output
+            # budget.  Provider tuning parameters must not override it.
+            "max_tokens": min(max(1, int(max_tokens)), LLM_MAX_COMPLETION_TOKENS),
         }
         body.setdefault("enable_thinking", False)
         url = f"{self._base_url}/chat/completions"
@@ -121,58 +136,88 @@ class OpenAIStreamingClient:
                 headers={"content-type": "application/json"},
                 body=body,
             )
-        key_events: list[dict[str, Any]] = []
-        last_event: dict[str, Any] | None = None
+        key_events = capture.event_buffer() if capture is not None else []
+        consumer_error: Exception | None = None
+        first_token_deadline = started + self._first_token_timeout_seconds
+        stream_completed = False
         try:
-            async with self._client.stream(
-                "POST",
-                url,
-                headers={"Authorization": f"Bearer {self._api_key}"},
-                json=body,
-                timeout=httpx.Timeout(None, connect=self._connection_timeout_seconds),
-            ) as response:
+            # Enter the response stream under the connection budget only.  The
+            # response body has its own absolute first-token/idle deadlines;
+            # wrapping the entire stream would incorrectly cap long replies.
+            async with AsyncExitStack() as stack:
+                try:
+                    async with asyncio.timeout(self._connection_timeout_seconds):
+                        response = await stack.enter_async_context(
+                            self._client.stream(
+                                "POST",
+                                url,
+                                headers={"Authorization": f"Bearer {self._api_key}"},
+                                json=body,
+                                timeout=httpx.Timeout(
+                                    None, connect=self._connection_timeout_seconds
+                                ),
+                            )
+                        )
+                except TimeoutError as error:
+                    raise LlmProviderError("llm_provider_failed") from error
                 if capture is not None:
                     capture.provider_request_id = _provider_request_id(response.headers)
                 if response.status_code < 200 or response.status_code >= 300:
-                    if capture is not None:
-                        capture.capture_response(
-                            transport="SSE",
-                            url=url,
-                            headers=response.headers,
-                            body=_response_json_or_text(await response.aread()),
-                            events=[],
-                        )
+                    if capture is not None and capture.can_capture:
+                        try:
+                            remaining = first_token_deadline - monotonic()
+                            if remaining <= 0:
+                                raise TimeoutError
+                            async with asyncio.timeout(remaining):
+                                error_body = await _bounded_error_body(response)
+                        except TimeoutError:
+                            capture.response = unavailable_provider_payload(
+                                "provider_error_body_timeout"
+                            )
+                        else:
+                            capture.capture_response(
+                                transport="SSE",
+                                url=url,
+                                headers=response.headers,
+                                body=error_body,
+                                events=[],
+                            )
                     raise LlmProviderError("llm_provider_failed")
                 lines = response.aiter_lines()
                 text_parts: list[str] = []
+                text_length = 0
                 first_token_latency_ms: int | None = None
                 completion_tokens: int | None = None
+                last_token_at: float | None = None
                 while True:
-                    timeout = (
-                        self._first_token_timeout_seconds
-                        if first_token_latency_ms is None
-                        else self._idle_timeout_seconds
-                    )
+                    now = monotonic()
+                    if first_token_latency_ms is None:
+                        timeout = first_token_deadline - now
+                        timeout_code = "llm_first_token_timeout"
+                    else:
+                        assert last_token_at is not None
+                        timeout = self._idle_timeout_seconds - (now - last_token_at)
+                        timeout_code = "llm_stream_stalled"
+                    if timeout <= 0:
+                        raise LlmProviderError(timeout_code)
                     try:
                         line = await asyncio.wait_for(anext(lines), timeout=timeout)
                     except StopAsyncIteration:
                         break
                     except TimeoutError as error:
-                        code = (
-                            "llm_first_token_timeout"
-                            if first_token_latency_ms is None
-                            else "llm_stream_stalled"
-                        )
-                        raise LlmProviderError(code) from error
+                        raise LlmProviderError(timeout_code) from error
                     payload = _sse_payload(line)
                     if payload is None:
                         continue
                     if payload == "[DONE]":
+                        stream_completed = True
                         break
                     event = _json_event(payload)
-                    if not key_events:
-                        key_events.append(event)
-                    last_event = event
+                    if capture is not None and capture.can_capture:
+                        if len(key_events) < 2:
+                            key_events.append(event)
+                        else:
+                            key_events[1] = event
                     usage_value = event.get("usage")
                     usage = (
                         cast(dict[str, Any], usage_value) if isinstance(usage_value, dict) else {}
@@ -184,8 +229,16 @@ class OpenAIStreamingClient:
                         continue
                     if first_token_latency_ms is None:
                         first_token_latency_ms = int((monotonic() - started) * 1000)
+                    if text_length + len(delta) > LLM_MAX_TEXT_CHARS:
+                        raise LlmProviderError("llm_output_too_large")
                     text_parts.append(delta)
-                    await on_delta(delta)
+                    text_length += len(delta)
+                    last_token_at = monotonic()
+                    try:
+                        await on_delta(delta)
+                    except Exception as error:
+                        consumer_error = error
+                        raise
         except asyncio.CancelledError:
             if capture is not None and capture.response is None:
                 capture.response = unavailable_provider_payload("provider_call_cancelled")
@@ -195,11 +248,27 @@ class OpenAIStreamingClient:
                 capture.response = unavailable_provider_payload("provider_stream_failed")
             raise
         except Exception as error:
+            if error is consumer_error:
+                if capture is not None:
+                    capture.error_code = "provider_consumer_failed"
+                    if capture.response is None:
+                        capture.response = unavailable_provider_payload("provider_consumer_failed")
+                raise
             if capture is not None and capture.response is None:
                 capture.response = unavailable_provider_payload("provider_transport_failed")
             raise LlmProviderError("llm_provider_failed") from error
+        # A provider may accept the request and close an otherwise successful
+        # SSE response without sending a first token. Treat that boundary as
+        # the same bounded first-token failure as a timed-out stream so the
+        # retry and UI can explain the failure consistently.
         if first_token_latency_ms is None:
-            raise LlmProviderError("llm_provider_failed")
+            raise LlmProviderError("llm_first_token_timeout")
+        # OpenAI-compatible streams are explicitly terminated by [DONE].  A
+        # body EOF after text (including one carrying finish_reason) is a
+        # truncated provider response and must never be committed as a full
+        # Agent draft.
+        if not stream_completed:
+            raise LlmProviderError("llm_stream_interrupted")
         result = LlmStreamResult(
             text="".join(text_parts),
             first_token_latency_ms=first_token_latency_ms,
@@ -207,8 +276,6 @@ class OpenAIStreamingClient:
             completion_tokens=completion_tokens,
         )
         if capture is not None:
-            if last_event is not None and (not key_events or last_event is not key_events[-1]):
-                key_events.append(last_event)
             capture.capture_response(
                 transport="SSE",
                 url=url,
@@ -219,6 +286,43 @@ class OpenAIStreamingClient:
                 events=key_events,
             )
         return result
+
+
+def _consume_client_close(task: asyncio.Task[None]) -> None:
+    try:
+        task.exception()
+    except BaseException:
+        pass
+
+
+async def close_llm_client_bounded(client: OpenAIStreamingClient) -> None:
+    """Bound best-effort cleanup without masking a completed provider result."""
+
+    task = asyncio.create_task(client.close(), name="llm-client-close")
+    try:
+        done, _ = await asyncio.wait({task}, timeout=LLM_CLIENT_CLOSE_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        task.cancel()
+        task.add_done_callback(_consume_client_close)
+        raise
+    if not done:
+        task.cancel()
+        task.add_done_callback(_consume_client_close)
+        logger.warning(
+            "LLM client cleanup timed out",
+            extra={"error_code": "llm_client_cleanup_timeout"},
+        )
+        return
+    try:
+        task.result()
+    except BaseException as error:
+        logger.warning(
+            "LLM client cleanup failed",
+            extra={
+                "error_code": "llm_client_cleanup_failed",
+                "exception_type": type(error).__name__,
+            },
+        )
 
 
 def _provider_request_id(headers: httpx.Headers) -> str | None:
@@ -236,6 +340,17 @@ def _response_json_or_text(raw: bytes) -> Any:
         return json.loads(raw)
     except (json.JSONDecodeError, UnicodeDecodeError):
         return {"text": raw.decode("utf-8", errors="replace")}
+
+
+async def _bounded_error_body(response: httpx.Response) -> Any:
+    """Read only a small provider error body for diagnostics."""
+    buffer = bytearray()
+    async for chunk in response.aiter_bytes():
+        remaining = LLM_MAX_ERROR_BODY_BYTES - len(buffer)
+        if len(chunk) > remaining:
+            return {"truncated": True, "bytes": LLM_MAX_ERROR_BODY_BYTES}
+        buffer.extend(chunk)
+    return _response_json_or_text(bytes(buffer))
 
 
 def _sse_payload(line: str) -> str | None:
@@ -287,5 +402,6 @@ __all__ = [
     "LlmProviderError",
     "LlmStreamResult",
     "OpenAIStreamingClient",
+    "close_llm_client_bounded",
     "iter_text_queue",
 ]

@@ -28,10 +28,14 @@ function readInitialLocale(): AppLocale {
   return navigator.language.toLowerCase().startsWith('en') ? 'en' : 'zh-CN';
 }
 
+function documentTitleForLocale(locale: AppLocale) {
+  return locale === 'en' ? 'Jixia · Live Human–AI Debate' : '稷下 · 人机实时辩论实验平台';
+}
+
 function applyDocumentLocale(locale: AppLocale) {
   document.documentElement.lang = locale;
   document.documentElement.dataset.locale = locale;
-  document.title = locale === 'en' ? 'Jixia · Live Human–AI Debate' : '稷下 · 人机实时辩论实验平台';
+  document.title = documentTitleForLocale(locale);
   const description = document.querySelector<HTMLMetaElement>('meta[name="description"]');
   if (description) {
     description.content =
@@ -64,14 +68,39 @@ export function LocaleProvider({
   initialLocale,
 }: Readonly<{ children: ReactNode; initialLocale?: AppLocale }>) {
   const pathname = usePathname();
-  const [locale, setLocaleState] = useState<AppLocale>(() => initialLocale ?? readInitialLocale());
+  // Keep the first client render identical to the server render. Persisted locale
+  // is read after mount so an English preference cannot hydrate over server HTML
+  // rendered with the default Chinese locale.
+  const [locale, setLocaleState] = useState<AppLocale>(() => initialLocale ?? 'zh-CN');
   const setLocale = useCallback((nextLocale: AppLocale) => {
     window.localStorage.setItem(STORAGE_KEY, nextLocale);
     applyDocumentLocale(nextLocale);
     startTransition(() => setLocaleState(nextLocale));
   }, []);
 
-  useEffect(() => applyDocumentLocale(locale), [locale, pathname]);
+  useEffect(() => {
+    if (initialLocale) return;
+    const persistedLocale = readInitialLocale();
+    if (persistedLocale !== locale) {
+      startTransition(() => setLocaleState(persistedLocale));
+    }
+  }, [initialLocale, locale]);
+
+  useEffect(() => {
+    applyDocumentLocale(locale);
+    // Next's client head reconciliation can restore the server metadata after
+    // this effect. Reapply once after that reconciliation so a persisted locale
+    // keeps the document title and social metadata in sync after reload.
+    const timer = window.setTimeout(() => applyDocumentLocale(locale), 0);
+    const observer = new MutationObserver(() => {
+      if (document.title !== documentTitleForLocale(locale)) applyDocumentLocale(locale);
+    });
+    observer.observe(document.head, { childList: true, characterData: true, subtree: true });
+    return () => {
+      window.clearTimeout(timer);
+      observer.disconnect();
+    };
+  }, [locale, pathname]);
   const value = useMemo(() => ({ locale, setLocale }), [locale, setLocale]);
   return (
     <LocaleContext.Provider value={value}>

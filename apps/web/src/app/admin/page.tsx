@@ -146,7 +146,8 @@ export default function AdminPage() {
                   className="inline-flex items-center gap-1 font-bold text-blue-700"
                   href="/admin/matches"
                 >
-                  {t('overviewPage.viewStatus')} <ArrowRight className="size-3.5" aria-hidden="true" />
+                  {t('overviewPage.viewStatus')}{' '}
+                  <ArrowRight className="size-3.5" aria-hidden="true" />
                 </Link>
               </div>
             </div>
@@ -190,12 +191,15 @@ export default function AdminPage() {
                   </div>
                 </div>
               ) : (
-              <AdminEmpty>{t('overviewPage.noMatches')}</AdminEmpty>
+                <AdminEmpty>{t('overviewPage.noMatches')}</AdminEmpty>
               )}
             </AdminPanel>
 
             <div className="space-y-5">
-              <AdminPanel description={t('overviewPage.pendingDescription')} title={t('overviewPage.pending')}>
+              <AdminPanel
+                description={t('overviewPage.pendingDescription')}
+                title={t('overviewPage.pending')}
+              >
                 <div className="space-y-3">
                   {storagePercent >= 80 ? (
                     <AdminNotice tone="warning">
@@ -225,7 +229,10 @@ export default function AdminPage() {
                   ) : null}
                 </div>
               </AdminPanel>
-              <AdminPanel description={t('overviewPage.quickLinksDescription')} title={t('overviewPage.quickLinks')}>
+              <AdminPanel
+                description={t('overviewPage.quickLinksDescription')}
+                title={t('overviewPage.quickLinks')}
+              >
                 <div className="grid grid-cols-2 gap-2">
                   <QuickLink href="/admin/rules" icon={Bot} label="赛制" />
                   <QuickLink href="/admin/models" icon={BrainCircuit} label="模型" />

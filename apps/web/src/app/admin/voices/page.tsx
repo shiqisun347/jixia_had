@@ -38,6 +38,13 @@ export default function AdminVoicesPage() {
   const [previewing, setPreviewing] = useState('');
   const [previewUrls, setPreviewUrls] = useState<Record<string, string>>({});
   const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const syncedRuleCount = catalog.rules.filter(
+    (rule) =>
+      rule.side_size === 4 &&
+      !rule.historical_read_only &&
+      rule.status !== 'ARCHIVED' &&
+      rule.default_agent_model_profile_id,
+  ).length;
   const preview = useCallback(
     async (voice: VoiceRow) => {
       await runPreview(async () => {
@@ -174,7 +181,7 @@ export default function AdminVoicesPage() {
       },
       {
         accessorKey: 'status',
-        header: '状态',
+        header: '全局状态',
         cell: ({ row }) => (
           <div className="grid justify-items-start gap-1">
             <StatusBadge status={row.original.status} />
@@ -227,12 +234,15 @@ export default function AdminVoicesPage() {
             添加音色
           </AdminButton>
         }
-        description="统一管理主持和 Agent 音色；编辑语速或供应商标识后，旧试听会自动失效。"
+        description="启用的 Agent 音色自动同步到所有赛制；每个赛制可在 Agent 管理中独立启停。主持音色独立管理。"
         eyebrow="VOICE PROFILES"
         title="语音方案"
       />
       {error ? <AdminFeedback message={error} tone="error" /> : null}
-      <AdminPanel title="音色目录" description={`${catalog.voices.length} 个音色配置`}>
+      <AdminPanel
+        title="音色目录"
+        description={`${catalog.voices.length} 个音色配置 · Agent 音色同步至 ${syncedRuleCount} 套已配置默认模型的赛制`}
+      >
         {loading ? (
           <AdminTableSkeleton />
         ) : (
@@ -260,7 +270,11 @@ export default function AdminVoicesPage() {
       />
       <AdminConfirmDialog
         confirmLabel={statusTarget?.status === 'ENABLED' ? '确认停用' : '确认启用'}
-        description="活动比赛引用的音色由服务端保护，停用只影响后续新房间。"
+        description={
+          statusTarget?.kind === 'AGENT'
+            ? `影响 ${syncedRuleCount} 套赛制的新房间。停用音色会使对应 Agent 不可用；重新启用后保留各赛制原有启停选择。`
+            : '主持音色独立管理，活动比赛引用由服务端保护。'
+        }
         onConfirm={() => void toggleStatus(statusTarget)}
         loading={isSubmitting}
         onOpenChange={(open) => {

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from typing import Any, cast
 from unittest.mock import AsyncMock
 from uuid import uuid4
@@ -85,6 +86,91 @@ async def test_revoke_user_removes_all_socket_and_media_epochs() -> None:
     assert not any(key[1] == user_id for key in coordinator._websocket)
     assert not any(key[1] == user_id for key in coordinator._media)
     coordinator._transition.assert_awaited_once_with(match_id, user_id, 0)
+
+
+@pytest.mark.asyncio
+async def test_close_match_releases_all_in_memory_presence_state() -> None:
+    coordinator = MatchPresenceCoordinator(cast(Any, None), cast(Any, None))
+    match_id = uuid4()
+    user_id = uuid4()
+    coordinator._websocket[(match_id, user_id, 1)].add(uuid4())
+    coordinator._media[(match_id, user_id, 1)].add("sid")
+    coordinator._seen_events[match_id].add("event")
+    coordinator._online_state[(match_id, user_id)] = True
+    coordinator._announced_epoch[(match_id, user_id)] = 1
+
+    await coordinator.close_match(match_id)
+
+    assert not any(key[0] == match_id for key in coordinator._websocket)
+    assert not any(key[0] == match_id for key in coordinator._media)
+    assert not coordinator._seen_events.get(match_id)
+    assert not any(key[0] == match_id for key in coordinator._online_state)
+    assert not any(key[0] == match_id for key in coordinator._announced_epoch)
+
+
+@pytest.mark.asyncio
+async def test_late_callbacks_cannot_recreate_closed_match_presence() -> None:
+    coordinator = MatchPresenceCoordinator(cast(Any, None), cast(Any, None))
+    coordinator._transition = AsyncMock()  # type: ignore[method-assign]
+    match_id = uuid4()
+    user_id = uuid4()
+
+    await coordinator.close_match(match_id)
+    await coordinator.websocket_joined(match_id, user_id, 1, uuid4())
+    await coordinator.websocket_left(match_id, user_id, 1, uuid4())
+    await coordinator.media_event(
+        match_id=match_id,
+        user_id=user_id,
+        epoch=1,
+        sid="late-sid",
+        event_id="late-event",
+        joined=True,
+    )
+
+    assert not any(key[0] == match_id for key in coordinator._websocket)
+    assert not any(key[0] == match_id for key in coordinator._media)
+    assert match_id not in coordinator._seen_events
+    coordinator._transition.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_presence_cancellation_rolls_back_partial_presence_state() -> None:
+    coordinator = MatchPresenceCoordinator(cast(Any, None), cast(Any, None))
+    started = asyncio.Event()
+
+    async def blocked_transition(*_: Any, **__: Any) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    coordinator._transition = blocked_transition  # type: ignore[method-assign]
+    match_id = uuid4()
+    user_id = uuid4()
+    task = asyncio.create_task(
+        coordinator.websocket_joined(match_id, user_id, 1, uuid4())
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not any(key[0] == match_id for key in coordinator._websocket)
+
+    started.clear()
+    task = asyncio.create_task(
+        coordinator.media_event(
+            match_id=match_id,
+            user_id=user_id,
+            epoch=1,
+            sid="cancelled-sid",
+            event_id="cancelled-event",
+            joined=True,
+        )
+    )
+    await started.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not any(key[0] == match_id for key in coordinator._media)
+    assert not coordinator._seen_events.get(match_id)
 
 
 @pytest.mark.asyncio

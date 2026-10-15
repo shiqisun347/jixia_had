@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
 from uuid import uuid4
 
 import pytest
@@ -8,6 +9,7 @@ from jx_core.auth.errors import ERROR_DEFINITIONS, AuthError
 from jx_core.rooms.schemas import RoomCreateRequest
 from jx_core.rooms.service import (
     _room_code,
+    ensure_formal_human_agent_mix,
     ensure_supported_side_size,
     ensure_unique_agent_ids,
     normalize_room_code,
@@ -42,7 +44,7 @@ def test_unseated_debater_and_agent_capacity_errors_are_actionable() -> None:
     )
     assert ERROR_DEFINITIONS["agent_capacity_insufficient"] == (
         409,
-        "可用 Agent 数量不足，请先启用至少 8 个可用 Agent",
+        "当前成员组成所需的可用 Agent 数量不足",
     )
 
 
@@ -79,6 +81,54 @@ def test_new_room_creation_supports_only_4v4_rules() -> None:
         with pytest.raises(AuthError) as raised:
             ensure_supported_side_size(side_size)
         assert raised.value.code == "rule_unavailable"
+
+
+@pytest.mark.parametrize(
+    ("affirmative_humans", "negative_humans"),
+    [(a, n) for a in range(5) for n in range(5)],
+)
+def test_formal_4v4_allows_any_complete_member_composition(
+    affirmative_humans: int, negative_humans: int
+) -> None:
+    seats = [
+        SimpleNamespace(
+            side=side,
+            seat_no=index + 1,
+            occupant_type=kind,
+            user_id=uuid4() if kind == "HUMAN" else None,
+            agent_profile_id=uuid4() if kind == "AGENT" else None,
+        )
+        for side, count in (("AFFIRMATIVE", affirmative_humans), ("NEGATIVE", negative_humans))
+        for index, kind in enumerate(["HUMAN"] * count + ["AGENT"] * (4 - count))
+    ]
+    ensure_formal_human_agent_mix(seats)  # type: ignore[arg-type]
+
+
+def test_formal_4v4_rejects_incomplete_or_empty_seats() -> None:
+    seats = [
+        SimpleNamespace(
+            side=side, seat_no=index + 1, occupant_type="EMPTY", user_id=None, agent_profile_id=None
+        )
+        for side in ("AFFIRMATIVE", "NEGATIVE")
+        for index in range(4)
+    ]
+    with pytest.raises(AuthError) as raised:
+        ensure_formal_human_agent_mix(seats)  # type: ignore[arg-type]
+    assert raised.value.code == "room_seats_incomplete"
+
+
+def test_room_creation_exposes_composition_controls() -> None:
+    payload = {
+        "title": "测试房间",
+        "label": "训练赛",
+        "rule_id": str(uuid4()),
+        "custom_topic_title": "辩题",
+        "affirmative_text": "正方",
+        "negative_text": "反方",
+        "human_participation_terms_version": "human-participation-v1",
+        "auto_fill_agents": False,
+    }
+    assert RoomCreateRequest.model_validate(payload).auto_fill_agents is False
 
 
 def test_new_room_codes_are_numeric_and_legacy_codes_still_resolve() -> None:

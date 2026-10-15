@@ -6,6 +6,7 @@ import asyncio
 import io
 import threading
 from collections.abc import AsyncIterator
+from concurrent.futures import TimeoutError as FutureTimeoutError
 from pathlib import Path
 from typing import Protocol, cast
 
@@ -162,6 +163,7 @@ class IncrementalOpusDecoder:
         self._reader: GrowingSpool | None = None
         self._error: BaseException | None = None
         self._done = asyncio.Event()
+        self._stopping = threading.Event()
 
     async def start(self, path: Path) -> None:
         if self._thread is not None:
@@ -195,10 +197,25 @@ class IncrementalOpusDecoder:
         await self._done.wait()
 
     async def close(self) -> None:
+        self._stopping.set()
         self.finish_input()
         await self.wait_done()
         if self._reader is not None:
             self._reader.close()
+
+    def _put_pcm(self, chunk: bytes | None) -> bool:
+        assert self._loop is not None
+        if self._stopping.is_set():
+            return False
+        pending = asyncio.run_coroutine_threadsafe(self._pcm.put(chunk), self._loop)
+        while not self._stopping.is_set():
+            try:
+                pending.result(timeout=0.1)
+                return True
+            except FutureTimeoutError:
+                continue
+        pending.cancel()
+        return False
 
     def _decode(self) -> None:
         assert self._reader is not None
@@ -221,23 +238,20 @@ class IncrementalOpusDecoder:
                         while len(pending) >= frame_bytes:
                             chunk = bytes(pending[:frame_bytes])
                             del pending[:frame_bytes]
-                            asyncio.run_coroutine_threadsafe(
-                                self._pcm.put(chunk), self._loop
-                            ).result()
+                            if not self._put_pcm(chunk):
+                                return
                 for converted in resampler.resample(None):
                     samples = converted.to_ndarray()
                     if samples.ndim == 2:
                         samples = samples[0]
                     pending.extend(np.asarray(samples, dtype=np.int16).tobytes())
                 if pending:
-                    asyncio.run_coroutine_threadsafe(
-                        self._pcm.put(bytes(pending)), self._loop
-                    ).result()
+                    self._put_pcm(bytes(pending))
         except BaseException as error:
             if not isinstance(error, (KeyboardInterrupt, SystemExit)):
                 self._error = error
         finally:
-            asyncio.run_coroutine_threadsafe(self._pcm.put(None), self._loop).result()
+            self._put_pcm(None)
             self._loop.call_soon_threadsafe(self._done.set)
 
 

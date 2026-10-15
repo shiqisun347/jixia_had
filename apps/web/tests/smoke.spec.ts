@@ -44,7 +44,7 @@ test('home prototype is usable at the target desktop viewport', async ({ page })
 
   await expect(
     page.getByRole('heading', {
-      name: /让人类与 Agent，\s*在声音中交锋与共创/,
+      name: /人机共辩，\s*百家之言各得鸣/,
     }),
   ).toBeVisible();
   await expect(page.getByRole('heading', { name: '正在进行' })).toBeVisible();
@@ -126,6 +126,27 @@ test('global header keeps horizontal readable navigation in a narrow viewport', 
 
   await page.getByRole('link', { name: '比赛大厅' }).focus();
   await expect(page.getByRole('link', { name: '比赛大厅' })).toBeFocused();
+});
+
+test('persisted English locale reloads without a hydration error', async ({ page }) => {
+  const reactErrors: string[] = [];
+  page.on('console', (message) => {
+    if (
+      message.type() === 'error' &&
+      /React (?:production )?error #418|hydration/i.test(message.text())
+    ) {
+      reactErrors.push(message.text());
+    }
+  });
+
+  await page.goto('/');
+  await page.getByRole('button', { name: 'Switch to English' }).click();
+  await expect(page.getByRole('heading', { name: /Humans and AI debate/ })).toBeVisible();
+  await page.reload();
+
+  await expect(page).toHaveTitle('Jixia · Live Human–AI Debate');
+  await expect(page.locator('html')).toHaveAttribute('lang', 'en');
+  expect(reactErrors).toEqual([]);
 });
 
 test('auth shell follows the real two-row mobile header height', async ({ page }) => {

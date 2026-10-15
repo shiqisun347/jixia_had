@@ -10,7 +10,7 @@ from collections.abc import Mapping, Sequence
 from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -20,6 +20,13 @@ CAPTURE_VERSION = 1
 SERIALIZATION_VERSION = 1
 CONTENT_CHUNK_BYTES = 512 * 1024
 CONTENT_COMPRESSION_CONCURRENCY = 4
+# Provider captures are currently limited to 2 MiB per side, but content blobs
+# are also used by a few legacy call paths. Keep a larger hard ceiling for
+# compatible reads while refusing metadata that could make one load allocate
+# an unbounded amount of memory.
+MAX_CONTENT_BLOB_COMPRESSED_BYTES = 8 * 1024 * 1024
+MAX_CONTENT_BLOB_UNCOMPRESSED_BYTES = 16 * 1024 * 1024
+MAX_CONTENT_BLOB_CHUNKS = MAX_CONTENT_BLOB_COMPRESSED_BYTES // CONTENT_CHUNK_BYTES
 _compression_slots = asyncio.Semaphore(CONTENT_COMPRESSION_CONCURRENCY)
 SENSITIVE_KEYS = frozenset(
     {
@@ -127,12 +134,32 @@ async def load_content_blob(session: AsyncSession, blob_id: UUID) -> Any:
     blob = await session.get(CallContentBlob, blob_id)
     if blob is None:
         raise LookupError("call_content_blob_not_found")
+    if (
+        blob.compressed_bytes < 0
+        or blob.compressed_bytes > MAX_CONTENT_BLOB_COMPRESSED_BYTES
+        or blob.uncompressed_bytes < 0
+        or blob.uncompressed_bytes > MAX_CONTENT_BLOB_UNCOMPRESSED_BYTES
+        or blob.chunk_count <= 0
+        or blob.chunk_count > MAX_CONTENT_BLOB_CHUNKS
+    ):
+        raise ValueError("call_content_blob_too_large")
+    chunk_count, chunk_bytes = (
+        await session.execute(
+            select(
+                func.count(),
+                func.coalesce(func.sum(func.octet_length(CallContentBlobChunk.payload)), 0),
+            ).where(CallContentBlobChunk.blob_id == blob_id)
+        )
+    ).one()
+    if chunk_count != blob.chunk_count or chunk_bytes > MAX_CONTENT_BLOB_COMPRESSED_BYTES:
+        raise ValueError("call_content_blob_too_large")
     chunks = list(
         (
             await session.scalars(
                 select(CallContentBlobChunk)
                 .where(CallContentBlobChunk.blob_id == blob_id)
                 .order_by(CallContentBlobChunk.chunk_no)
+                .limit(MAX_CONTENT_BLOB_CHUNKS + 1)
             )
         ).all()
     )
@@ -141,9 +168,29 @@ async def load_content_blob(session: AsyncSession, blob_id: UUID) -> Any:
     compressed = b"".join(chunk.payload for chunk in chunks)
     if len(compressed) != blob.compressed_bytes:
         raise ValueError("call_content_blob_size_mismatch")
-    raw = zlib.decompress(compressed)
+    raw = _decompress_bounded(compressed, max_bytes=MAX_CONTENT_BLOB_UNCOMPRESSED_BYTES)
     if len(raw) != blob.uncompressed_bytes:
         raise ValueError("call_content_blob_size_mismatch")
     if hashlib.sha256(raw).hexdigest() != blob.sha256:
         raise ValueError("call_content_blob_checksum_mismatch")
     return json.loads(raw.decode("utf-8"))
+
+
+def _decompress_bounded(compressed: bytes, *, max_bytes: int) -> bytes:
+    """Decompress a zlib payload without allowing a decompression bomb."""
+
+    if max_bytes <= 0:
+        raise ValueError("call_content_blob_too_large")
+    decoder = zlib.decompressobj()
+    output = bytearray()
+    for offset in range(0, len(compressed), CONTENT_CHUNK_BYTES):
+        piece = decoder.decompress(
+            compressed[offset : offset + CONTENT_CHUNK_BYTES], max_bytes + 1 - len(output)
+        )
+        output.extend(piece)
+        if len(output) > max_bytes or decoder.unconsumed_tail:
+            raise ValueError("call_content_blob_too_large")
+    output.extend(decoder.flush(max_bytes + 1 - len(output)))
+    if len(output) > max_bytes or not decoder.eof:
+        raise ValueError("call_content_blob_too_large")
+    return bytes(output)

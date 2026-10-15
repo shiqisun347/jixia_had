@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 ROOM_RE = re.compile(r"^jx-match-([0-9a-f-]{36})$")
 IDENTITY_RE = re.compile(r"^jx-human-([0-9a-f-]{36})-([0-9a-f-]{36})-(\d+)-")
 WEBHOOK_PROCESSING_TIMEOUT_SECONDS = 5.0
+MAX_WEBHOOK_BODY_BYTES = 256 * 1024
 
 
 def _event_value(event: Any, name: str, default: str = "") -> str:
@@ -43,6 +44,24 @@ def _parse_human_identity(identity: str) -> tuple[UUID, UUID, int] | None:
     return match_id, user_id, epoch
 
 
+async def _bounded_request_body(request: Request) -> bytes | None:
+    content_length = request.headers.get("content-length")
+    if content_length is not None:
+        try:
+            if int(content_length) > MAX_WEBHOOK_BODY_BYTES:
+                return None
+        except ValueError:
+            return None
+    chunks: list[bytes] = []
+    size = 0
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_WEBHOOK_BODY_BYTES:
+            return None
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 @router.post("/api/livekit/webhook", include_in_schema=False)
 async def livekit_webhook(request: Request) -> Response:
     settings = request.app.state.settings
@@ -52,7 +71,10 @@ async def livekit_webhook(request: Request) -> Response:
     if not authorization:
         return Response(status_code=401)
     try:
-        body = (await request.body()).decode("utf-8")
+        raw_body = await _bounded_request_body(request)
+        if raw_body is None:
+            return Response(status_code=413)
+        body = raw_body.decode("utf-8")
         event = api.WebhookReceiver(
             api.TokenVerifier(
                 settings.livekit_api_key.get_secret_value(),

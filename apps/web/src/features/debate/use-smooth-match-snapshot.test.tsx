@@ -53,6 +53,33 @@ describe('smooth match timing', () => {
     expect(result.current?.speech_remaining_ms).toBe(10_000);
   });
 
+  it('expires an authoritative hand window while waiting for a delayed state event', () => {
+    vi.useFakeTimers();
+    let now = 1000;
+    vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const { result } = renderHook(() =>
+      useSmoothMatchSnapshot(
+        snapshot({
+          action_state: 'SPEECH_FINALIZING',
+          hand_window_open: true,
+          experiment_team_state: {
+            opportunity_id: 'next-opportunity',
+            opportunity_generation: 2,
+            selection_phase: 'COMPETING',
+            agent_status: 'WAITING',
+            selection_remaining_ms: 3000,
+            human_wait_remaining_ms: null,
+          },
+        }),
+      ),
+    );
+    now = 4100;
+    act(() => vi.advanceTimersByTime(3100));
+    expect(result.current?.experiment_team_state?.selection_remaining_ms).toBe(0);
+    expect(result.current?.action_state).toBe('SPEECH_FINALIZING');
+    expect(result.current?.speech_remaining_ms).toBe(10000);
+  });
+
   it('decrements the authoritative start or resume countdown without sending commands', () => {
     vi.useFakeTimers();
     let now = 10;

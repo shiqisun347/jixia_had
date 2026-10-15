@@ -30,6 +30,7 @@ logs/
 !apps/web/src/app/admin/logs/
 !apps/web/src/app/admin/logs/page.tsx
 artifacts/
+profile_output/
 *.pcm
 *.tsbuildinfo
 *.db
@@ -39,3 +40,5 @@ artifacts/
 *.opus
 *.wav
 *.flac
+# Playwright CLI output (may contain credentials)
+.playwright-cli/

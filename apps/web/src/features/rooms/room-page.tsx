@@ -378,7 +378,9 @@ export function RoomPage({
     mutationFn: async () => {
       const starting = await roomsApi.start(roomId);
       await refreshRoom(starting);
-      return matchesApi.startRuntime(roomId);
+      return starting.match_id
+        ? matchesApi.snapshot(starting.match_id)
+        : matchesApi.prepare(roomId);
     },
     onSuccess: (match) => {
       window.location.replace(`/debate?match_id=${encodeURIComponent(match.match_id)}`);
@@ -390,7 +392,8 @@ export function RoomPage({
     },
   });
   const runtimeStartMutation = useMutation({
-    mutationFn: () => matchesApi.startRuntime(roomId),
+    mutationFn: () =>
+      room?.match_id ? matchesApi.startRuntime(roomId) : matchesApi.prepare(roomId),
     onSuccess: (match) => {
       window.location.replace(`/debate?match_id=${encodeURIComponent(match.match_id)}`);
     },
@@ -603,7 +606,7 @@ export function RoomPage({
                   ? '比赛进行中'
                   : room.status === 'PAUSED'
                     ? '比赛已暂停'
-                    : '正在开赛'}
+                    : '候场中'}
               </span>
               <h1 className="mt-5 text-3xl font-black tracking-[-0.05em] text-slate-950">
                 {room.title}
@@ -635,6 +638,13 @@ export function RoomPage({
                     )}
                     作为观众进入比赛
                   </Button>
+                ) : alreadyJoined && room.match_id ? (
+                  <Link
+                    className={buttonVariants({ variant: 'primary', size: 'md' })}
+                    href={`/debate?match_id=${encodeURIComponent(room.match_id)}`}
+                  >
+                    <Radio className="size-4" /> 进入候场
+                  </Link>
                 ) : canManageRoom && !room.match_id ? (
                   <Button
                     disabled={startGate.isPending}
@@ -648,7 +658,7 @@ export function RoomPage({
                     ) : (
                       <RefreshCcw className="size-4" />
                     )}
-                    继续启动比赛
+                    进入候场
                   </Button>
                 ) : (
                   <span className="inline-flex min-h-11 items-center gap-2 rounded-xl bg-blue-50 px-4 py-2.5 text-sm font-bold text-blue-700">
@@ -688,7 +698,7 @@ export function RoomPage({
                 </span>
                 {room.experiment_mode ? (
                   <span className="rounded-md bg-blue-100 px-2.5 py-1 text-[11px] font-black text-blue-800">
-                    {isFormalExperiment ? '论文实验 · 固定席位' : '论文实验 · 训练房间'}
+                    {isFormalExperiment ? '正式赛 · 固定席位' : '正式 4v4'}
                   </span>
                 ) : null}
                 <button
@@ -747,7 +757,7 @@ export function RoomPage({
                     ) : (
                       <Play className="size-4" />
                     )}
-                    {startGate.isPending ? '正在启动' : '开始比赛'}
+                    {startGate.isPending ? '正在准备候场' : '进入候场'}
                   </Button>
                   {room.status === 'WAITING' && startBlockers[0] ? (
                     <p
@@ -961,9 +971,9 @@ export function RoomPage({
               </h2>
               <p className="mt-2 text-xs leading-5 text-slate-300">
                 {!currentMember && isFormalExperiment
-                  ? '实验席位不能临时加入，当前账号可直接进入观众席。'
+                  ? '正式赛席位不能临时加入，当前账号可直接进入观众席。'
                   : preparationFlow.activeStep === 2 && isFormalExperiment
-                    ? '席位已由实验排表固定。'
+                    ? '席位已由比赛安排固定。'
                     : `${preparationFlow.nextAction}。`}
               </p>
               {!currentMember ? (

@@ -66,7 +66,7 @@ class Settings(BaseSettings):
     asr_workspace_id: str | None = None
     tts_ws_url: str = "wss://dashscope.aliyuncs.com/api-ws/v1/inference"
     tts_api_key: SecretStr | None = None
-    tts_model: str = "qwen-audio-3.0-tts-flash"
+    tts_model: str = "qwen-audio-3.1-tts-flash"
     tts_workspace_id: str | None = None
     host_audio_storage_dir: str = "./data/host-audio"
     agent_audio_storage_dir: str = "./data/agent-audio"
@@ -74,6 +74,7 @@ class Settings(BaseSettings):
     export_storage_dir: str = "./data/exports"
     llm_key_encryption_key: SecretStr | None = None
     llm_global_concurrency: int = 50
+    provider_capture_enabled: bool = True
     diagnostic_queue_size: int = 1024
     diagnostic_batch_size: int = 50
     diagnostic_flush_interval_ms: int = 250

@@ -127,7 +127,10 @@ POSTMATCH_QUESTIONNAIRE = {
     "team_ai": {
         "q1": {
             "type": "multiple_choice",
-            "text": "在看到 AI 的实际发言之前，根据当时可见的团队状态，团队此刻需要哪些合适的行为？请选择 1–3 项。",
+            "text": (
+                "在看到 AI 的实际发言之前，根据当时可见的团队状态，"
+                "团队此刻需要哪些合适的行为？请选择 1–3 项。"
+            ),
             "max_selections": 3,
             "options": list(AI_ACCEPTABLE_ACTIONS),
         },

@@ -67,7 +67,7 @@ test('registration keeps the form and retries a failed terms request in place', 
   await page.getByLabel('真实姓名').fill('保留填写');
   const termsError = page.getByTestId('register-terms-error');
   await expect(termsError).toContainText('平台条款暂时无法加载');
-  await expect(page.getByRole('region', { name: '操作提示' }).getByRole('alert')).toHaveCount(0);
+  await expect(page.getByRole('region', { name: '连接错误' }).getByRole('alert')).toHaveCount(0);
   await expect(page.getByRole('button', { name: '创建账号' })).toBeDisabled();
   await page.getByRole('button', { name: '重新加载条款' }).click();
   await expect(termsError).toHaveCount(0);

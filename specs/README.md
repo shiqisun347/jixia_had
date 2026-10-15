@@ -2,12 +2,50 @@
 
 v2.0 的产品与架构事实来源只有根目录的 PRD、TechDesign 和实时语音 Spike。
 
+- `271-tts-voice-compatibility-recovery.md`：修复百炼 3.1 TTS 历史错误音色导致 Agent
+  恢复后无法发言，保留冻结快照并使用显式兼容映射；已实施、测试并发布，真人现场试听仍按规格边界待验收。
+
 `161`–`170` 是 v1.0 已发布或已验证的历史规格，只作为回归证据，不作为
 新增产品范围。v2.0 新规格从 `200` 开始。
 
 新规格必须在这里创建，并明确对应的版本变更、验收标准和回滚边界。
 
+- `304-match-handoff-context-and-conference-recovery.md`：已实施、复验并上线20261015-spec304-8cd36502；主持固定longanwen_v3.1、显示“龙风月瑶”。2202标准测试、发布前三场及安装后一场真实混合完整比赛通过，122安装文件与6赛制/46主持资产核验通过。五分钟运行指标正常；原审计因19条发布前既有TERMINATED记录缺结束时间未通过，备份逐项比对确证未新增，原失败及遗留风险保留。
+
+- `303-complete-flow-rtc-and-judge-contract.md`：已实施、完整复验并上线20261015-spec303-29073b57。SDK1.1.20、Agent暂停精确退役/旧回调丢弃、裁判既有评分契约；1614标准、发布前3场＋发布后1场真实媒体/实际归档及五分钟观察通过，物理/压力边界明确。
+
+- `302-asr-protocol-retirement-epoch.md`：用户明确批准后，已修复 ASR 调用退役、迟到 socket／错误／capture 及重复取消清理；并按已批准 Spec217/274 补齐 Session 回调隔离、abort 后连接恢复及旧暂停标记清理。2026-10-15标准1,564项、同场完整服务／PG至颁奖、浏览器248与Storybook94通过；用户批准正常关闭两处旧候场后已受保护发布，209安装文件及Web构建匹配、0046升级和终态元数据修复完成。实际短语音链通过，完整混合媒体QA失败且继续定位，证据见真实媒体QA报告。
+
+- `301-asr-rtc-startup-ownership.md`：ASR 局部启动资源、SDK join 独立 owner、轨道回调及取消 registry 回收，并将私有服务身份逐连接唯一化，防止迟到旧 join 挤掉恢复连接；明确批准后实施，标准1,531项与实际ASR原生三场景各两轮通过，2026-10-15随完整流程版本受保护发布。正常 close 先按 Spec274 修复并保留回滚基线；真实媒体／永久 pending 等仍独立验收。
+
+- `269-agent-provider-transient-failure-hardening.md`：对 Agent 供应商首 token 前的瞬时流中断增加有界退避、稳定错误分类和前端可操作提示；保持一次重试后暂停语义，已实施、测试并发布。
+
+- `270-bailian-access-model-selection.md`：依据百炼官方接入文档，对 OpenAI 兼容与 DashScope SSE、Qwen 3.0/3.1 Audio 及 Qwen 3.7 Flash 快照进行脱敏对比；固定文本模型快照，保留已验证的生产适配器与 3.1 音色，已实施、测试并发布。
+
+- `272-resilience-simulation-audit.md`：重复多场景、并发、故障注入及实际 Actor/Provider/PostgreSQL 恢复链测试；原40项显式采集／导出冻结探针20绿20红，批准Spec300后44项连续两轮全绿；已修复项见 Spec 273/274/217/300，真实压力待验收。
+
+- `273-provider-stream-convergence-and-release-gates.md`：修复 Provider 流心跳/截断不收敛、迁移 head 发布门禁和 React Compiler lint；实施与门禁完成，2026-10-15已受保护发布。
+- `274-context-memory-and-tts-stream-budgets.md`：上下文/TTS 硬预算、共享容量、退役清理，以及 Provider 诊断与权威事务隔离、幂等失败清理；完整异步 writer 已按批准 Spec 300 实施。补齐共享 publisher 启动所有权和 SDK join 取消保护，原生旧构件两个 self-SIGTERM 对照与候选两轮收敛留证；2026-10-15已受保护发布，永久 pending／shutdown 和真实媒体压力未关闭。
+- `299-match-fair-llm-capacity-scheduling.md`：补齐 TechDesign 的按比赛轮转和活动比赛优先调度；设计草案待批准，尚未实施，不能用 Spec 274 的共享硬上限代替该验收。
+- `300-bounded-provider-diagnostic-writes.md`：继承 Spec 214 研究采集契约，新增独立 capture 表／导出投影冻结、有界异步 writer、兼容读取、构造与字节预算、连接锁释放和关闭语义；已批准并本地实施，追加0046。最终构造补修标准回归1,378、44项故障探针连续两轮、实际PG／Core／Jobs Unicode导出及临时Linux限额补验通过；此前浏览器混合日志与同构件flagoff兼容证据保留，范围及性能局限见规格。后续尺寸计量补修32新增及当前1,457标准检查通过，七fixture配对字节证明一致；dense编码仍有同步开销。2026-10-15已随完整流程候选受保护生产发布；完整真实媒体与归档音频验收仍未闭合。
+
 ## v2.0 规格
+
+- `268-conference-staging-and-postmatch-showcase.md`：会议现场候场与二次启动、管理员应急抽屉、观众大屏，以及赛后评委点评、观众排名投票、颁奖和后台展示；同时压缩首页首屏资源并补齐静态缓存，已实施、测试并发布，真人现场完整流程仍需现场验收。
+
+- `267-host-audio-handoff-and-free-debate-continuation.md`：基础主持衔接／四辩总结切片已发布；补齐主持恢复身份、保护预算、旧计时器及挂起 PCM 控制入口、事件sequence顺序，修复自有测试夹具容量泄漏。补修于2026-10-15通过1,564标准门禁后发布；真实媒体与真人设备试听按实际证据验收。
+
+- `266-agent-provider-stall-recovery.md`：修复 Agent 取消后复用陈旧 TTS 连接，以及 TTS 失败导致 LLM 文本队列永久阻塞；已完成本地回归并发布生产。
+
+- `265-unrestricted-4v4-member-composition.md`：所有赛制恢复双方各 4 席、任意真人/Agent 比例，包含纯真人和纯 Agent；取代 Spec 261 固定 2+2 限制，拆分 Agent 能力与基础就绪，已于 2026-10-10 实施发布并通过本地与线上健康核验。
+
+- `264-rule-management-and-host-audio-lifecycle.md`：重设计赛制规则 CRUD、规则生命周期与主持音频 generation，修复音频成功后状态不汇总、TTS worker 配置静默阻塞和审核入口错置；已批准实施并于 2026-10-09 完成生产发布。2026-10-13 补齐 Jobs 当前 generation 和独立测试库回归，两轮集成通过。
+
+- `263-voice-synced-rule-agent-management.md`：补齐音色驱动的赛制 Agent 同步，独立保存各赛制启停选择；已实现、回归与独立数据库验证通过，并完成生产发布。
+
+- `261-human-4v4-match-operations.md`：收敛为双方各 2 真人 + 2 Agent 的正式比赛，新增管理员大屏展示和现场事故控制台；已完成线上发布与稳定性观察。
+
+- `260-bailian-qwen-model-voice-config.md`：切换北京百炼 `qwen3.7-flash` LLM，固定 Qwen Audio 3.1 TTS/ASR，并登记未校准备用音色；已完成。
 
 - `255-speech-control-strip-coherence.md`：修复英文 Speech 控制组因重置文案过长而在
   1280×720 下换行的问题，并统一紧凑桌面控制栏；已完成生产发布、浏览器验证和五分钟
@@ -94,7 +132,7 @@ v2.0 的产品与架构事实来源只有根目录的 PRD、TechDesign 和实时
   已修复并正式发布，完成真实 PostgreSQL 回归、两场生产自然完赛及两类问卷提交验证。
 - `230-human-asr-retry-deadline-and-survey-audit.md`：修复 ASR 错误恢复后 deadline
   幂等键复用导致 `HUMAN_SPEAKING / 0 ms` 卡死、自由辩论跨机会共享失败次数及参与者问卷
-  缺少审计的问题；规格已批准，正在实现。
+  缺少审计的问题；已实施、测试并发布，物理麦克风与无故障现场验收仍按规格边界待执行。
 - `234-human-speech-transient-query-failure.md`：真人发言收尾期间的临时查询失败保持比赛页面，
   并使真人音频文件落库幂等；已实现并完成生产发布。
 - `237-postmatch-transcript-and-finish-prompt.md`：单场赛后任务提供服务端渐进解锁的双方完整
@@ -117,3 +155,62 @@ v2.0 的产品与架构事实来源只有根目录的 PRD、TechDesign 和实时
   公开大厅与排行榜已完成本地验证，其他资源与实验工作台仍在逐页迁移，尚未发布。
 - `253-i18n-surface-completeness.md`：收敛英文模式混杂的中文 Web UI，先覆盖实时辩论页，
   再按页面域完成审计与迁移；正在实现。
+- `258-voice-reliability-simulator-expansion.md`：扩展五真人模拟器，覆盖 ASR/Agent 故障、
+  自由辩论竞态、暂停恢复矩阵、超时边界和幂等性边界；纯内存 MatchActor 验收工具已完成，
+  真实供应商、LiveKit 和物理设备仍不在模拟器验收范围。
+- `259-production-snapshot-rollback.md`：按用户授权将生产 Core/Jobs/Web 回撤至 `b3ef871`
+  论文提交快照；数据库保持 `0043`，完整 Web standalone、首页 v5 插画和服务健康检查已验证。
+- `275-terminal-room-cleanup-and-production-memory-guards.md`：终态房间清理与生产内存护栏；2026-10-15已受保护发布，终态元数据修复及Core/Jobs有效nofile限制通过，未安装未经实测定额的内存限制。
+- `276-streamed-experiment-export.md`：实验批量导出改为 SQL 流式写入 ZIP，并增加行、文件和批次总量护栏；本地实现完成，待受保护发布。
+- `277-bounded-late-experiment-opportunity-lookups.md`：迟到 Agent/ASR 回调按 source speech
+  有界查询自由辩论机会，保留旧 JSON 数据兼容条件并避免 Python 全量扫描；同时将启动时
+  终态房间校正改为集合更新；本地实现完成，待受保护发布。
+- `278-survey-admin-streaming-exports.md`：管理员个人/赛后问卷展示与导出改为 SQL 流式响应，保留原有 JSON/CSV 字段和排序；本地实现完成，待受保护发布。
+- `279-bounded-match-export-materialization.md`：研究导出单场 speeches、events、provider calls
+  与批次项查询增加 sentinel 行上限，超限失败闭环；赛后参与者列表完成风险审计，分页另立规格；
+  本地实现完成，待受保护发布。
+- `280-bounded-participant-postmatch-surveys.md`：参与者赛后问卷列表增加有界分页与游标，
+  列表默认摘要投影、详情单任务读取，批量加载比赛/席位/语音并增加每场、整页和文本预算；
+  本地实现完成，待受保护发布。
+- `281-livekit-container-preflight.md`：发布门禁兼容受控的 LiveKit Docker 容器部署；严格校验
+  容器名、running 状态和镜像前缀，保留 systemd 路径并 fail-closed；本地实现完成，待受保护发布。
+- `282-release-preflight-status-diagnostics.md`：发布预检输出非终态比赛按状态计数，保留零非终态
+  门禁并提升暂停/运行/恢复问题的现场诊断能力；本地实现完成，待受保护发布。
+- `283-terminal-state-repair-runbook.md`：新增默认只读、应用时对非终态房间/比赛
+  fail-closed 的终态时间戳和连接租约修复脚本；本地实现完成，待受保护窗口执行。
+- `284-bounded-experiment-index-pages.md`：实验批次与参与者预约接口采用每页最多 50 条的
+  稳定游标分页，预约当前页的最新 attempt 改为批量查询，旧数组响应保持兼容；本地实现完成，待受保护发布。
+- `285-bounded-annotation-task-pages.md`：参与者与专家标注任务列表采用每页最多 50 条的
+  稳定游标分页，单页关联对象改为批量查询并保留旧数组响应；本地实现完成，待受保护发布。
+- `286-bounded-experiment-postmatch-payloads.md`：实验赛后标注物料化增加聚合预检、sentinel
+  行、发言文本和冻结 JSON 逻辑字节预算，超限稳定失败并回滚事务；本地实现完成，待受保护发布。
+- `287-bounded-postmatch-audio-replay.md`：赛后音频回放对运行时快照、语音行、源文件与
+  ffmpeg 临时输出增加 sentinel、数量、字节和路径上限；本地实现完成，待受保护发布。
+- `288-annotation-response-payload-bounds.md`：在任务分页之上限制单页标注项目、答案和冻结
+  JSON 载荷，先做数据库逻辑 UTF-8 字节预检，并防止 Web 任务游标重复或无限追页；本地实现
+  完成，待受保护发布。
+- `289-bounded-postmatch-audio-cleanup.md`：修复赛后 ffmpeg 取消后的子进程残留，按 JSON
+  逻辑字节限制运行时快照，校验主持/辩手音频可信根，并将输入预算对齐可配置的 90 分钟
+  规则上限；本地实现完成，待受保护发布。
+- `290-annotation-request-payload-bounds.md`：限制参与者标注答案请求的键数量和逻辑 JSON
+  字节，避免超大 POST 进入事务；本地实现完成，待受保护发布。
+- `291-bounded-experiment-history-aggregation.md`：为批次/预约兼容 helper 与 Web 全量便利层
+  增加页数、条数、JSON 字节和响应形状护栏；重复或不前进游标 fail-closed，不静默截断历史；
+  本地实现完成，待受保护发布。
+- `292-web-annotation-history-aggregation-guard.md`：为 Web 参与者/专家标注任务的四页自动聚合
+  增加数组响应校验、累计 100 条任务和 64 MiB UTF-8 JSON 预算；超限或异常响应 fail-closed，
+  不返回部分历史；本地实现完成，待受保护发布。
+- `293-bounded-annotation-history-helpers.md`：为 Core 参与者/专家标注历史兼容 helper
+  增加 200 页/10,000 条聚合上限，并校验降序游标重复与不前进；超限或异常游标不返回部分
+  历史；本地实现完成，待受保护发布。
+- `294-history-cursor-and-questionnaire-budget-guard.md`：为 Core 批次/预约兼容 helper 增加
+  解码后的游标单调性校验，并在参与者标注预检中计入问卷 `q6` UTF-8 字节；本地实现完成，
+  待受保护发布。
+- `295-runtime-cgroup-telemetry-audit.md`：只读审计 Core/Jobs cgroup 当前/峰值内存、swap、
+  `oom_kill` 与 pids，区分 systemd nofile hard/soft 和进程实际限制；本地实现完成，待受保护发布。
+- `296-runtime-guard-path-hardening.md`：cgroup 符号链接循环、路径解析和越界异常统一降级为
+  `unavailable`；本地实现完成，待受保护发布。
+- `297-resume-agent-decision-fence.md`：Agent 发言暂停恢复时清除旧决策轮次与手队列，并将
+  原先伪通过的 Bug 4 模拟改为真实断言；本地实现完成，待受保护发布。
+- `298-nonterminal-room-release-gate.md`：发布预检统计并阻断 `WAITING/PAUSED` 等非终态房间，
+  避免只看比赛状态而遗漏房间级实时连接，真实 shell 行为回归覆盖字段异常拒绝放行；本地实现完成，待受保护发布。

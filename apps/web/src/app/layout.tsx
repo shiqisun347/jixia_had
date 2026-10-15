@@ -10,13 +10,13 @@ import './globals.css';
 
 export const metadata: Metadata = {
   title: {
-    default: '稷下 · 人机实时辩论实验平台',
+    default: '稷下 · 人机实时辩论赛',
     template: '%s · 稷下',
   },
-  description: '让人类与 Agent 在声音中交锋与共创的实时辩论实验平台。',
+  description: '四名真人辩手与四名 Agent 的实时语音辩论赛。',
   openGraph: {
-    title: '稷下 · 人机实时辩论实验平台',
-    description: '让人类与 Agent 在声音中交锋与共创的实时辩论实验平台。',
+    title: '稷下 · 人机实时辩论赛',
+    description: '四名真人辩手与四名 Agent 的实时语音辩论赛。',
   },
 };
 

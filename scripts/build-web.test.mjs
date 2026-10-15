@@ -8,7 +8,7 @@ import {
   assertNoCssOptimizerWarnings,
   assertOwnedNextOutput,
   assertHomeBundleBoundary,
-  assertQuestionnaireSurface,
+  assertPublicResearchSurface,
   assertStaticArtifactIntegrity,
   assertStandaloneCoreOrigin,
   cleanNextOutput,
@@ -140,7 +140,7 @@ test('home bundle guard rejects debate runtime code in initial scripts', () => {
   }
 });
 
-test('production build contains both questionnaire routes and profile links', () => {
+test('production build keeps historical questionnaire routes but hides research links', () => {
   const directory = mkdtempSync(join(tmpdir(), 'jx-web-questionnaire-surface-'));
   const webRoot = join(directory, 'apps/web');
   mkdirSync(join(webRoot, '.next/server/chunks'), { recursive: true });
@@ -153,15 +153,15 @@ test('production build contains both questionnaire routes and profile links', ()
   );
   writeFileSync(
     join(webRoot, '.next/server/chunks/me.js'),
-    'apps_web_src_features_auth_me-page AI 辩论感受 赛后问卷',
+    'apps_web_src_features_auth_me-page 比赛记录',
   );
   try {
-    assert.doesNotThrow(() => assertQuestionnaireSurface(webRoot));
+    assert.doesNotThrow(() => assertPublicResearchSurface(webRoot));
     writeFileSync(
       join(webRoot, '.next/server/chunks/me.js'),
-      'apps_web_src_features_auth_me-page AI 辩论感受',
+      'apps_web_src_features_auth_me-page 赛后问卷',
     );
-    assert.throws(() => assertQuestionnaireSurface(webRoot), /post-match survey link/);
+    assert.throws(() => assertPublicResearchSurface(webRoot), /paper questionnaire links/);
   } finally {
     rmSync(directory, { force: true, recursive: true });
   }

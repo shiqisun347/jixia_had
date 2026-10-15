@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { cleanup } from '@testing-library/react';
 
@@ -25,7 +25,12 @@ describe('LocaleProvider', () => {
   });
 
   it('defaults to Chinese and persists an explicit English choice without navigation', () => {
-    render(<LocaleProvider><LocaleSwitcher /><Probe /></LocaleProvider>);
+    render(
+      <LocaleProvider>
+        <LocaleSwitcher />
+        <Probe />
+      </LocaleProvider>,
+    );
 
     expect(screen.getByText('首页')).toBeVisible();
     fireEvent.click(screen.getByRole('button', { name: 'Switch to English' }));
@@ -33,20 +38,31 @@ describe('LocaleProvider', () => {
     expect(screen.getByText('Home')).toBeVisible();
     expect(document.documentElement.lang).toBe('en');
     expect(window.localStorage.getItem('jx.locale.v1')).toBe('en');
-    expect(screen.getByRole('button', { name: 'Switch to English' })).toHaveAttribute('aria-pressed', 'true');
+    expect(screen.getByRole('button', { name: 'Switch to English' })).toHaveAttribute(
+      'aria-pressed',
+      'true',
+    );
   });
 
-  it('uses the persisted locale on a later mount', () => {
+  it('uses the persisted locale on a later mount', async () => {
     window.localStorage.setItem('jx.locale.v1', 'en');
-    render(<LocaleProvider><Probe /></LocaleProvider>);
-    expect(screen.getByText('Home')).toBeVisible();
-    expect(document.documentElement.lang).toBe('en');
+    render(
+      <LocaleProvider>
+        <Probe />
+      </LocaleProvider>,
+    );
+    await waitFor(() => expect(screen.getByText('Home')).toBeVisible());
+    await waitFor(() => expect(document.documentElement.lang).toBe('en'));
   });
 
-  it('uses English only when the browser language requests English', () => {
+  it('uses English only when the browser language requests English', async () => {
     Object.defineProperty(window.navigator, 'language', { configurable: true, value: 'en-GB' });
-    render(<LocaleProvider><Probe /></LocaleProvider>);
-    expect(screen.getByText('Home')).toBeVisible();
-    expect(document.documentElement.lang).toBe('en');
+    render(
+      <LocaleProvider>
+        <Probe />
+      </LocaleProvider>,
+    );
+    await waitFor(() => expect(screen.getByText('Home')).toBeVisible());
+    await waitFor(() => expect(document.documentElement.lang).toBe('en'));
   });
 });

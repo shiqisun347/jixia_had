@@ -233,18 +233,29 @@ async def probe_asr(pcm: bytes, database: Database | None = None) -> dict[str, A
         on_capture=on_capture,
     )
     task = asyncio.create_task(session.run(), name="provider-probe-asr")
+    feeder: asyncio.Task[None] | None = None
     started = monotonic()
     try:
+        async def feed_audio() -> None:
+            for offset in range(0, len(pcm), 3_200):
+                session.feed_pcm(pcm[offset : offset + 3_200])
+                await asyncio.sleep(0.1)
+            await session.finish()
+
+        # `AsrSpeechSession.run()` waits for its first queued frame before it
+        # can set the ready event. Feed in a concurrent task so the probe does
+        # not deadlock waiting for readiness before sending any audio.
+        feeder = asyncio.create_task(feed_audio(), name="provider-probe-asr-feed")
         await session.wait_ready()
-        for offset in range(0, len(pcm), 3_200):
-            session.feed_pcm(pcm[offset : offset + 3_200])
-            await asyncio.sleep(0.1)
-        await session.finish()
+        await feeder
         result = await task
     except Exception as caught:
         error = caught
         raise
     finally:
+        if feeder is not None and not feeder.done():
+            feeder.cancel()
+            await asyncio.gather(feeder, return_exceptions=True)
         if not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -488,10 +499,18 @@ async def run_load(
     llm_results = await asyncio.gather(
         *[_measure(lambda: probe_llm(material, database)) for _ in range(llm_count)]
     )
-    livekit_results = await asyncio.gather(*[_measure(probe_livekit) for _ in range(livekit_count)])
+    # The LiveKit Python binding owns a process-wide Rust Tokio runtime.  Its
+    # native destructor aborts when several Room handles are torn down at the
+    # same time, even though all connect/disconnect calls report success. Keep
+    # this provider probe sequential for deterministic, non-aborting cleanup;
+    # the application itself still handles rooms concurrently in its service
+    # process.
+    livekit_results: list[tuple[bool, int, str | None]] = []
+    for _ in range(livekit_count):
+        livekit_results.append(await _measure(probe_livekit))
     return {
         "probe_version": "2",
-        "mode": "concurrent_load",
+        "mode": "mixed_load_livekit_serial_cleanup",
         "tts": summarize_latencies(list(tts_results)),
         "asr": summarize_latencies(list(asr_results)),
         "llm": summarize_latencies(list(llm_results)),

@@ -21,40 +21,14 @@ from .models import (
     BulkJobItem,
     Match,
     ModelProfile,
-    Rule,
     Topic,
     User,
     VoiceProfile,
 )
+from .rules.agent_pool import lock_agent_pool, sync_agent_pools
 from .rules.service import CatalogService
 
 router = APIRouter(prefix="/api/admin", tags=["admin-bulk"])
-
-
-async def _sync_voice_agents(session: AsyncSession, voice_id: UUID, status: str) -> None:
-    agents = list(
-        (
-            await session.scalars(
-                select(AgentProfile)
-                .where(
-                    AgentProfile.voice_profile_id == voice_id,
-                    AgentProfile.rule_id.is_not(None),
-                )
-                .with_for_update()
-            )
-        ).all()
-    )
-    for agent in agents:
-        agent.status = status
-    rule_ids = {agent.rule_id for agent in agents if agent.rule_id is not None}
-    if rule_ids:
-        rules = list(
-            (
-                await session.scalars(select(Rule).where(Rule.id.in_(rule_ids)).with_for_update())
-            ).all()
-        )
-        for rule in rules:
-            rule.config_revision += 1
 
 
 class BulkRequest(BaseModel):
@@ -136,6 +110,7 @@ async def create_bulk(
 ) -> dict[str, Any]:
     model = _resource_model(payload.resource)
     unique_ids = list(dict.fromkeys(payload.target_ids))
+    await lock_agent_pool(session)
     rows = list(
         (
             await session.scalars(select(model).where(model.id.in_(unique_ids)).with_for_update())
@@ -244,7 +219,9 @@ async def create_bulk(
             else:
                 row.status = "DISABLED"
                 if payload.resource == "voice":
-                    await _sync_voice_agents(session, target_id, "DISABLED")
+                    await sync_agent_pools(
+                        session, voice_id=target_id, actor_user_id=auth.user_id, refresh_voice=True
+                    )
                 item.status = "SUCCEEDED"
                 succeeded += 1
         elif payload.resource == "voice" and payload.operation == "DELETE":
@@ -269,7 +246,9 @@ async def create_bulk(
                     else ("DISABLED" if payload.operation == "DISABLE" else "ENABLED")
                 )
                 if payload.resource == "voice":
-                    await _sync_voice_agents(session, target_id, str(row.status))
+                    await sync_agent_pools(
+                        session, voice_id=target_id, actor_user_id=auth.user_id, refresh_voice=True
+                    )
             elif payload.operation == "DELETE":
                 await session.delete(row)
             item.status = "SUCCEEDED"

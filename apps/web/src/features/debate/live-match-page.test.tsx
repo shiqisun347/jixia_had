@@ -15,29 +15,22 @@ import {
 import { resolveCurrentSeat } from './match-presentation';
 import { matchSocketErrorText, newestMatchSnapshot } from './use-match-runtime';
 
-describe('experiment match controls', () => {
+describe('match controls', () => {
   const baseRoom = {
     organizer_user_id: 'affirmative-first',
     experiment_mode: true,
     viewer_is_experiment_controller: false,
   } as unknown as RoomSnapshot;
 
-  it('allows both side controllers and an administrator who entered to control', () => {
+  it('allows the organizer and administrators to control', () => {
     expect(canManageMatch(baseRoom, 'affirmative-first', 'USER')).toBe(true);
-    expect(
-      canManageMatch(
-        { ...baseRoom, viewer_is_experiment_controller: true },
-        'negative-controller',
-        'USER',
-      ),
-    ).toBe(true);
     expect(canManageMatch(baseRoom, 'admin-viewer', 'ADMIN')).toBe(true);
   });
 
-  it('does not elevate ordinary viewers or administrators in ordinary rooms', () => {
+  it('does not elevate ordinary viewers', () => {
     expect(canManageMatch(baseRoom, 'ordinary-viewer', 'USER')).toBe(false);
     expect(canManageMatch({ ...baseRoom, experiment_mode: false }, 'ordinary-admin', 'ADMIN')).toBe(
-      false,
+      true,
     );
   });
 });
@@ -47,7 +40,8 @@ describe('live match completion presentation', () => {
     const presentation = actionLabel('MATCH_FINISHED');
 
     expect(presentation.title).toBe('本场辩论已完成');
-    expect(presentation.detail).toContain('完整文字记录已经归档');
+    expect(presentation.detail).toContain('查看整理与评分进度');
+    expect(presentation.detail).not.toContain('已经归档');
     expect(presentation.detail).not.toContain('后续切片');
   });
 

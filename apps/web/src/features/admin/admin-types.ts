@@ -1,3 +1,8 @@
+import type { components } from '@jx/contracts';
+
+export type MatchControlRequest = components['schemas']['MatchControlRequest'];
+export type MatchControlTarget = components['schemas']['MatchControlTargetResponse'];
+
 export type UserRow = {
   id: string;
   username: string;
@@ -228,20 +233,12 @@ export type VoiceRow = {
   status: string;
 };
 
-export type AgentRow = {
-  id: string;
-  format_version_id?: string | null;
-  rule_id?: string | null;
-  name: string;
-  model_profile_id: string;
-  voice_profile_id: string;
-  system_prompt?: string;
-  debater_prompt?: string;
-  generation_params?: Record<string, unknown>;
-  avatar_key?: string;
-  status: string;
-  prompt_override_count?: number;
-};
+type AgentContract = components['schemas']['AgentProfileResponse'];
+export type AgentRow = Pick<
+  AgentContract,
+  'id' | 'name' | 'model_profile_id' | 'voice_profile_id' | 'status'
+> &
+  Partial<Omit<AgentContract, 'id' | 'name' | 'model_profile_id' | 'voice_profile_id' | 'status'>>;
 
 export type TopicRow = {
   id: string;
@@ -255,13 +252,24 @@ export type TopicRow = {
   status: string;
 };
 
-export type RuleRow = {
+export type RuleRow = Partial<
+  Pick<
+    components['schemas']['RuleResponse'],
+    | 'readiness'
+    | 'blockers'
+    | 'available_agent_count'
+    | 'pure_agent_available'
+    | 'pure_human_available'
+  >
+> & {
   id: string;
   name: string;
   description: string;
   side_size: number;
   estimated_seconds: number;
   status: string;
+  lifecycle_status?: string;
+  current_audio_generation_id?: string | null;
   audio_reviewed_at: string | null;
   host_voice_profile_id: string | null;
   default_agent_model_profile_id: string | null;

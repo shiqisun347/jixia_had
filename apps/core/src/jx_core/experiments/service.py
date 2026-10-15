@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import csv
 import io
+import json
 import secrets
+from collections.abc import Sequence
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, cast
 from uuid import UUID
 
-from sqlalchemy import Select, delete, func, select
+from sqlalchemy import Select, Text, and_, delete, func, or_, select
+from sqlalchemy import cast as sa_cast
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from ..audit.service import AuditService
 from ..auth.errors import APIError, AuthError
@@ -35,6 +41,7 @@ from ..models import (
     FreeDebateOpportunity,
     Match,
     MatchQuestionnaire,
+    ModelProfile,
     ParticipantAnnotationAnswer,
     ParticipantAnnotationItem,
     ParticipantAnnotationTask,
@@ -49,6 +56,7 @@ from ..models import (
     Topic,
     User,
     UserConsent,
+    VoiceProfile,
 )
 from ..rooms.service import RoomService
 from ..survey_definitions import (
@@ -139,6 +147,24 @@ def _context_query() -> Select[tuple[ExperimentMatchAttempt, ScheduledMatch, Exp
 
 
 class ExperimentService:
+    EXPERIMENT_PAGE_DEFAULT = 50
+    EXPERIMENT_PAGE_MAX = 50
+    # HTTP callers can continue through the cursor page by page.  These limits
+    # only protect the legacy complete-array compatibility helpers from
+    # retaining an unbounded history or following a broken unique cursor.
+    EXPERIMENT_HISTORY_MAX_PAGES = 200
+    EXPERIMENT_HISTORY_MAX_ROWS = 10_000
+    # Annotation pages are intentionally smaller than the index pages.  A
+    # task carries nested transcript/context JSON, so the task count alone is
+    # not a sufficient memory bound.
+    ANNOTATION_PAGE_DEFAULT = 25
+    ANNOTATION_PAGE_MAX = 50
+    ANNOTATION_MAX_ITEMS_PER_TASK = 512
+    ANNOTATION_MAX_ANSWERS_PER_TASK = 2_048
+    ANNOTATION_MAX_TASK_PAYLOAD_BYTES = 8 * 1024 * 1024
+    ANNOTATION_MAX_PAGE_PAYLOAD_BYTES = 64 * 1024 * 1024
+    ANNOTATION_MAX_AUDIO_AUTH_ROWS = 4_096
+    ANNOTATION_MAX_AUDIO_AUTH_BYTES = 64 * 1024 * 1024
     _DEFAULT_ACCOUNT_PASSWORD = "Jixia2026"
     _HUMAN_PRIMARY_REASONS = set(HUMAN_PRIMARY_REASONS)
     _HUMAN_GOALS = set(HUMAN_GOALS)
@@ -207,6 +233,158 @@ class ExperimentService:
         "让出机会",
         "其他",
     }
+
+    @classmethod
+    def _page_limit(cls, value: int) -> int:
+        if value < 1 or value > cls.EXPERIMENT_PAGE_MAX:
+            raise APIError("experiment_query_invalid")
+        return value
+
+    @staticmethod
+    def _validate_annotation_history_cursor(
+        previous: tuple[datetime, UUID] | None,
+        next_cursor: tuple[datetime, UUID],
+        seen: set[tuple[datetime, UUID]],
+    ) -> None:
+        """Reject cursor loops and cursors that do not move through the sort order.
+
+        Annotation task pages are ordered by ``created_at DESC, id DESC``.  A
+        compatibility helper must therefore receive a strictly older cursor on
+        every page.  Checking this before retaining the next page prevents a
+        broken page implementation from relying on the global page cap to
+        eventually fail.
+        """
+
+        if next_cursor in seen or next_cursor == previous:
+            raise APIError("experiment_query_invalid")
+        if previous is not None and next_cursor >= previous:
+            raise APIError("experiment_query_invalid")
+
+    @staticmethod
+    def _encode_batch_cursor(row: ExperimentBatch) -> str:
+        payload = f"{row.created_at.isoformat()}|{row.id}"
+        return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+    @staticmethod
+    def _decode_batch_cursor(value: str) -> tuple[datetime, UUID]:
+        try:
+            padded = value + "=" * (-len(value) % 4)
+            timestamp, row_id = base64.urlsafe_b64decode(padded).decode().rsplit("|", 1)
+            created_at = datetime.fromisoformat(timestamp)
+            if created_at.tzinfo is None:
+                raise ValueError
+            return created_at, UUID(row_id)
+        except (ValueError, UnicodeDecodeError, binascii.Error):
+            raise APIError("experiment_query_invalid") from None
+
+    @staticmethod
+    def _encode_appointment_cursor(row: ScheduledMatch) -> str:
+        payload = json.dumps(
+            {
+                "scheduled_at": row.scheduled_at.isoformat() if row.scheduled_at else None,
+                "round_no": row.round_no,
+                "match_no": row.match_no,
+                "id": str(row.id),
+            },
+            separators=(",", ":"),
+        )
+        return base64.urlsafe_b64encode(payload.encode()).decode().rstrip("=")
+
+    @staticmethod
+    def _decode_appointment_cursor(value: str) -> tuple[datetime | None, int, int, UUID]:
+        try:
+            padded = value + "=" * (-len(value) % 4)
+            decoded = json.loads(base64.urlsafe_b64decode(padded).decode())
+            if not isinstance(decoded, dict):
+                raise ValueError
+            raw = cast(dict[str, Any], decoded)
+            scheduled_at_raw = raw.get("scheduled_at")
+            scheduled_at = (
+                datetime.fromisoformat(str(scheduled_at_raw))
+                if scheduled_at_raw is not None
+                else None
+            )
+            if scheduled_at is not None and scheduled_at.tzinfo is None:
+                raise ValueError
+            round_no = int(str(raw["round_no"]))
+            match_no = int(str(raw["match_no"]))
+            row_id = UUID(str(raw["id"]))
+            if round_no < 1 or match_no < 1:
+                raise ValueError
+            return scheduled_at, round_no, match_no, row_id
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            UnicodeDecodeError,
+            binascii.Error,
+            json.JSONDecodeError,
+        ):
+            raise APIError("experiment_query_invalid") from None
+
+    @classmethod
+    def _validate_batch_history_cursor(
+        cls,
+        previous: tuple[datetime, UUID] | None,
+        encoded: str,
+        seen: set[tuple[datetime, UUID]],
+    ) -> tuple[datetime, UUID]:
+        """Decode and validate a batch cursor before retaining another page.
+
+        list_batches_page orders by created_at DESC, id ASC. A compatibility
+        helper must therefore receive a cursor that is strictly older in that
+        same order. Validating the decoded tuple, rather than only the opaque
+        string, also rejects the same cursor encoded with different optional
+        padding.
+        """
+
+        next_cursor = cls._decode_batch_cursor(encoded)
+        if next_cursor in seen or (
+            previous is not None
+            and not (
+                next_cursor[0] < previous[0]
+                or (next_cursor[0] == previous[0] and next_cursor[1] > previous[1])
+            )
+        ):
+            raise APIError("experiment_query_invalid")
+        return next_cursor
+
+    @classmethod
+    def _validate_appointment_history_cursor(
+        cls,
+        previous: tuple[datetime | None, int, int, UUID] | None,
+        encoded: str,
+        seen: set[tuple[datetime | None, int, int, UUID]],
+    ) -> tuple[datetime | None, int, int, UUID]:
+        """Decode and validate an appointment cursor in query sort order.
+
+        Appointments are ordered by scheduled_at ASC NULLS LAST followed by
+        round_no, match_no, id ascending. The null branch is kept explicit
+        because Python cannot compare None and datetimes.
+        """
+
+        next_cursor = cls._decode_appointment_cursor(encoded)
+        if next_cursor in seen:
+            raise APIError("experiment_query_invalid")
+        if previous is not None:
+            previous_at, previous_round, previous_match, previous_id = previous
+            next_at, next_round, next_match, next_id = next_cursor
+            previous_slot = (previous_round, previous_match, previous_id)
+            next_slot = (next_round, next_match, next_id)
+            if previous_at is None:
+                progressed = next_at is None and next_slot > previous_slot
+            elif next_at is None:
+                # NULL values are last in the SQL ordering.
+                progressed = True
+            elif next_at > previous_at:
+                progressed = True
+            elif next_at == previous_at:
+                progressed = next_slot > previous_slot
+            else:
+                progressed = False
+            if not progressed:
+                raise APIError("experiment_query_invalid")
+        return next_cursor
 
     async def generate_anonymous_accounts(
         self, session: AsyncSession, *, actor_user_id: UUID
@@ -479,7 +657,14 @@ class ExperimentService:
             agents = list(
                 (
                     await session.scalars(
-                        select(AgentProfile).where(AgentProfile.id.in_(agent_ids))
+                        select(AgentProfile)
+                        .join(ModelProfile, ModelProfile.id == AgentProfile.model_profile_id)
+                        .join(VoiceProfile, VoiceProfile.id == AgentProfile.voice_profile_id)
+                        .where(
+                            AgentProfile.id.in_(agent_ids),
+                            ModelProfile.status == "ENABLED",
+                            VoiceProfile.status == "ENABLED",
+                        )
                     )
                 ).all()
             )
@@ -1239,52 +1424,168 @@ class ExperimentService:
                 id=batch.id, status="DISABLED", disabled_at=disabled_at
             )
 
+    async def list_appointments_page(
+        self,
+        session: AsyncSession,
+        *,
+        user_id: UUID,
+        limit: int = EXPERIMENT_PAGE_DEFAULT,
+        cursor: str | None = None,
+    ) -> tuple[list[ExperimentAppointmentResponse], str | None]:
+        page_limit = self._page_limit(limit)
+        filters = [
+            ScheduledSeat.user_id == user_id,
+            ScheduledSeat.occupant_kind == "HUMAN",
+            ExperimentBatch.status == "PUBLISHED",
+        ]
+        if cursor:
+            cursor_at, cursor_round, cursor_match, cursor_id = self._decode_appointment_cursor(
+                cursor
+            )
+            after_slot = or_(
+                ScheduledMatch.round_no > cursor_round,
+                and_(
+                    ScheduledMatch.round_no == cursor_round,
+                    ScheduledMatch.match_no > cursor_match,
+                ),
+                and_(
+                    ScheduledMatch.round_no == cursor_round,
+                    ScheduledMatch.match_no == cursor_match,
+                    ScheduledMatch.id > cursor_id,
+                ),
+            )
+            if cursor_at is None:
+                filters.append(ScheduledMatch.scheduled_at.is_(None) & after_slot)
+            else:
+                filters.append(
+                    or_(
+                        ScheduledMatch.scheduled_at.is_(None),
+                        ScheduledMatch.scheduled_at > cursor_at,
+                        and_(ScheduledMatch.scheduled_at == cursor_at, after_slot),
+                    )
+                )
+        rows = list(
+            (
+                await session.execute(
+                    select(ScheduledMatch, ScheduledSeat, ExperimentBatch)
+                    .options(
+                        load_only(
+                            ScheduledMatch.id,
+                            ScheduledMatch.round_no,
+                            ScheduledMatch.match_no,
+                            ScheduledMatch.topic_id,
+                            ScheduledMatch.scheduled_at,
+                            ScheduledMatch.kind,
+                            ScheduledMatch.status,
+                        ),
+                        load_only(ScheduledSeat.side, ScheduledSeat.seat_no),
+                        load_only(ExperimentBatch.id, ExperimentBatch.title),
+                    )
+                    .join(ScheduledSeat, ScheduledSeat.scheduled_match_id == ScheduledMatch.id)
+                    .join(ExperimentBatch, ExperimentBatch.id == ScheduledMatch.batch_id)
+                    .where(*filters)
+                    .order_by(
+                        ScheduledMatch.scheduled_at.asc().nulls_last(),
+                        ScheduledMatch.round_no,
+                        ScheduledMatch.match_no,
+                        ScheduledMatch.id,
+                    )
+                    .limit(page_limit + 1)
+                )
+            ).all()
+        )
+        has_more = len(rows) > page_limit
+        rows = rows[:page_limit]
+        scheduled_ids = [scheduled.id for scheduled, _, _ in rows]
+        latest_attempt_by_schedule: dict[UUID, ExperimentMatchAttempt] = {}
+        if scheduled_ids:
+            latest_attempt_numbers = (
+                select(
+                    ExperimentMatchAttempt.scheduled_match_id.label("scheduled_match_id"),
+                    func.max(ExperimentMatchAttempt.attempt_no).label("attempt_no"),
+                )
+                .where(ExperimentMatchAttempt.scheduled_match_id.in_(scheduled_ids))
+                .group_by(ExperimentMatchAttempt.scheduled_match_id)
+                .subquery()
+            )
+            attempt_rows = (
+                await session.scalars(
+                    select(ExperimentMatchAttempt).join(
+                        latest_attempt_numbers,
+                        and_(
+                            ExperimentMatchAttempt.scheduled_match_id
+                            == latest_attempt_numbers.c.scheduled_match_id,
+                            ExperimentMatchAttempt.attempt_no
+                            == latest_attempt_numbers.c.attempt_no,
+                        ),
+                    )
+                )
+            ).all()
+            for attempt in attempt_rows:
+                latest_attempt_by_schedule.setdefault(attempt.scheduled_match_id, attempt)
+        responses = [
+            ExperimentAppointmentResponse(
+                scheduled_match_id=scheduled.id,
+                batch_id=batch.id,
+                batch_title=batch.title,
+                round_no=scheduled.round_no,
+                match_no=scheduled.match_no,
+                topic_id=scheduled.topic_id,
+                scheduled_at=scheduled.scheduled_at,
+                kind=cast(Literal["FORMAL", "TRAINING"], scheduled.kind),
+                status=scheduled.status,
+                side=cast(Literal["AFFIRMATIVE", "NEGATIVE"], seat.side),
+                seat_no=seat.seat_no,
+                room_id=(
+                    latest_attempt_by_schedule[scheduled.id].room_id
+                    if scheduled.id in latest_attempt_by_schedule
+                    else None
+                ),
+                attempt_id=(
+                    latest_attempt_by_schedule[scheduled.id].id
+                    if scheduled.id in latest_attempt_by_schedule
+                    else None
+                ),
+            )
+            for scheduled, seat, batch in rows
+        ]
+        next_cursor = self._encode_appointment_cursor(rows[-1][0]) if has_more and rows else None
+        return responses, next_cursor
+
     async def list_appointments(
         self, session: AsyncSession, *, user_id: UUID
     ) -> list[ExperimentAppointmentResponse]:
-        rows = (
-            await session.execute(
-                select(ScheduledMatch, ScheduledSeat, ExperimentBatch)
-                .join(ScheduledSeat, ScheduledSeat.scheduled_match_id == ScheduledMatch.id)
-                .join(ExperimentBatch, ExperimentBatch.id == ScheduledMatch.batch_id)
-                .where(
-                    ScheduledSeat.user_id == user_id,
-                    ScheduledSeat.occupant_kind == "HUMAN",
-                    ExperimentBatch.status == "PUBLISHED",
-                )
-                .order_by(
-                    ScheduledMatch.scheduled_at.asc().nulls_last(),
-                    ScheduledMatch.round_no,
-                    ScheduledMatch.match_no,
-                )
-            )
-        ).all()
+        # Compatibility helper for internal callers. HTTP callers use the bounded page method;
+        # preserve the historical complete-array helper by advancing through bounded pages.
         responses: list[ExperimentAppointmentResponse] = []
-        for scheduled, seat, batch in rows:
-            attempt = await session.scalar(
-                select(ExperimentMatchAttempt)
-                .where(ExperimentMatchAttempt.scheduled_match_id == scheduled.id)
-                .order_by(ExperimentMatchAttempt.attempt_no.desc())
-                .limit(1)
+        cursor: str | None = None
+        seen: set[tuple[datetime | None, int, int, UUID]] = set()
+        previous_cursor: tuple[datetime | None, int, int, UUID] | None = None
+        page_count = 0
+        while True:
+            if page_count >= self.EXPERIMENT_HISTORY_MAX_PAGES:
+                raise APIError("experiment_history_too_large")
+            page, next_cursor = await self.list_appointments_page(
+                session,
+                user_id=user_id,
+                limit=self.EXPERIMENT_PAGE_MAX,
+                cursor=cursor,
             )
-            responses.append(
-                ExperimentAppointmentResponse(
-                    scheduled_match_id=scheduled.id,
-                    batch_id=batch.id,
-                    batch_title=batch.title,
-                    round_no=scheduled.round_no,
-                    match_no=scheduled.match_no,
-                    topic_id=scheduled.topic_id,
-                    scheduled_at=scheduled.scheduled_at,
-                    kind=cast(Literal["FORMAL", "TRAINING"], scheduled.kind),
-                    status=scheduled.status,
-                    side=cast(Literal["AFFIRMATIVE", "NEGATIVE"], seat.side),
-                    seat_no=seat.seat_no,
-                    room_id=attempt.room_id if attempt is not None else None,
-                    attempt_id=attempt.id if attempt is not None else None,
+            page_count += 1
+            decoded_cursor = None
+            if next_cursor is not None:
+                decoded_cursor = self._validate_appointment_history_cursor(
+                    previous_cursor, next_cursor, seen
                 )
-            )
-        return responses
+            if len(responses) + len(page) > self.EXPERIMENT_HISTORY_MAX_ROWS:
+                raise APIError("experiment_history_too_large")
+            responses.extend(page)
+            if next_cursor is None:
+                return responses
+            assert decoded_cursor is not None
+            seen.add(decoded_cursor)
+            previous_cursor = decoded_cursor
+            cursor = next_cursor
 
     async def _allocate_room_code(self, session: AsyncSession) -> str:
         for _ in range(10):
@@ -1392,7 +1693,9 @@ class ExperimentService:
                             (ScheduledMatch.round_no == scheduled.round_no)
                             & (ScheduledMatch.match_no < scheduled.match_no)
                         ),
-                        Room.format_snapshot["postmatch_questionnaire_enabled"].as_boolean().is_(True),
+                        Room.format_snapshot["postmatch_questionnaire_enabled"]
+                        .as_boolean()
+                        .is_(True),
                     )
                     .limit(1)
                 )
@@ -1664,30 +1967,227 @@ class ExperimentService:
             raise APIError("experiment_annotation_not_found")
         return task
 
-    async def _participant_task_response(
-        self, session: AsyncSession, task: ParticipantAnnotationTask
-    ) -> ParticipantAnnotationTaskResponse:
-        attempt = await session.get(ExperimentMatchAttempt, task.experiment_attempt_id)
-        scheduled = (
-            await session.get(ScheduledMatch, attempt.scheduled_match_id)
-            if attempt is not None
-            else None
+    @staticmethod
+    def _annotation_json_bytes(value: object) -> int:
+        """Return the compact UTF-8 size used for response budget checks."""
+
+        return len(
+            json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str).encode(
+                "utf-8"
+            )
         )
-        if attempt is None or scheduled is None:
-            raise APIError("experiment_attempt_invalid")
-        items = list(
+
+    @classmethod
+    def _raise_annotation_payload_too_large(cls) -> None:
+        raise APIError("experiment_annotation_payload_too_large")
+
+    @classmethod
+    def _assert_annotation_response_budget(
+        cls, responses: Sequence[ParticipantAnnotationTaskResponse | ExpertAnnotationTaskResponse]
+    ) -> None:
+        total = 0
+        for response in responses:
+            payload_bytes = cls._annotation_json_bytes(response.model_dump(mode="json"))
+            if payload_bytes > cls.ANNOTATION_MAX_TASK_PAYLOAD_BYTES:
+                cls._raise_annotation_payload_too_large()
+            total += payload_bytes
+            if total > cls.ANNOTATION_MAX_PAGE_PAYLOAD_BYTES:
+                cls._raise_annotation_payload_too_large()
+
+    @classmethod
+    async def _assert_participant_child_budget(
+        cls, session: AsyncSession, task_ids: list[UUID]
+    ) -> None:
+        """Check child row counts and JSON/text sizes before selecting payload columns.
+
+        The follow-up ORM queries intentionally happen only after these scalar
+        aggregates. This prevents a malformed task containing a huge JSONB,
+        transcript, or questionnaire free-text answer from being materialized
+        merely to discover that it is too large.
+        """
+
+        item_stats = (
+            await session.execute(
+                select(
+                    ParticipantAnnotationItem.task_id,
+                    func.count(ParticipantAnnotationItem.id),
+                )
+                .where(ParticipantAnnotationItem.task_id.in_(task_ids))
+                .group_by(ParticipantAnnotationItem.task_id)
+            )
+        ).all()
+        if any(int(count) > cls.ANNOTATION_MAX_ITEMS_PER_TASK for _task_id, count in item_stats):
+            cls._raise_annotation_payload_too_large()
+
+        answer_stats = (
+            await session.execute(
+                select(
+                    ParticipantAnnotationAnswer.task_id,
+                    func.count(ParticipantAnnotationAnswer.id),
+                    func.coalesce(
+                        func.sum(
+                            func.octet_length(sa_cast(ParticipantAnnotationAnswer.answer, Text))
+                        ),
+                        0,
+                    ),
+                )
+                .where(ParticipantAnnotationAnswer.task_id.in_(task_ids))
+                .group_by(ParticipantAnnotationAnswer.task_id)
+            )
+        ).all()
+        answer_bytes_by_task: dict[UUID, int] = {}
+        for task_id, count, payload_bytes in answer_stats:
+            if int(count) > cls.ANNOTATION_MAX_ANSWERS_PER_TASK:
+                cls._raise_annotation_payload_too_large()
+            answer_bytes_by_task[task_id] = int(payload_bytes or 0)
+
+        opportunity_stats = (
+            await session.execute(
+                select(
+                    ParticipantAnnotationItem.task_id,
+                    func.coalesce(
+                        func.sum(
+                            func.octet_length(sa_cast(FreeDebateOpportunity.frozen_context, Text))
+                        ),
+                        0,
+                    ),
+                )
+                .join(
+                    FreeDebateOpportunity,
+                    FreeDebateOpportunity.id == ParticipantAnnotationItem.opportunity_id,
+                )
+                .where(ParticipantAnnotationItem.task_id.in_(task_ids))
+                .group_by(ParticipantAnnotationItem.task_id)
+            )
+        ).all()
+        context_bytes_by_task = {
+            task_id: int(payload_bytes or 0) for task_id, payload_bytes in opportunity_stats
+        }
+
+        speech_stats = (
+            await session.execute(
+                select(
+                    ParticipantAnnotationItem.task_id,
+                    func.coalesce(
+                        func.sum(func.octet_length(func.coalesce(Speech.display_text, ""))), 0
+                    ),
+                )
+                .join(Speech, Speech.id == ParticipantAnnotationItem.speech_id)
+                .where(ParticipantAnnotationItem.task_id.in_(task_ids))
+                .group_by(ParticipantAnnotationItem.task_id)
+            )
+        ).all()
+        speech_bytes_by_task = {
+            task_id: int(payload_bytes or 0) for task_id, payload_bytes in speech_stats
+        }
+
+        questionnaire_stats = (
+            await session.execute(
+                select(
+                    MatchQuestionnaire.task_id,
+                    func.coalesce(
+                        func.sum(func.octet_length(func.coalesce(MatchQuestionnaire.q6, ""))),
+                        0,
+                    ),
+                )
+                .where(MatchQuestionnaire.task_id.in_(task_ids))
+                .group_by(MatchQuestionnaire.task_id)
+            )
+        ).all()
+        questionnaire_bytes_by_task = {
+            task_id: int(payload_bytes or 0) for task_id, payload_bytes in questionnaire_stats
+        }
+
+        total_bytes = 0
+        for task_id in task_ids:
+            task_bytes = (
+                answer_bytes_by_task.get(task_id, 0)
+                + context_bytes_by_task.get(task_id, 0)
+                + speech_bytes_by_task.get(task_id, 0)
+                + questionnaire_bytes_by_task.get(task_id, 0)
+            )
+            if task_bytes > cls.ANNOTATION_MAX_TASK_PAYLOAD_BYTES:
+                cls._raise_annotation_payload_too_large()
+            total_bytes += task_bytes
+        if total_bytes > cls.ANNOTATION_MAX_PAGE_PAYLOAD_BYTES:
+            cls._raise_annotation_payload_too_large()
+
+    @classmethod
+    async def _assert_expert_child_budget(cls, session: AsyncSession, task_ids: list[UUID]) -> None:
+        stats = (
+            await session.execute(
+                select(
+                    ExpertAnnotationAnswer.task_id,
+                    func.count(ExpertAnnotationAnswer.id),
+                    func.coalesce(
+                        func.sum(
+                            func.octet_length(sa_cast(ExpertAnnotationAnswer.frozen_payload, Text))
+                        ),
+                        0,
+                    ),
+                )
+                .where(ExpertAnnotationAnswer.task_id.in_(task_ids))
+                .group_by(ExpertAnnotationAnswer.task_id)
+            )
+        ).all()
+        total_bytes = 0
+        for _task_id, count, payload_bytes in stats:
+            if int(count) > cls.ANNOTATION_MAX_ITEMS_PER_TASK:
+                cls._raise_annotation_payload_too_large()
+            task_bytes = int(payload_bytes or 0)
+            if task_bytes > cls.ANNOTATION_MAX_TASK_PAYLOAD_BYTES:
+                cls._raise_annotation_payload_too_large()
+            total_bytes += task_bytes
+        if total_bytes > cls.ANNOTATION_MAX_PAGE_PAYLOAD_BYTES:
+            cls._raise_annotation_payload_too_large()
+
+    async def _participant_task_responses(
+        self, session: AsyncSession, tasks: list[ParticipantAnnotationTask]
+    ) -> list[ParticipantAnnotationTaskResponse]:
+        """Materialize a bounded task page with set-based related queries.
+
+        A task contains several JSON payloads, so loading a whole user's history
+        in one request is intentionally avoided. The page itself is loaded once,
+        then all items, opportunities, speeches, answers, questionnaires and
+        attempt metadata are fetched in batches to avoid one query per task.
+        """
+        if not tasks:
+            return []
+        task_ids = [task.id for task in tasks]
+        await self._assert_participant_child_budget(session, task_ids)
+        attempt_ids = [task.experiment_attempt_id for task in tasks]
+        attempt_rows = list(
             (
-                await session.scalars(
-                    select(ParticipantAnnotationItem)
-                    .where(ParticipantAnnotationItem.task_id == task.id)
-                    .order_by(ParticipantAnnotationItem.position)
+                await session.execute(
+                    select(ExperimentMatchAttempt, ScheduledMatch)
+                    .join(
+                        ScheduledMatch,
+                        ScheduledMatch.id == ExperimentMatchAttempt.scheduled_match_id,
+                    )
+                    .where(ExperimentMatchAttempt.id.in_(attempt_ids))
                 )
             ).all()
         )
-        opportunity_ids = [item.opportunity_id for item in items]
-        opportunity_rows: list[FreeDebateOpportunity] = []
-        if opportunity_ids:
-            opportunity_rows = list(
+        attempts = {attempt.id: (attempt, scheduled) for attempt, scheduled in attempt_rows}
+        if len(attempts) != len(set(attempt_ids)):
+            raise APIError("experiment_attempt_invalid")
+
+        item_rows = list(
+            (
+                await session.scalars(
+                    select(ParticipantAnnotationItem)
+                    .where(ParticipantAnnotationItem.task_id.in_(task_ids))
+                    .order_by(ParticipantAnnotationItem.task_id, ParticipantAnnotationItem.position)
+                )
+            ).all()
+        )
+        items_by_task: dict[UUID, list[ParticipantAnnotationItem]] = {}
+        for item in item_rows:
+            items_by_task.setdefault(item.task_id, []).append(item)
+        opportunity_ids = {item.opportunity_id for item in item_rows}
+        speech_ids = {item.speech_id for item in item_rows}
+        opportunity_rows = (
+            list(
                 (
                     await session.scalars(
                         select(FreeDebateOpportunity).where(
@@ -1696,84 +2196,158 @@ class ExperimentService:
                     )
                 ).all()
             )
-        opportunities: dict[UUID, FreeDebateOpportunity] = {row.id: row for row in opportunity_rows}
-        speech_ids = [item.speech_id for item in items]
-        speech_rows: list[Speech] = []
-        if speech_ids:
-            speech_rows = list(
-                (await session.scalars(select(Speech).where(Speech.id.in_(speech_ids)))).all()
-            )
-        speeches: dict[UUID, Speech] = {row.id: row for row in speech_rows}
+            if opportunity_ids
+            else []
+        )
+        speech_rows = (
+            list((await session.scalars(select(Speech).where(Speech.id.in_(speech_ids)))).all())
+            if speech_ids
+            else []
+        )
+        opportunities = {row.id: row for row in opportunity_rows}
+        speeches = {row.id: row for row in speech_rows}
+
         answer_rows = list(
             (
                 await session.scalars(
                     select(ParticipantAnnotationAnswer).where(
-                        ParticipantAnnotationAnswer.task_id == task.id
+                        ParticipantAnnotationAnswer.task_id.in_(task_ids)
                     )
                 )
             ).all()
         )
-        answers_by_item: dict[UUID, dict[str, object]] = {}
-        versions_by_item: dict[UUID, dict[str, int]] = {}
+        answers_by_task_item: dict[tuple[UUID, UUID], dict[str, object]] = {}
+        versions_by_task_item: dict[tuple[UUID, UUID], dict[str, int]] = {}
         for answer in answer_rows:
             key = f"stage{answer.stage}.{answer.question_key}"
-            answers_by_item.setdefault(answer.opportunity_id, {})[key] = answer.answer
-            versions_by_item.setdefault(answer.opportunity_id, {})[key] = answer.client_version
-        response_items: list[ParticipantAnnotationItemResponse] = []
-        for item in items:
-            opportunity = opportunities.get(item.opportunity_id)
-            speech = speeches.get(item.speech_id)
-            if opportunity is None or speech is None:
-                raise APIError("experiment_annotation_invalid")
-            revealed = item.subject_kind == "HUMAN_SELF" or item.stage1_locked_at is not None
-            response_items.append(
-                ParticipantAnnotationItemResponse(
-                    id=item.id,
-                    opportunity_id=item.opportunity_id,
-                    subject_kind=cast(Literal["HUMAN_SELF", "TEAM_AI"], item.subject_kind),
-                    speech_id=item.speech_id,
-                    position=item.position,
-                    stage1_locked=item.stage1_locked_at is not None,
-                    revealed=revealed,
-                    frozen_context=dict(opportunity.frozen_context),
-                    speech_text=speech.display_text if revealed else None,
-                    answers=answers_by_item.get(item.opportunity_id, {}),
-                    answer_versions=versions_by_item.get(item.opportunity_id, {}),
+            lookup = (answer.task_id, answer.opportunity_id)
+            answers_by_task_item.setdefault(lookup, {})[key] = answer.answer
+            versions_by_task_item.setdefault(lookup, {})[key] = answer.client_version
+        questionnaire_rows = list(
+            (
+                await session.scalars(
+                    select(MatchQuestionnaire).where(MatchQuestionnaire.task_id.in_(task_ids))
+                )
+            ).all()
+        )
+        questionnaires = {row.task_id: row for row in questionnaire_rows}
+
+        responses: list[ParticipantAnnotationTaskResponse] = []
+        for task in tasks:
+            _attempt, scheduled = attempts[task.experiment_attempt_id]
+            response_items: list[ParticipantAnnotationItemResponse] = []
+            for item in items_by_task.get(task.id, []):
+                opportunity = opportunities.get(item.opportunity_id)
+                speech = speeches.get(item.speech_id)
+                if opportunity is None or speech is None:
+                    raise APIError("experiment_annotation_invalid")
+                revealed = item.subject_kind == "HUMAN_SELF" or item.stage1_locked_at is not None
+                lookup = (task.id, item.opportunity_id)
+                response_items.append(
+                    ParticipantAnnotationItemResponse(
+                        id=item.id,
+                        opportunity_id=item.opportunity_id,
+                        subject_kind=cast(Literal["HUMAN_SELF", "TEAM_AI"], item.subject_kind),
+                        speech_id=item.speech_id,
+                        position=item.position,
+                        stage1_locked=item.stage1_locked_at is not None,
+                        revealed=revealed,
+                        frozen_context=dict(opportunity.frozen_context),
+                        speech_text=speech.display_text if revealed else None,
+                        answers=answers_by_task_item.get(lookup, {}),
+                        answer_versions=versions_by_task_item.get(lookup, {}),
+                    )
+                )
+            questionnaire = questionnaires.get(task.id)
+            responses.append(
+                ParticipantAnnotationTaskResponse(
+                    id=task.id,
+                    experiment_attempt_id=task.experiment_attempt_id,
+                    questionnaire_version=task.questionnaire_version,
+                    status=cast(Literal["PENDING", "IN_PROGRESS", "SUBMITTED"], task.status),
+                    due_at=task.due_at,
+                    late=task.late,
+                    submitted_at=task.submitted_at,
+                    scheduled_match_kind=cast(Literal["FORMAL", "TRAINING"], scheduled.kind),
+                    items=response_items,
+                    questionnaire=(
+                        ParticipantQuestionnaireResponse.model_validate(questionnaire)
+                        if questionnaire is not None
+                        else None
+                    ),
                 )
             )
-        questionnaire = await session.scalar(
-            select(MatchQuestionnaire).where(MatchQuestionnaire.task_id == task.id)
-        )
-        return ParticipantAnnotationTaskResponse(
-            id=task.id,
-            experiment_attempt_id=task.experiment_attempt_id,
-            questionnaire_version=task.questionnaire_version,
-            status=cast(Literal["PENDING", "IN_PROGRESS", "SUBMITTED"], task.status),
-            due_at=task.due_at,
-            late=task.late,
-            submitted_at=task.submitted_at,
-            scheduled_match_kind=cast(Literal["FORMAL", "TRAINING"], scheduled.kind),
-            items=response_items,
-            questionnaire=(
-                ParticipantQuestionnaireResponse.model_validate(questionnaire)
-                if questionnaire is not None
-                else None
-            ),
-        )
+        self._assert_annotation_response_budget(responses)
+        return responses
+
+    async def _participant_task_response(
+        self, session: AsyncSession, task: ParticipantAnnotationTask
+    ) -> ParticipantAnnotationTaskResponse:
+        return (await self._participant_task_responses(session, [task]))[0]
 
     async def list_participant_tasks(
         self, session: AsyncSession, *, user_id: UUID
     ) -> list[ParticipantAnnotationTaskResponse]:
-        tasks = list(
-            (
-                await session.scalars(
-                    select(ParticipantAnnotationTask)
-                    .where(ParticipantAnnotationTask.user_id == user_id)
-                    .order_by(ParticipantAnnotationTask.created_at.desc())
-                )
-            ).all()
+        # Compatibility helper for internal callers that historically expected
+        # the complete array. The HTTP route uses the bounded page method below;
+        # each compatibility page is still bounded and batch-loaded.
+        result: list[ParticipantAnnotationTaskResponse] = []
+        cursor: tuple[datetime, UUID] | None = None
+        previous_cursor: tuple[datetime, UUID] | None = None
+        seen: set[tuple[datetime, UUID]] = set()
+        page_count = 0
+        while True:
+            if page_count >= self.EXPERIMENT_HISTORY_MAX_PAGES:
+                raise APIError("experiment_history_too_large")
+            page, next_cursor = await self.list_participant_tasks_page(
+                session,
+                user_id=user_id,
+                limit=self.EXPERIMENT_PAGE_MAX,
+                cursor=cursor,
+            )
+            page_count += 1
+            if len(result) + len(page) > self.EXPERIMENT_HISTORY_MAX_ROWS:
+                raise APIError("experiment_history_too_large")
+            result.extend(page)
+            if next_cursor is None:
+                return result
+            self._validate_annotation_history_cursor(previous_cursor, next_cursor, seen)
+            seen.add(next_cursor)
+            previous_cursor = next_cursor
+            cursor = next_cursor
+
+    async def list_participant_tasks_page(
+        self,
+        session: AsyncSession,
+        *,
+        user_id: UUID,
+        limit: int = ANNOTATION_PAGE_DEFAULT,
+        cursor: tuple[datetime, UUID] | None = None,
+    ) -> tuple[list[ParticipantAnnotationTaskResponse], tuple[datetime, UUID] | None]:
+        bounded_limit = min(max(limit, 1), self.ANNOTATION_PAGE_MAX)
+        query = select(ParticipantAnnotationTask).where(
+            ParticipantAnnotationTask.user_id == user_id
         )
-        return [await self._participant_task_response(session, task) for task in tasks]
+        if cursor is not None:
+            query = query.where(
+                or_(
+                    ParticipantAnnotationTask.created_at < cursor[0],
+                    and_(
+                        ParticipantAnnotationTask.created_at == cursor[0],
+                        ParticipantAnnotationTask.id < cursor[1],
+                    ),
+                )
+            )
+        query = query.order_by(
+            ParticipantAnnotationTask.created_at.desc(), ParticipantAnnotationTask.id.desc()
+        ).limit(bounded_limit + 1)
+        rows = list((await session.scalars(query)).all())
+        has_more = len(rows) > bounded_limit
+        page_rows = rows[:bounded_limit]
+        next_cursor = (
+            (page_rows[-1].created_at, page_rows[-1].id) if has_more and page_rows else None
+        )
+        return await self._participant_task_responses(session, page_rows), next_cursor
 
     async def participant_audio(
         self,
@@ -1844,12 +2418,16 @@ class ExperimentService:
         if set(payload.answers) != expected:
             raise APIError("experiment_annotation_answer_invalid")
         if payload.stage == 1:
-            allowed = self._AI_APPROPRIATENESS if strict else {
-                "合适",
-                "不合适",
-                "无法判断",
-                *self._AI_APPROPRIATENESS,
-            }
+            allowed = (
+                self._AI_APPROPRIATENESS
+                if strict
+                else {
+                    "合适",
+                    "不合适",
+                    "无法判断",
+                    *self._AI_APPROPRIATENESS,
+                }
+            )
             if payload.answers["appropriateness"] not in allowed:
                 raise APIError("experiment_annotation_answer_invalid")
             return
@@ -2002,10 +2580,7 @@ class ExperimentService:
                 complete = (
                     required.issubset(item.answers)
                     if task.questionnaire_version == QUESTIONNAIRE_VERSION
-                    else (
-                        required.issubset(item.answers)
-                        or legacy_required.issubset(item.answers)
-                    )
+                    else (required.issubset(item.answers) or legacy_required.issubset(item.answers))
                 )
                 if not complete or (item.subject_kind == "TEAM_AI" and not item.stage1_locked):
                     raise APIError("experiment_annotation_incomplete")
@@ -2050,55 +2625,118 @@ class ExperimentService:
     async def _expert_task_response(
         self, session: AsyncSession, task: ExpertAnnotationTask
     ) -> ExpertAnnotationTaskResponse:
-        answers = list(
+        return (await self._expert_task_responses(session, [task]))[0]
+
+    async def _expert_task_responses(
+        self, session: AsyncSession, tasks: list[ExpertAnnotationTask]
+    ) -> list[ExpertAnnotationTaskResponse]:
+        if not tasks:
+            return []
+        task_ids = [task.id for task in tasks]
+        await self._assert_expert_child_budget(session, task_ids)
+        answer_rows = list(
             (
-                await session.scalars(
-                    select(ExpertAnnotationAnswer)
+                await session.execute(
+                    select(ExpertAnnotationAnswer, FreeDebateOpportunity)
                     .join(
                         FreeDebateOpportunity,
                         FreeDebateOpportunity.id == ExpertAnnotationAnswer.opportunity_id,
                     )
-                    .where(ExpertAnnotationAnswer.task_id == task.id)
+                    .where(ExpertAnnotationAnswer.task_id.in_(task_ids))
                     .order_by(
+                        ExpertAnnotationAnswer.task_id,
                         FreeDebateOpportunity.opened_at,
                         FreeDebateOpportunity.sequence_no,
                     )
                 )
             ).all()
         )
-        return ExpertAnnotationTaskResponse(
-            id=task.id,
-            batch_id=task.batch_id,
-            status=cast(Literal["PENDING", "IN_PROGRESS", "SUBMITTED"], task.status),
-            submitted_at=task.submitted_at,
-            items=[
-                ExpertAnnotationItemResponse(
-                    opportunity_id=answer.opportunity_id,
-                    frozen_payload=dict(answer.frozen_payload),
-                    q1=answer.q1,
-                    q2=dict(answer.q2) if answer.q2 is not None else None,
-                    q3=answer.q3,
-                    client_version=answer.client_version,
-                    saved_at=answer.saved_at,
-                    submitted_at=answer.submitted_at,
-                )
-                for answer in answers
-            ],
-        )
+        answers_by_task: dict[UUID, list[ExpertAnnotationAnswer]] = {}
+        for answer, _opportunity in answer_rows:
+            answers_by_task.setdefault(answer.task_id, []).append(answer)
+        responses = [
+            ExpertAnnotationTaskResponse(
+                id=task.id,
+                batch_id=task.batch_id,
+                status=cast(Literal["PENDING", "IN_PROGRESS", "SUBMITTED"], task.status),
+                submitted_at=task.submitted_at,
+                items=[
+                    ExpertAnnotationItemResponse(
+                        opportunity_id=answer.opportunity_id,
+                        frozen_payload=dict(answer.frozen_payload),
+                        q1=answer.q1,
+                        q2=dict(answer.q2) if answer.q2 is not None else None,
+                        q3=answer.q3,
+                        client_version=answer.client_version,
+                        saved_at=answer.saved_at,
+                        submitted_at=answer.submitted_at,
+                    )
+                    for answer in answers_by_task.get(task.id, [])
+                ],
+            )
+            for task in tasks
+        ]
+        self._assert_annotation_response_budget(responses)
+        return responses
 
     async def list_expert_tasks(
         self, session: AsyncSession, *, user_id: UUID
     ) -> list[ExpertAnnotationTaskResponse]:
-        tasks = list(
-            (
-                await session.scalars(
-                    select(ExpertAnnotationTask)
-                    .where(ExpertAnnotationTask.expert_user_id == user_id)
-                    .order_by(ExpertAnnotationTask.created_at.desc())
+        result: list[ExpertAnnotationTaskResponse] = []
+        cursor: tuple[datetime, UUID] | None = None
+        previous_cursor: tuple[datetime, UUID] | None = None
+        seen: set[tuple[datetime, UUID]] = set()
+        page_count = 0
+        while True:
+            if page_count >= self.EXPERIMENT_HISTORY_MAX_PAGES:
+                raise APIError("experiment_history_too_large")
+            page, next_cursor = await self.list_expert_tasks_page(
+                session,
+                user_id=user_id,
+                limit=self.EXPERIMENT_PAGE_MAX,
+                cursor=cursor,
+            )
+            page_count += 1
+            if len(result) + len(page) > self.EXPERIMENT_HISTORY_MAX_ROWS:
+                raise APIError("experiment_history_too_large")
+            result.extend(page)
+            if next_cursor is None:
+                return result
+            self._validate_annotation_history_cursor(previous_cursor, next_cursor, seen)
+            seen.add(next_cursor)
+            previous_cursor = next_cursor
+            cursor = next_cursor
+
+    async def list_expert_tasks_page(
+        self,
+        session: AsyncSession,
+        *,
+        user_id: UUID,
+        limit: int = ANNOTATION_PAGE_DEFAULT,
+        cursor: tuple[datetime, UUID] | None = None,
+    ) -> tuple[list[ExpertAnnotationTaskResponse], tuple[datetime, UUID] | None]:
+        bounded_limit = min(max(limit, 1), self.ANNOTATION_PAGE_MAX)
+        query = select(ExpertAnnotationTask).where(ExpertAnnotationTask.expert_user_id == user_id)
+        if cursor is not None:
+            query = query.where(
+                or_(
+                    ExpertAnnotationTask.created_at < cursor[0],
+                    and_(
+                        ExpertAnnotationTask.created_at == cursor[0],
+                        ExpertAnnotationTask.id < cursor[1],
+                    ),
                 )
-            ).all()
+            )
+        query = query.order_by(
+            ExpertAnnotationTask.created_at.desc(), ExpertAnnotationTask.id.desc()
+        ).limit(bounded_limit + 1)
+        rows = list((await session.scalars(query)).all())
+        has_more = len(rows) > bounded_limit
+        page_rows = rows[:bounded_limit]
+        next_cursor = (
+            (page_rows[-1].created_at, page_rows[-1].id) if has_more and page_rows else None
         )
-        return [await self._expert_task_response(session, task) for task in tasks]
+        return await self._expert_task_responses(session, page_rows), next_cursor
 
     async def expert_audio(
         self,
@@ -2116,16 +2754,39 @@ class ExperimentService:
         )
         if task is None:
             raise APIError("experiment_expert_task_not_found")
-        answers = list(
+        answer_count, payload_bytes = (
+            await session.execute(
+                select(
+                    func.count(ExpertAnnotationAnswer.id),
+                    func.coalesce(
+                        func.sum(
+                            func.octet_length(sa_cast(ExpertAnnotationAnswer.frozen_payload, Text))
+                        ),
+                        0,
+                    ),
+                ).where(ExpertAnnotationAnswer.task_id == task.id)
+            )
+        ).one()
+        if (
+            int(answer_count or 0) > self.ANNOTATION_MAX_AUDIO_AUTH_ROWS
+            or int(payload_bytes or 0) > self.ANNOTATION_MAX_AUDIO_AUTH_BYTES
+        ):
+            self._raise_annotation_payload_too_large()
+        payload_rows = (
             (
-                await session.scalars(
-                    select(ExpertAnnotationAnswer).where(ExpertAnnotationAnswer.task_id == task.id)
+                await session.execute(
+                    select(ExpertAnnotationAnswer.frozen_payload).where(
+                        ExpertAnnotationAnswer.task_id == task.id
+                    )
                 )
-            ).all()
+            )
+            .scalars()
+            .all()
         )
         allowed_speech_ids: set[str] = set()
-        for answer in answers:
-            raw_context: object = answer.frozen_payload.get("context")
+        for frozen_payload in payload_rows:
+            raw_payload = frozen_payload
+            raw_context: object = raw_payload.get("context")
             if not isinstance(raw_context, dict):
                 continue
             context = cast(dict[str, object], raw_context)
@@ -2139,6 +2800,8 @@ class ExperimentService:
                 candidate_id = history_item.get("speech_id")
                 if candidate_id is not None:
                     allowed_speech_ids.add(str(candidate_id))
+                    if len(allowed_speech_ids) > self.ANNOTATION_MAX_ITEMS_PER_TASK * 16:
+                        self._raise_annotation_payload_too_large()
         if str(speech_id) not in allowed_speech_ids:
             raise APIError("experiment_expert_opportunity_not_found")
         speech = await session.get(Speech, speech_id)
@@ -2476,16 +3139,84 @@ class ExperimentService:
             )
         return response
 
-    async def list_batches(self, session: AsyncSession) -> list[ExperimentBatch]:
-        return list(
+    async def list_batches_page(
+        self,
+        session: AsyncSession,
+        *,
+        limit: int = EXPERIMENT_PAGE_DEFAULT,
+        cursor: str | None = None,
+    ) -> tuple[list[ExperimentBatch], str | None]:
+        page_limit = self._page_limit(limit)
+        query = select(ExperimentBatch)
+        if cursor:
+            cursor_at, cursor_id = self._decode_batch_cursor(cursor)
+            query = query.where(
+                or_(
+                    ExperimentBatch.created_at < cursor_at,
+                    and_(
+                        ExperimentBatch.created_at == cursor_at,
+                        ExperimentBatch.id > cursor_id,
+                    ),
+                )
+            )
+        rows = list(
             (
                 await session.scalars(
-                    select(ExperimentBatch).order_by(
-                        ExperimentBatch.created_at.desc(), ExperimentBatch.id
+                    query.order_by(ExperimentBatch.created_at.desc(), ExperimentBatch.id)
+                    .options(
+                        load_only(
+                            ExperimentBatch.id,
+                            ExperimentBatch.code,
+                            ExperimentBatch.title,
+                            ExperimentBatch.status,
+                            ExperimentBatch.schedule_version,
+                            ExperimentBatch.rule_id,
+                            ExperimentBatch.format_version_id,
+                            ExperimentBatch.training_room_quota,
+                            ExperimentBatch.created_by,
+                            ExperimentBatch.created_at,
+                            ExperimentBatch.updated_at,
+                            ExperimentBatch.published_at,
+                            ExperimentBatch.disabled_at,
+                        )
                     )
+                    .limit(page_limit + 1)
                 )
             ).all()
         )
+        has_more = len(rows) > page_limit
+        rows = rows[:page_limit]
+        return rows, self._encode_batch_cursor(rows[-1]) if has_more and rows else None
+
+    async def list_batches(self, session: AsyncSession) -> list[ExperimentBatch]:
+        # Compatibility helper for internal callers. HTTP callers use the bounded page method;
+        # preserve the historical complete-array helper by advancing through bounded pages.
+        rows: list[ExperimentBatch] = []
+        cursor: str | None = None
+        seen: set[tuple[datetime, UUID]] = set()
+        previous_cursor: tuple[datetime, UUID] | None = None
+        page_count = 0
+        while True:
+            if page_count >= self.EXPERIMENT_HISTORY_MAX_PAGES:
+                raise APIError("experiment_history_too_large")
+            page, next_cursor = await self.list_batches_page(
+                session, limit=self.EXPERIMENT_PAGE_MAX, cursor=cursor
+            )
+            page_count += 1
+            decoded_cursor = None
+            if next_cursor is not None:
+                decoded_cursor = self._validate_batch_history_cursor(
+                    previous_cursor, next_cursor, seen
+                )
+            if len(rows) + len(page) > self.EXPERIMENT_HISTORY_MAX_ROWS:
+                raise APIError("experiment_history_too_large")
+            rows.extend(page)
+            if next_cursor is None:
+                return rows
+            assert decoded_cursor is not None
+            seen.add(decoded_cursor)
+            previous_cursor = decoded_cursor
+            cursor = next_cursor
 
     async def get_batch(self, session: AsyncSession, batch_id: UUID) -> ExperimentBatch:
         batch = await session.get(ExperimentBatch, batch_id)

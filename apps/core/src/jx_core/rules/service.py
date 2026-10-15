@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
-from hashlib import sha256
 from uuid import UUID, uuid4
 
 from sqlalchemy import delete, func, or_, select
@@ -25,6 +24,7 @@ from ..models import (
     ModelProfile,
     Room,
     Rule,
+    RuleAudioGeneration,
     RuleJudgeConfig,
     RuleStage,
     Seat,
@@ -34,6 +34,18 @@ from ..models import (
     VoiceProfile,
 )
 from ..security.crypto import encrypt_secret
+from .agent_pool import lock_agent_pool, sync_agent_pools
+from .audio import (
+    AudioConfiguration,
+    aggregate,
+    audio_file,
+    build_manifest,
+    create_generation,
+    fingerprint,
+    project,
+    repair_generation,
+)
+from .host_voice import is_host_reserved_voice
 from .prompts import (
     DEFAULT_FIXED_SPEECH_PROMPT,
     DEFAULT_FREE_DECISION_PROMPT,
@@ -44,6 +56,7 @@ from .prompts import (
     PromptTemplateError,
     validate_prompt_template,
 )
+from .readiness import inspect_rule
 from .schemas import (
     AgentProfileCreate,
     AgentProfileUpdate,
@@ -54,12 +67,15 @@ from .schemas import (
     RuleCreate,
     RuleJudgeUpdate,
     RulePromptUpdate,
+    RuleStageCreate,
+    RuleStageReorder,
     RuleStageUpdate,
     TopicCreate,
     TopicUpdate,
     VoiceProfileCreate,
     VoiceProfileUpdate,
 )
+from .structure import validate_structure
 from .validation import RuleValidationError, validate_rule_draft
 
 
@@ -162,6 +178,8 @@ class CatalogService:
             raise AuthError("model_profile_unavailable")
         if voice is None or voice.status != "ENABLED" or voice.kind != "AGENT":
             raise AuthError("voice_profile_unavailable")
+        if is_host_reserved_voice(voice.provider_voice):
+            raise AuthError("host_voice_reserved")
         return voice
 
     async def create_voice(
@@ -172,6 +190,9 @@ class CatalogService:
         actor_user_id: UUID | None = None,
     ) -> VoiceProfile:
         async with database_session.begin():
+            await lock_agent_pool(database_session)
+            if payload.kind == "AGENT" and is_host_reserved_voice(payload.provider_voice):
+                raise AuthError("host_voice_reserved")
             if payload.kind == "HOST":
                 existing = await database_session.scalar(
                     select(VoiceProfile.id).where(
@@ -183,31 +204,7 @@ class CatalogService:
             voice = VoiceProfile(**payload.model_dump())
             database_session.add(voice)
             await database_session.flush()
-            if voice.kind == "AGENT" and voice.status == "ENABLED":
-                rules = list(
-                    (
-                        await database_session.scalars(
-                            select(Rule).where(
-                                Rule.side_size == 4,
-                                Rule.historical_read_only.is_(False),
-                                Rule.default_agent_model_profile_id.is_not(None),
-                                Rule.status != "ARCHIVED",
-                            )
-                        )
-                    ).all()
-                )
-                for rule in rules:
-                    assert rule.default_agent_model_profile_id is not None
-                    database_session.add(
-                        AgentProfile(
-                            rule_id=rule.id,
-                            name=voice.name,
-                            model_profile_id=rule.default_agent_model_profile_id,
-                            voice_profile_id=voice.id,
-                            status="ENABLED",
-                        )
-                    )
-                    rule.config_revision += 1
+            await sync_agent_pools(database_session, voice_id=voice.id, actor_user_id=actor_user_id)
             AuditService().record(
                 database_session,
                 actor_user_id=actor_user_id,
@@ -373,6 +370,7 @@ class CatalogService:
     ) -> AgentProfile:
         duplicate_name = False
         async with database_session.begin():
+            await lock_agent_pool(database_session)
             agent = await database_session.get(AgentProfile, agent_id, with_for_update=True)
             if agent is None:
                 raise AuthError("catalog_item_not_found")
@@ -465,8 +463,10 @@ class CatalogService:
         voice_id: UUID,
         payload: VoiceProfileUpdate,
         actor_user_id: UUID | None = None,
+        audio_configuration: AudioConfiguration | None = None,
     ) -> VoiceProfile:
         async with database_session.begin():
+            await lock_agent_pool(database_session)
             voice = await database_session.get(VoiceProfile, voice_id, with_for_update=True)
             if voice is None:
                 raise AuthError("catalog_item_not_found")
@@ -489,9 +489,20 @@ class CatalogService:
             )
             if active_reference is not None:
                 raise AuthError("voice_in_use")
-            if payload.kind == "HOST" and voice.kind != "HOST":
+            if payload.kind != voice.kind:
                 raise AuthError("voice_kind_immutable")
             values = payload.model_dump(exclude_unset=True)
+            if (
+                voice.kind == "AGENT"
+                and is_host_reserved_voice(str(values.get("provider_voice", voice.provider_voice)))
+                and (values.get("status", voice.status) == "ENABLED")
+            ):
+                raise AuthError("host_voice_reserved")
+            host_audio_changed = voice.kind == "HOST" and any(
+                values.get(field) != getattr(voice, field)
+                for field in ("provider_voice", "rate")
+                if field in values
+            )
             if any(
                 values.get(field) != getattr(voice, field)
                 for field in ("provider_voice", "rate", "chars_per_second", "playback_gain")
@@ -501,31 +512,35 @@ class CatalogService:
                 voice.calibrated_at = None
             for field, value in values.items():
                 setattr(voice, field, value)
-            if voice.kind == "AGENT":
-                agents = list(
+            await sync_agent_pools(
+                database_session,
+                voice_id=voice.id,
+                actor_user_id=actor_user_id,
+                refresh_voice=True,
+            )
+            if host_audio_changed:
+                rules = list(
                     (
                         await database_session.scalars(
-                            select(AgentProfile)
-                            .where(AgentProfile.voice_profile_id == voice_id)
-                            .where(AgentProfile.rule_id.is_not(None))
+                            select(Rule)
+                            .where(
+                                Rule.host_voice_profile_id == voice.id,
+                                Rule.lifecycle_status != "ARCHIVED",
+                                Rule.historical_read_only.is_(False),
+                            )
+                            .order_by(Rule.id)
                             .with_for_update()
                         )
                     ).all()
                 )
-                for agent in agents:
-                    agent.name = voice.name
-                    agent.status = voice.status
-                rule_ids = {agent.rule_id for agent in agents if agent.rule_id is not None}
-                if rule_ids:
-                    rules = list(
-                        (
-                            await database_session.scalars(
-                                select(Rule).where(Rule.id.in_(rule_ids)).with_for_update()
-                            )
-                        ).all()
+                for rule in rules:
+                    rule.config_revision += 1
+                    await create_generation(
+                        database_session,
+                        rule=rule,
+                        actor_user_id=actor_user_id,
+                        configuration=audio_configuration,
                     )
-                    for rule in rules:
-                        rule.config_revision += 1
             AuditService().record(
                 database_session,
                 actor_user_id=actor_user_id,
@@ -542,6 +557,7 @@ class CatalogService:
         voice_id: UUID,
         actor_user_id: UUID | None = None,
     ) -> str:
+        await lock_agent_pool(database_session)
         voice = await database_session.get(VoiceProfile, voice_id, with_for_update=True)
         if voice is None:
             raise AuthError("catalog_item_not_found")
@@ -578,8 +594,6 @@ class CatalogService:
         )
         if historical_reference is not None or rule_reference is not None:
             voice.status = "DISABLED"
-            for agent in agents:
-                agent.status = "DISABLED"
             outcome = "ARCHIVED"
         else:
             for agent in agents:
@@ -674,6 +688,29 @@ class RuleService:
         except PromptTemplateError as error:
             raise AuthError("rule_invalid", {field: str(error)}) from error
 
+    audio_configuration: AudioConfiguration = AudioConfiguration()
+
+    def __init__(self, audio_configuration: AudioConfiguration | None = None) -> None:
+        if audio_configuration is not None:
+            self.audio_configuration = audio_configuration
+
+    async def _create_audio_generation(
+        self,
+        database_session: AsyncSession,
+        *,
+        rule: Rule,
+        segments: list[tuple[str, str]],
+        voice_profile_id: UUID | None,
+        actor_user_id: UUID | None,
+        now: datetime,
+    ) -> RuleAudioGeneration:
+        return await create_generation(
+            database_session,
+            rule=rule,
+            actor_user_id=actor_user_id,
+            configuration=self.audio_configuration,
+        )
+
     async def create_rule(
         self,
         database_session: AsyncSession,
@@ -688,6 +725,7 @@ class RuleService:
         current = datetime.now(UTC)
         rule_key = payload.rule_key or _stable_key("rule")
         async with database_session.begin():
+            await lock_agent_pool(database_session)
             host_voice = await database_session.get(VoiceProfile, payload.host_voice_profile_id)
             if host_voice is None or host_voice.status != "ENABLED" or host_voice.kind != "HOST":
                 raise AuthError("host_voice_unavailable")
@@ -795,47 +833,16 @@ class RuleService:
                     )
                 if stage_draft.end_host_text:
                     host_segments.append((f"stage-{stage_position}-end", stage_draft.end_host_text))
-            for segment_key, text_value in host_segments:
-                asset = HostAudioAsset(
-                    rule_id=rule.id,
-                    segment_key=segment_key,
-                    text=text_value,
-                    text_hash=sha256(text_value.encode("utf-8")).hexdigest(),
-                    voice_profile_id=host_voice.id,
-                )
-                database_session.add(asset)
-                await database_session.flush()
-                database_session.add(
-                    BackgroundTask(
-                        task_type="HOST_TTS",
-                        payload={"asset_id": str(asset.id), "rule_id": str(rule.id)},
-                        available_at=current,
-                    )
-                )
-            rule.status = "GENERATING_AUDIO" if host_segments else "READY"
-            if default_model is not None:
-                agent_voices = list(
-                    (
-                        await database_session.scalars(
-                            select(VoiceProfile)
-                            .where(
-                                VoiceProfile.kind == "AGENT",
-                                VoiceProfile.status == "ENABLED",
-                            )
-                            .order_by(VoiceProfile.name, VoiceProfile.id)
-                        )
-                    ).all()
-                )
-                for voice in agent_voices:
-                    database_session.add(
-                        AgentProfile(
-                            rule_id=rule.id,
-                            name=voice.name,
-                            model_profile_id=default_model.id,
-                            voice_profile_id=voice.id,
-                            status="ENABLED",
-                        )
-                    )
+            rule.lifecycle_status = "DISABLED"
+            await self._create_audio_generation(
+                database_session,
+                rule=rule,
+                segments=host_segments,
+                voice_profile_id=host_voice.id,
+                actor_user_id=creator_user_id,
+                now=current,
+            )
+            await sync_agent_pools(database_session, rule_id=rule.id, actor_user_id=creator_user_id)
             database_session.add(RuleJudgeConfig(rule_id=rule.id))
             AuditService().record(
                 database_session,
@@ -857,9 +864,18 @@ class RuleService:
         actor_user_id: UUID,
     ) -> AgentProfile:
         async with database_session.begin():
+            await lock_agent_pool(database_session)
+            rule = await database_session.get(Rule, rule_id, with_for_update=True)
+            if rule is None or rule.historical_read_only or rule.status == "ARCHIVED":
+                raise AuthError("rule_invalid", {"rule_id": "历史规则不可编辑"})
             agent = await database_session.get(AgentProfile, agent_id, with_for_update=True)
             if agent is None or agent.rule_id != rule_id:
                 raise AuthError("catalog_item_not_found")
+            blocked = await CatalogService().status_change_block(
+                database_session, kind="agents", item_id=agent_id, status=payload.status
+            )
+            if blocked is not None:
+                raise AuthError(blocked)
             model = await database_session.get(ModelProfile, payload.model_profile_id)
             if model is None or model.status != "ENABLED":
                 raise AuthError("model_profile_unavailable")
@@ -879,6 +895,41 @@ class RuleService:
             )
         return agent
 
+    async def set_agent_status(
+        self,
+        database_session: AsyncSession,
+        *,
+        rule_id: UUID,
+        agent_id: UUID,
+        status: str,
+        actor_user_id: UUID,
+    ) -> AgentProfile:
+        async with database_session.begin():
+            await lock_agent_pool(database_session)
+            rule = await database_session.get(Rule, rule_id, with_for_update=True)
+            if rule is None or rule.historical_read_only or rule.status == "ARCHIVED":
+                raise AuthError("rule_invalid", {"rule_id": "历史规则不可编辑"})
+            agent = await database_session.get(AgentProfile, agent_id, with_for_update=True)
+            if agent is None or agent.rule_id != rule_id:
+                raise AuthError("catalog_item_not_found")
+            blocked = await CatalogService().status_change_block(
+                database_session, kind="agents", item_id=agent_id, status=status
+            )
+            if blocked is not None:
+                raise AuthError(blocked)
+            agent.status = status
+            rule.config_revision += 1
+            AuditService().record(
+                database_session,
+                actor_user_id=actor_user_id,
+                action="admin.rule_agent.status_updated",
+                target_type="agent_profile",
+                target_id=str(agent.id),
+                details={"rule_id": str(rule_id), "status": status},
+            )
+            await database_session.flush()
+        return agent
+
     async def update_rule_basic(
         self,
         database_session: AsyncSession,
@@ -889,6 +940,7 @@ class RuleService:
     ) -> Rule:
         current = datetime.now(UTC)
         async with database_session.begin():
+            await lock_agent_pool(database_session)
             rule = await database_session.get(Rule, rule_id, with_for_update=True)
             if rule is None:
                 raise AuthError("rule_not_found")
@@ -905,50 +957,37 @@ class RuleService:
             rule.description = payload.description.strip()
             rule.host_voice_profile_id = host_voice.id
             rule.default_agent_model_profile_id = model.id
+            await sync_agent_pools(database_session, rule_id=rule.id, actor_user_id=actor_user_id)
             rule.topic_policy = payload.topic_policy
             rule.postmatch_questionnaire_enabled = payload.postmatch_questionnaire_enabled
             rule.config_revision += 1
             if host_changed:
-                assets = list(
+                stages = list(
                     (
                         await database_session.scalars(
-                            select(HostAudioAsset)
-                            .where(HostAudioAsset.rule_id == rule_id)
-                            .with_for_update()
+                            select(RuleStage)
+                            .where(RuleStage.rule_id == rule_id)
+                            .order_by(RuleStage.position)
                         )
                     ).all()
                 )
-                old_tasks = list(
-                    (
-                        await database_session.scalars(
-                            select(BackgroundTask).where(BackgroundTask.task_type == "HOST_TTS")
-                        )
-                    ).all()
+                segments = [
+                    (f"stage-{stage.position}-{suffix}", text_value)
+                    for stage in stages
+                    for suffix, text_value in (
+                        ("start", stage.start_host_text),
+                        ("end", stage.end_host_text),
+                    )
+                    if text_value
+                ]
+                await self._create_audio_generation(
+                    database_session,
+                    rule=rule,
+                    segments=segments,
+                    voice_profile_id=host_voice.id,
+                    actor_user_id=actor_user_id,
+                    now=current,
                 )
-                for asset in assets:
-                    for task in old_tasks:
-                        if str(task.payload.get("asset_id", "")) == str(asset.id):
-                            await database_session.delete(task)
-                    segment_key, text_value = asset.segment_key, asset.text
-                    await database_session.delete(asset)
-                    replacement = HostAudioAsset(
-                        rule_id=rule_id,
-                        segment_key=segment_key,
-                        text=text_value,
-                        text_hash=sha256(text_value.encode("utf-8")).hexdigest(),
-                        voice_profile_id=host_voice.id,
-                    )
-                    database_session.add(replacement)
-                    await database_session.flush()
-                    database_session.add(
-                        BackgroundTask(
-                            task_type="HOST_TTS",
-                            payload={"asset_id": str(replacement.id), "rule_id": str(rule_id)},
-                            available_at=current,
-                        )
-                    )
-                rule.status = "GENERATING_AUDIO" if assets else "READY"
-                rule.audio_reviewed_at = None if assets else current
             AuditService().record(
                 database_session,
                 actor_user_id=actor_user_id,
@@ -1051,61 +1090,28 @@ class RuleService:
             rule.estimated_seconds = int(snapshot["estimated_seconds"])
             rule.config_revision += 1
             if host_changed:
-                for suffix, text_value in (
-                    ("start", payload.start_host_text),
-                    ("end", payload.end_host_text),
-                ):
-                    segment_key = f"stage-{stage.position}-{suffix}"
-                    old_asset = await database_session.scalar(
-                        select(HostAudioAsset)
-                        .where(
-                            HostAudioAsset.rule_id == rule_id,
-                            HostAudioAsset.segment_key == segment_key,
-                        )
-                        .with_for_update()
+                # Persist the edited stage before rebuilding the manifest.  The
+                # audio builder reads stages through a separate SELECT; an
+                # explicit flush prevents it from reusing the previous hash
+                # when a caller has disabled session autoflush.
+                await database_session.flush()
+                segments = [
+                    (f"stage-{item.position}-{suffix}", text_value)
+                    for item in stages
+                    for suffix, text_value in (
+                        ("start", item.start_host_text),
+                        ("end", item.end_host_text),
                     )
-                    if old_asset is not None:
-                        old_tasks = list(
-                            (
-                                await database_session.scalars(
-                                    select(BackgroundTask).where(
-                                        BackgroundTask.task_type == "HOST_TTS"
-                                    )
-                                )
-                            ).all()
-                        )
-                        for task in old_tasks:
-                            if str(task.payload.get("asset_id", "")) == str(old_asset.id):
-                                await database_session.delete(task)
-                        await database_session.delete(old_asset)
-                        await database_session.flush()
-                    if text_value:
-                        replacement = HostAudioAsset(
-                            rule_id=rule_id,
-                            segment_key=segment_key,
-                            text=text_value,
-                            text_hash=sha256(text_value.encode("utf-8")).hexdigest(),
-                            voice_profile_id=rule.host_voice_profile_id,
-                        )
-                        database_session.add(replacement)
-                        await database_session.flush()
-                        database_session.add(
-                            BackgroundTask(
-                                task_type="HOST_TTS",
-                                payload={"asset_id": str(replacement.id), "rule_id": str(rule_id)},
-                                available_at=current,
-                            )
-                        )
-                remaining_assets = int(
-                    await database_session.scalar(
-                        select(func.count())
-                        .select_from(HostAudioAsset)
-                        .where(HostAudioAsset.rule_id == rule_id)
-                    )
-                    or 0
+                    if text_value
+                ]
+                await self._create_audio_generation(
+                    database_session,
+                    rule=rule,
+                    segments=segments,
+                    voice_profile_id=rule.host_voice_profile_id,
+                    actor_user_id=actor_user_id,
+                    now=current,
                 )
-                rule.status = "GENERATING_AUDIO" if remaining_assets else "READY"
-                rule.audio_reviewed_at = None if remaining_assets else current
             AuditService().record(
                 database_session,
                 actor_user_id=actor_user_id,
@@ -1116,6 +1122,223 @@ class RuleService:
             )
             await database_session.flush()
         return stage
+
+    async def create_rule_stage(
+        self,
+        database_session: AsyncSession,
+        *,
+        rule_id: UUID,
+        payload: RuleStageCreate,
+        actor_user_id: UUID,
+    ) -> RuleStage:
+        async with database_session.begin():
+            rule = await database_session.get(Rule, rule_id, with_for_update=True)
+            if rule is None:
+                raise AuthError("rule_not_found")
+            if rule.historical_read_only or rule.lifecycle_status == "ARCHIVED":
+                raise AuthError("rule_invalid", {"rule_id": "历史规则不可编辑"})
+            stages = list(
+                (
+                    await database_session.scalars(
+                        select(RuleStage)
+                        .where(RuleStage.rule_id == rule_id)
+                        .order_by(RuleStage.position)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            if len(stages) >= 50 or payload.stage_kind == "END":
+                raise AuthError("rule_invalid", {"stage_kind": "只允许一个末尾结束阶段"})
+            position = payload.position or max(1, len(stages))
+            if position > len(stages):
+                raise AuthError("rule_invalid", {"position": "新阶段必须放在结束阶段之前"})
+            original_positions = {item.id: item.position for item in stages}
+            for item in stages:
+                item.position += len(stages) + 1
+            await database_session.flush()
+            for item in stages:
+                original = original_positions[item.id]
+                item.position = original + (1 if original >= position else 0)
+            stage = RuleStage(
+                rule_id=rule_id,
+                position=position,
+                name=payload.name.strip(),
+                stage_kind=payload.stage_kind,
+                duration_seconds=payload.duration_seconds,
+                start_host_text=payload.start_host_text,
+                end_host_text=payload.end_host_text,
+                parameters=dict(payload.parameters),
+            )
+            database_session.add(stage)
+            await database_session.flush()
+            for action_position, action in enumerate(payload.actions, start=1):
+                database_session.add(
+                    StageAction(stage_id=stage.id, position=action_position, **action.model_dump())
+                )
+            if stage.stage_kind in {"FIXED_SPEECH", "FREE_DEBATE"}:
+                text_value = (
+                    DEFAULT_FREE_SPEECH_PROMPT
+                    if stage.stage_kind == "FREE_DEBATE"
+                    else DEFAULT_FIXED_SPEECH_PROMPT
+                )
+                required = (
+                    FREE_SPEECH_VARIABLES
+                    if stage.stage_kind == "FREE_DEBATE"
+                    else FIXED_SPEECH_VARIABLES
+                )
+                database_session.add(
+                    StagePromptTemplate(
+                        stage_id=stage.id,
+                        purpose="SPEECH",
+                        template_text=text_value,
+                        variables=self._validated_prompt(
+                            text_value, required_variables=required, field="speech_prompt"
+                        ),
+                        output_contract="TEXT",
+                    )
+                )
+            if stage.stage_kind == "FREE_DEBATE":
+                database_session.add(
+                    StagePromptTemplate(
+                        stage_id=stage.id,
+                        purpose="DECISION",
+                        template_text=DEFAULT_FREE_DECISION_PROMPT,
+                        variables=self._validated_prompt(
+                            DEFAULT_FREE_DECISION_PROMPT,
+                            required_variables=FREE_DECISION_VARIABLES,
+                            field="decision_prompt",
+                        ),
+                        output_contract="SHOULD_SPEAK_V1",
+                    )
+                )
+            await validate_structure(database_session, rule)
+            await validate_structure(database_session, rule)
+            rule.config_revision += 1
+            await create_generation(
+                database_session,
+                rule=rule,
+                actor_user_id=actor_user_id,
+                configuration=self.audio_configuration,
+            )
+            AuditService().record(
+                database_session,
+                actor_user_id=actor_user_id,
+                action="admin.rule.stage_created",
+                target_type="rule_stage",
+                target_id=str(stage.id),
+                details={"rule_id": str(rule_id)},
+            )
+            await database_session.flush()
+        return stage
+
+    async def reorder_rule_stages(
+        self,
+        database_session: AsyncSession,
+        *,
+        rule_id: UUID,
+        payload: RuleStageReorder,
+        actor_user_id: UUID,
+    ) -> Rule:
+        async with database_session.begin():
+            rule = await database_session.get(Rule, rule_id, with_for_update=True)
+            if rule is None:
+                raise AuthError("rule_not_found")
+            if rule.historical_read_only or rule.lifecycle_status == "ARCHIVED":
+                raise AuthError("rule_invalid", {"rule_id": "历史规则不可编辑"})
+            stages = list(
+                (
+                    await database_session.scalars(
+                        select(RuleStage)
+                        .where(RuleStage.rule_id == rule_id)
+                        .order_by(RuleStage.position)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            if len(stages) != len(payload.stage_ids) or {stage.id for stage in stages} != set(
+                payload.stage_ids
+            ):
+                raise AuthError("rule_invalid", {"stage_ids": "阶段列表必须完整且不可重复"})
+            offset = len(stages) + 1
+            for stage in stages:
+                stage.position += offset
+            await database_session.flush()
+            by_id = {stage.id: stage for stage in stages}
+            for position, stage_id in enumerate(payload.stage_ids, start=1):
+                by_id[stage_id].position = position
+            await validate_structure(database_session, rule)
+            rule.config_revision += 1
+            await create_generation(
+                database_session,
+                rule=rule,
+                actor_user_id=actor_user_id,
+                configuration=self.audio_configuration,
+            )
+            AuditService().record(
+                database_session,
+                actor_user_id=actor_user_id,
+                action="admin.rule.stages_reordered",
+                target_type="rule",
+                target_id=str(rule_id),
+            )
+            await database_session.flush()
+        return rule
+
+    async def delete_rule_stage(
+        self,
+        database_session: AsyncSession,
+        *,
+        rule_id: UUID,
+        stage_id: UUID,
+        actor_user_id: UUID,
+    ) -> Rule:
+        async with database_session.begin():
+            rule = await database_session.get(Rule, rule_id, with_for_update=True)
+            stage = await database_session.get(RuleStage, stage_id, with_for_update=True)
+            if rule is None or stage is None or stage.rule_id != rule_id:
+                raise AuthError("rule_not_found")
+            if rule.historical_read_only or rule.lifecycle_status == "ARCHIVED":
+                raise AuthError("rule_invalid", {"rule_id": "历史规则不可编辑"})
+            if stage.stage_kind == "END":
+                raise AuthError("rule_invalid", {"stage_id": "结束阶段不能删除"})
+            stages = list(
+                (
+                    await database_session.scalars(
+                        select(RuleStage)
+                        .where(RuleStage.rule_id == rule_id)
+                        .order_by(RuleStage.position)
+                        .with_for_update()
+                    )
+                ).all()
+            )
+            if len(stages) <= 1:
+                raise AuthError("rule_invalid", {"stage_id": "至少保留一个阶段"})
+            await database_session.delete(stage)
+            await database_session.flush()
+            remaining = [item for item in stages if item.id != stage_id]
+            for item in remaining:
+                item.position += len(stages) + 1
+            await database_session.flush()
+            for position, item in enumerate(remaining, start=1):
+                item.position = position
+            await validate_structure(database_session, rule)
+            rule.config_revision += 1
+            await create_generation(
+                database_session,
+                rule=rule,
+                actor_user_id=actor_user_id,
+                configuration=self.audio_configuration,
+            )
+            AuditService().record(
+                database_session,
+                actor_user_id=actor_user_id,
+                action="admin.rule.stage_deleted",
+                target_type="rule_stage",
+                target_id=str(stage_id),
+                details={"rule_id": str(rule_id)},
+            )
+            await database_session.flush()
+        return rule
 
     async def save_prompt(
         self,
@@ -1225,7 +1448,7 @@ class RuleService:
                     AgentProfile.rule_id == rule_id,
                     RuleStage.rule_id == rule_id,
                 )
-                .with_for_update()
+                .with_for_update(of=AgentPromptOverride)
             )
             if prompt is not None:
                 await database_session.delete(prompt)
@@ -1280,6 +1503,63 @@ class RuleService:
             await database_session.flush()
         return judge
 
+    async def generate_audio(
+        self,
+        database_session: AsyncSession,
+        *,
+        rule_id: UUID,
+        actor_user_id: UUID | None,
+        force: bool = False,
+    ) -> RuleAudioGeneration:
+        async with database_session.begin():
+            rule = await database_session.get(Rule, rule_id, with_for_update=True)
+            if rule is None:
+                raise AuthError("rule_not_found")
+            if rule.historical_read_only or rule.lifecycle_status == "ARCHIVED":
+                raise AuthError("rule_invalid", {"rule_id": "历史规则不可编辑"})
+            generation = await create_generation(
+                database_session,
+                rule=rule,
+                actor_user_id=actor_user_id,
+                configuration=self.audio_configuration,
+                force=force,
+            )
+            AuditService().record(
+                database_session,
+                actor_user_id=actor_user_id,
+                action="admin.rule.audio_generation_requested",
+                target_type="rule",
+                target_id=str(rule.id),
+                details={"generation_id": str(generation.id), "force": force},
+            )
+            await database_session.flush()
+        return generation
+
+    async def retry_audio(
+        self,
+        database_session: AsyncSession,
+        *,
+        rule_id: UUID,
+        actor_user_id: UUID | None,
+    ) -> RuleAudioGeneration:
+        async with database_session.begin():
+            rule = await database_session.get(Rule, rule_id, with_for_update=True)
+            if rule is None:
+                raise AuthError("rule_not_found")
+            if rule.historical_read_only or rule.lifecycle_status == "ARCHIVED":
+                raise AuthError("rule_invalid", {"rule_id": "历史规则不可编辑"})
+            generation = await repair_generation(database_session, rule=rule, retry=True)
+            AuditService().record(
+                database_session,
+                actor_user_id=actor_user_id,
+                action="admin.rule.audio_generation_retried",
+                target_type="rule",
+                target_id=str(rule.id),
+                details={"generation_id": str(generation.id)},
+            )
+            await database_session.flush()
+        return generation
+
     async def review_audio(
         self,
         database_session: AsyncSession,
@@ -1287,26 +1567,73 @@ class RuleService:
         rule_id: UUID,
         now: datetime | None = None,
         actor_user_id: UUID | None = None,
+        generation_id: UUID | None = None,
+        manifest_hash: str | None = None,
     ) -> Rule:
         async with database_session.begin():
             rule = await database_session.get(Rule, rule_id, with_for_update=True)
             if rule is None:
                 raise AuthError("rule_not_found")
-            non_ready = await database_session.scalar(
-                select(func.count())
-                .select_from(HostAudioAsset)
-                .where(HostAudioAsset.rule_id == rule_id, HostAudioAsset.status != "READY")
-            )
-            if non_ready:
+            if rule.lifecycle_status == "ARCHIVED" or rule.historical_read_only:
                 raise AuthError("rule_audio_not_ready")
-            rule.status = "READY"
-            rule.audio_reviewed_at = now or datetime.now(UTC)
+            if rule.current_audio_generation_id is None:
+                raise AuthError("rule_audio_not_ready")
+            generation = await database_session.get(
+                RuleAudioGeneration, rule.current_audio_generation_id, with_for_update=True
+            )
+            if (
+                generation is None
+                or not generation.is_current
+                or (generation_id is not None and generation.id != generation_id)
+                or (manifest_hash is not None and generation.manifest_hash != manifest_hash)
+            ):
+                raise AuthError("rule_audio_not_ready")
+            expected = await build_manifest(
+                database_session, rule=rule, configuration=self.audio_configuration
+            )
+            if generation.manifest_hash != fingerprint(expected):
+                raise AuthError("rule_audio_not_ready")
+            await aggregate(database_session, rule, generation)
+            if generation.status not in {"SUCCEEDED", "NOT_REQUIRED"}:
+                raise AuthError("rule_audio_not_ready")
+            assets = list(
+                (
+                    await database_session.scalars(
+                        select(HostAudioAsset).where(HostAudioAsset.generation_id == generation.id)
+                    )
+                ).all()
+            )
+            expected_inputs = {
+                item["segment_key"]: item["input_hash"] for item in expected["segments"]
+            }
+            if len(assets) != len(expected_inputs):
+                raise AuthError("rule_audio_not_ready")
+            for asset in assets:
+                if (
+                    asset.status != "READY"
+                    or not asset.storage_path
+                    or (asset.duration_ms or 0) <= 0
+                    or expected_inputs.get(asset.segment_key) != asset.input_hash
+                ):
+                    raise AuthError("rule_audio_not_ready")
+                if self.audio_configuration.storage_root is not None:
+                    path = audio_file(self.audio_configuration.storage_root, asset.storage_path)
+                    if not path.is_file() or path.stat().st_size <= 0:
+                        raise AuthError("host_audio_unavailable")
+            generation.review_status = "APPROVED" if assets else "NOT_REQUIRED"
+            generation.approved_by = actor_user_id if assets else None
+            generation.approved_at = now or datetime.now(UTC) if assets else None
+            project(rule, generation)
             AuditService().record(
                 database_session,
                 actor_user_id=actor_user_id,
                 action="admin.rule.audio_reviewed",
                 target_type="rule",
                 target_id=str(rule.id),
+                details={
+                    "generation_id": str(generation.id),
+                    "manifest_hash": generation.manifest_hash,
+                },
             )
             await database_session.flush()
         return rule
@@ -1333,60 +1660,19 @@ class RuleService:
                 ).all()
             )
             rule = next(version for version in versions if version.id == rule_id)
-            if rule.status not in {"READY", "DISABLED"} or rule.audio_reviewed_at is None:
-                raise AuthError("rule_not_ready")
-            if (
-                rule.side_size != 4
-                or rule.historical_read_only
-                or rule.default_agent_model_profile_id is None
-            ):
-                raise AuthError("rule_not_ready")
-            enabled_agent_count = int(
-                await database_session.scalar(
-                    select(func.count())
-                    .select_from(AgentProfile)
-                    .join(ModelProfile, ModelProfile.id == AgentProfile.model_profile_id)
-                    .join(VoiceProfile, VoiceProfile.id == AgentProfile.voice_profile_id)
-                    .where(
-                        AgentProfile.rule_id == rule_id,
-                        AgentProfile.status == "ENABLED",
-                        ModelProfile.status == "ENABLED",
-                        VoiceProfile.status == "ENABLED",
-                    )
+            inspection = await inspect_rule(
+                database_session, rule, storage_root=self.audio_configuration.storage_root
+            )
+            if rule.lifecycle_status == "ARCHIVED" or not inspection.ready:
+                raise AuthError(
+                    "rule_not_ready", {item.target: item.message for item in inspection.blockers}
                 )
-                or 0
-            )
-            if enabled_agent_count < 8:
-                raise AuthError("agent_capacity_insufficient")
-            stages = list(
-                (
-                    await database_session.scalars(
-                        select(RuleStage).where(RuleStage.rule_id == rule_id)
-                    )
-                ).all()
-            )
-            prompt_rows = list(
-                (
-                    await database_session.execute(
-                        select(StagePromptTemplate.stage_id, StagePromptTemplate.purpose).where(
-                            StagePromptTemplate.stage_id.in_([stage.id for stage in stages])
-                        )
-                    )
-                ).all()
-            )
-            prompt_slots = set(prompt_rows)
-            for stage in stages:
-                if stage.stage_kind == "FIXED_SPEECH" and (stage.id, "SPEECH") not in prompt_slots:
-                    raise AuthError("rule_not_ready")
-                if stage.stage_kind == "FREE_DEBATE" and not {
-                    (stage.id, "SPEECH"),
-                    (stage.id, "DECISION"),
-                }.issubset(prompt_slots):
-                    raise AuthError("rule_not_ready")
             for version in versions:
                 if version.id != rule.id and version.status == "ENABLED":
                     version.status = "DISABLED"
+                    version.lifecycle_status = "DISABLED"
             rule.status = "ENABLED"
+            rule.lifecycle_status = "ENABLED"
             AuditService().record(
                 database_session,
                 actor_user_id=actor_user_id,
@@ -1411,6 +1697,7 @@ class RuleService:
             if rule.status != "ENABLED":
                 raise AuthError("rule_not_enabled")
             rule.status = "DISABLED"
+            rule.lifecycle_status = "DISABLED"
             AuditService().record(
                 database_session,
                 actor_user_id=actor_user_id,
@@ -1447,6 +1734,7 @@ class RuleService:
                 for reference in (room_reference, format_reference, experiment_reference)
             ):
                 rule.status = "ARCHIVED"
+                rule.lifecycle_status = "ARCHIVED"
                 AuditService().record(
                     database_session,
                     actor_user_id=actor_user_id,

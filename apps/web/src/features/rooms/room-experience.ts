@@ -2,6 +2,8 @@ type RuleOption = {
   id: string;
   name: string;
   side_size: number;
+  pure_agent_available?: boolean;
+  available_agent_count?: number;
 };
 
 export function supportedRoomRules(rules: readonly RuleOption[]): RuleOption[] {
@@ -101,7 +103,7 @@ export function derivePreparationFlow({
     };
   }
 
-  if (memberRole === 'SPECTATOR') {
+  if (memberRole === 'SPECTATOR' || (memberRole === 'ORGANIZER' && !hasOwnSeat)) {
     return {
       activeStep: 4,
       completedSteps: [1, 2, 3, 4],

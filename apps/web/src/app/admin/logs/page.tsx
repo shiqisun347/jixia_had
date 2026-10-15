@@ -14,11 +14,7 @@ import {
   StatusBadge,
 } from '@/features/admin/admin-controls';
 import { AdminEmpty, AdminFeedback, AdminPageHeader, AdminPanel } from '@/features/admin/admin-ui';
-import type {
-  AdminPage,
-  ExternalCallDetail,
-  ExternalCallRow,
-} from '@/features/admin/admin-types';
+import type { AdminPage, ExternalCallDetail, ExternalCallRow } from '@/features/admin/admin-types';
 
 const REFRESH_OPTIONS = [
   { value: 0, label: '关闭' },
@@ -130,7 +126,8 @@ export default function AdminApiRequestLogsPage() {
 
   const rows = visible?.items ?? [];
   const newCount = buffered
-    ? buffered.items.filter((item) => !rows.some((visibleItem) => visibleItem.id === item.id)).length
+    ? buffered.items.filter((item) => !rows.some((visibleItem) => visibleItem.id === item.id))
+        .length
     : 0;
   return (
     <div className="space-y-6">
@@ -177,14 +174,46 @@ export default function AdminApiRequestLogsPage() {
             }}
             placeholder="精确输入比赛 ID"
           />
-          <LogSelect label="调用类型" value={kind} options={KIND_OPTIONS} onChange={setKind} setPage={setPage} />
-          <LogSelect label="来源" value={source} options={SOURCE_OPTIONS} onChange={setSource} setPage={setPage} />
-          <LogSelect label="状态" value={status} options={[
-            ['ALL', '全部状态'], ['STARTED', '进行中'], ['SUCCEEDED', '成功'], ['FAILED', '失败'], ['CANCELLED', '已取消'],
-          ]} onChange={setStatus} setPage={setPage} />
-          <LogSelect label="时间范围" value={range} options={[
-            ['15m', '最近 15 分钟'], ['1h', '最近 1 小时'], ['6h', '最近 6 小时'], ['24h', '最近 24 小时'], ['ALL', '全部时间'],
-          ]} onChange={setRange} setPage={setPage} />
+          <LogSelect
+            label="调用类型"
+            value={kind}
+            options={KIND_OPTIONS}
+            onChange={setKind}
+            setPage={setPage}
+          />
+          <LogSelect
+            label="来源"
+            value={source}
+            options={SOURCE_OPTIONS}
+            onChange={setSource}
+            setPage={setPage}
+          />
+          <LogSelect
+            label="状态"
+            value={status}
+            options={[
+              ['ALL', '全部状态'],
+              ['STARTED', '进行中'],
+              ['SUCCEEDED', '成功'],
+              ['FAILED', '失败'],
+              ['CANCELLED', '已取消'],
+            ]}
+            onChange={setStatus}
+            setPage={setPage}
+          />
+          <LogSelect
+            label="时间范围"
+            value={range}
+            options={[
+              ['15m', '最近 15 分钟'],
+              ['1h', '最近 1 小时'],
+              ['6h', '最近 6 小时'],
+              ['24h', '最近 24 小时'],
+              ['ALL', '全部时间'],
+            ]}
+            onChange={setRange}
+            setPage={setPage}
+          />
         </div>
         {newCount > 0 ? (
           <AdminButton
@@ -199,7 +228,11 @@ export default function AdminApiRequestLogsPage() {
           </AdminButton>
         ) : null}
         {callsQuery.isLoading && !visible ? (
-          <div className="h-64 animate-pulse rounded-md bg-slate-50" role="status" aria-label="正在加载 API 请求日志" />
+          <div
+            className="h-64 animate-pulse rounded-md bg-slate-50"
+            role="status"
+            aria-label="正在加载 API 请求日志"
+          />
         ) : rows.length ? (
           <div className="overflow-x-auto rounded-md border border-slate-200 text-xs">
             <div className="min-w-[64rem]">
@@ -210,13 +243,21 @@ export default function AdminApiRequestLogsPage() {
                   onClick={() => setSelected(row)}
                   type="button"
                 >
-                  <time className="text-slate-500">{new Date(row.started_at).toLocaleString('zh-CN')}</time>
+                  <time className="text-slate-500">
+                    {new Date(row.started_at).toLocaleString('zh-CN')}
+                  </time>
                   <span className="font-bold text-slate-900">{row.kind_label}</span>
                   <span className="text-slate-600">{sourceLabel(row.source_kind)}</span>
-                  <span className="truncate font-mono text-slate-600">{row.provider} / {row.operation}</span>
+                  <span className="truncate font-mono text-slate-600">
+                    {row.provider} / {row.operation}
+                  </span>
                   <StatusBadge status={row.status} />
                   <span>第 {row.attempt_no} 次</span>
-                  <span>{row.completed_latency_ms === null ? '未完成' : `${row.completed_latency_ms} ms`}</span>
+                  <span>
+                    {row.completed_latency_ms === null
+                      ? '未完成'
+                      : `${row.completed_latency_ms} ms`}
+                  </span>
                   <Eye className="size-3.5 text-slate-400" />
                 </button>
               ))}
@@ -226,7 +267,12 @@ export default function AdminApiRequestLogsPage() {
           <AdminEmpty>没有符合筛选条件的新版本 API 请求日志。</AdminEmpty>
         )}
         {visible ? (
-          <AdminPagination page={visible.page} total={visible.total} totalPages={visible.total_pages} onPageChange={setPage} />
+          <AdminPagination
+            page={visible.page}
+            total={visible.total}
+            totalPages={visible.total_pages}
+            onPageChange={setPage}
+          />
         ) : null}
       </AdminPanel>
       <ProviderCallDrawer selected={selected} onClose={() => setSelected(null)} />
@@ -234,7 +280,13 @@ export default function AdminApiRequestLogsPage() {
   );
 }
 
-function LogSelect({ label, value, options, onChange, setPage }: {
+function LogSelect({
+  label,
+  value,
+  options,
+  onChange,
+  setPage,
+}: {
   label: string;
   value: string;
   options: readonly (readonly [string, string])[];
@@ -242,16 +294,28 @@ function LogSelect({ label, value, options, onChange, setPage }: {
   setPage: (page: number) => void;
 }) {
   return (
-    <AdminSelect aria-label={label} label={label} value={value} onChange={(event) => {
-      setPage(1);
-      onChange(event.target.value);
-    }}>
-      {options.map(([key, text]) => <option key={key} value={key}>{text}</option>)}
+    <AdminSelect
+      aria-label={label}
+      label={label}
+      value={value}
+      onChange={(event) => {
+        setPage(1);
+        onChange(event.target.value);
+      }}
+    >
+      {options.map(([key, text]) => (
+        <option key={key} value={key}>
+          {text}
+        </option>
+      ))}
     </AdminSelect>
   );
 }
 
-function ProviderCallDrawer({ selected, onClose }: {
+function ProviderCallDrawer({
+  selected,
+  onClose,
+}: {
   selected: ExternalCallRow | null;
   onClose: () => void;
 }) {
@@ -263,12 +327,18 @@ function ProviderCallDrawer({ selected, onClose }: {
   return (
     <AdminDrawer
       open={Boolean(selected)}
-      onOpenChange={(open) => { if (!open) onClose(); }}
+      onOpenChange={(open) => {
+        if (!open) onClose();
+      }}
       title="API 请求详情"
       description="仅显示已经通过服务端安全边界的供应商 JSON。"
     >
-      {detail.isLoading ? <div className="h-64 animate-pulse rounded-md bg-slate-100" role="status" /> : null}
-      {detail.error ? <AdminFeedback message={readableAdminError(detail.error)} tone="error" /> : null}
+      {detail.isLoading ? (
+        <div className="h-64 animate-pulse rounded-md bg-slate-100" role="status" />
+      ) : null}
+      {detail.error ? (
+        <AdminFeedback message={readableAdminError(detail.error)} tone="error" />
+      ) : null}
       {detail.data ? <ProviderJson detail={detail.data} /> : null}
     </AdminDrawer>
   );
@@ -278,19 +348,44 @@ function ProviderJson({ detail }: { detail: ExternalCallDetail }) {
   return (
     <div className="space-y-4">
       <div className="grid gap-2 text-xs sm:grid-cols-2">
-        <p><strong>业务动作：</strong><span className="break-all font-mono">{detail.logical_call_id ?? '未记录'}</span></p>
-        <p><strong>供应商请求：</strong><span className="break-all font-mono">{detail.provider_request_id ?? '未记录'}</span></p>
+        <p>
+          <strong>业务动作：</strong>
+          <span className="break-all font-mono">{detail.logical_call_id ?? '未记录'}</span>
+        </p>
+        <p>
+          <strong>供应商请求：</strong>
+          <span className="break-all font-mono">{detail.provider_request_id ?? '未记录'}</span>
+        </p>
       </div>
-      <JsonSection title="请求 JSON" value={detail.request} status={detail.request_capture_status} />
-      <JsonSection title="响应 JSON" value={detail.response} status={detail.response_capture_status} />
+      <JsonSection
+        title="请求 JSON"
+        value={detail.request}
+        status={detail.request_capture_status}
+      />
+      <JsonSection
+        title="响应 JSON"
+        value={detail.response}
+        status={detail.response_capture_status}
+      />
       {detail.content_errors.length ? (
-        <AdminFeedback message={`部分内容无法读取：${detail.content_errors.join('、')}`} tone="error" />
+        <AdminFeedback
+          message={`部分内容无法读取：${detail.content_errors.join('、')}`}
+          tone="error"
+        />
       ) : null}
     </div>
   );
 }
 
-function JsonSection({ title, value, status }: { title: string; value: unknown; status: string | null }) {
+function JsonSection({
+  title,
+  value,
+  status,
+}: {
+  title: string;
+  value: unknown;
+  status: string | null;
+}) {
   const text = value === null || value === undefined ? '未记录' : JSON.stringify(value, null, 2);
   return (
     <section className="overflow-hidden rounded-md border border-slate-200">
@@ -298,7 +393,9 @@ function JsonSection({ title, value, status }: { title: string; value: unknown; 
         <h3 className="text-sm font-black text-slate-900">{title}</h3>
         <StatusBadge status={status ?? 'UNAVAILABLE'} />
       </div>
-      <pre className="max-h-[24rem] overflow-auto whitespace-pre-wrap break-all bg-slate-950 p-4 text-xs leading-6 text-slate-100">{text}</pre>
+      <pre className="max-h-[24rem] overflow-auto whitespace-pre-wrap break-all bg-slate-950 p-4 text-xs leading-6 text-slate-100">
+        {text}
+      </pre>
     </section>
   );
 }

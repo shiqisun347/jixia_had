@@ -2,7 +2,7 @@
 
 import { Bot, Pencil, RotateCcw } from 'lucide-react';
 import Image from 'next/image';
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { useOptionalToast } from '@/components/ui/toast-provider';
 import { readableAdminError } from '@/features/admin/admin-api';
@@ -48,6 +48,9 @@ export default function AdminAgentsPage() {
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [selectedAgent, setSelectedAgent] = useState<AgentRow | null>(null);
   const [loading, setLoading] = useState(true);
+  const [pendingAgentId, setPendingAgentId] = useState('');
+  const loadVersion = useRef(0);
+  const currentRuleId = useRef('');
   const [error, setError] = useState('');
 
   useEffect(() => {
@@ -56,10 +59,11 @@ export default function AdminAgentsPage() {
       requestJson<Catalog>('/api/admin/catalog'),
       requestJson<RuleRow[]>('/api/admin/rules'),
     ])
-      .then(async ([nextCatalog, nextRules]) => {
+      .then(([nextCatalog, nextRules]) => {
         if (!active) return;
         const usable = nextRules.filter(
-          (rule) => rule.side_size === 4 && !rule.historical_read_only,
+          (rule) =>
+            rule.side_size === 4 && !rule.historical_read_only && rule.status !== 'ARCHIVED',
         );
         setCatalog(nextCatalog);
         setRules(usable);
@@ -69,13 +73,6 @@ export default function AdminAgentsPage() {
           return;
         }
         setRuleId(remembered);
-        const [nextAgents, nextWorkspace] = await Promise.all([
-          requestJson<AgentRow[]>(`/api/admin/rules/${remembered}/agents`),
-          requestJson<Workspace>(`/api/admin/rules/${remembered}/workspace`),
-        ]);
-        if (!active) return;
-        setAgents(nextAgents);
-        setWorkspace(nextWorkspace);
       })
       .catch((requestError: unknown) => {
         if (active) setError(readableAdminError(requestError));
@@ -89,6 +86,7 @@ export default function AdminAgentsPage() {
   }, []);
 
   const reloadRule = useCallback(async (selectedRuleId: string) => {
+    const version = ++loadVersion.current;
     if (!selectedRuleId) {
       setAgents([]);
       setWorkspace(null);
@@ -100,20 +98,71 @@ export default function AdminAgentsPage() {
         requestJson<AgentRow[]>(`/api/admin/rules/${selectedRuleId}/agents`),
         requestJson<Workspace>(`/api/admin/rules/${selectedRuleId}/workspace`),
       ]);
+      if (version !== loadVersion.current) return;
       setAgents(nextAgents);
       setWorkspace(nextWorkspace);
       setError('');
     } catch (requestError: unknown) {
-      setError(readableAdminError(requestError));
+      if (version === loadVersion.current) setError(readableAdminError(requestError));
     } finally {
-      setLoading(false);
+      if (version === loadVersion.current) setLoading(false);
     }
   }, []);
 
+  useEffect(() => {
+    currentRuleId.current = ruleId;
+    let active = true;
+    queueMicrotask(() => {
+      if (active) void reloadRule(ruleId);
+    });
+    return () => {
+      active = false;
+      loadVersion.current += 1;
+    };
+  }, [ruleId, reloadRule]);
+
   function selectRule(selectedRuleId: string) {
+    currentRuleId.current = selectedRuleId;
+    loadVersion.current += 1;
+    setSelectedAgent(null);
+    setAgents([]);
+    setWorkspace(null);
     setRuleId(selectedRuleId);
     if (selectedRuleId) window.localStorage.setItem(RULE_STORAGE_KEY, selectedRuleId);
-    void reloadRule(selectedRuleId);
+    else window.localStorage.removeItem(RULE_STORAGE_KEY);
+  }
+
+  async function toggleAgent(agent: AgentRow) {
+    if (pendingAgentId) return;
+    const selectedRuleId = ruleId;
+    setPendingAgentId(agent.id);
+    try {
+      const updated = await requestJson<AgentRow>(
+        `/api/admin/rules/${selectedRuleId}/agents/${agent.id}/status`,
+        {
+          method: 'PATCH',
+          body: JSON.stringify({ status: agent.status === 'ENABLED' ? 'DISABLED' : 'ENABLED' }),
+        },
+      );
+      if (currentRuleId.current === selectedRuleId) {
+        setAgents((items) =>
+          items.map((item) =>
+            item.id === agent.id
+              ? { ...item, ...updated, prompt_override_count: item.prompt_override_count }
+              : item,
+          ),
+        );
+      }
+      toast?.showToast({
+        message: `${agent.name} 已在本赛制${updated.status === 'ENABLED' ? '启用' : '停用'}`,
+        tone: 'success',
+      });
+    } catch (requestError: unknown) {
+      setError(readableAdminError(requestError));
+      toast?.showToast({ message: readableAdminError(requestError), tone: 'error' });
+    } finally {
+      setPendingAgentId('');
+    }
   }
 
   const selectedRule = rules.find((rule) => rule.id === ruleId);
@@ -132,14 +181,14 @@ export default function AdminAgentsPage() {
   return (
     <div className="space-y-6">
       <AdminPageHeader
-        description="每套赛制拥有独立 Agent 池。选择赛制后，才能查看和编辑其中的 Agent。"
+        description="启用的 Agent 音色自动同步到各赛制；每套赛制独立决定是否使用对应 Agent。"
         eyebrow="RULE AGENT POOLS"
         title="Agent 管理"
       />
       {error ? <AdminFeedback message={error} tone="error" /> : null}
       <AdminPanel
         action={selectedRule ? <StatusBadge status={selectedRule.status} /> : null}
-        description="Agent 由启用的全局音色自动生成，不支持手工新增、删除或跨赛制复制。"
+        description="名称、头像和语速跟随全局音色。本赛制的启停选择会保留，不受音色编辑或重新启用影响。"
         title="选择赛制规则"
       >
         <AdminSelect
@@ -151,7 +200,15 @@ export default function AdminAgentsPage() {
           <option value="">请选择赛制规则</option>
           {rules.map((rule) => (
             <option key={rule.id} value={rule.id}>
-              {rule.name}
+              {rule.name} ·{' '}
+              {rule.status === 'ENABLED'
+                ? '已启用'
+                : rule.status === 'READY'
+                  ? '已就绪'
+                  : rule.status === 'DISABLED'
+                    ? '已停用'
+                    : '配置中'}{' '}
+              · {rule.id.slice(0, 8)}
             </option>
           ))}
         </AdminSelect>
@@ -164,10 +221,30 @@ export default function AdminAgentsPage() {
           description={`${agents.length} 个 Agent · 名称、头像、音色和语速跟随全局音色`}
           title={selectedRule?.name ?? 'Agent 池'}
         >
+          {selectedRule && !selectedRule.default_agent_model_profile_id ? (
+            <div className="mb-4">
+              <AdminFeedback
+                message="本赛制尚未配置默认 Agent 模型，选择默认模型后将自动同步启用音色。"
+                tone="info"
+              />
+              <a
+                className="text-sm font-bold text-blue-700 underline"
+                href={`/admin/rules/${ruleId}`}
+              >
+                配置赛制默认模型
+              </a>
+            </div>
+          ) : null}
           {loading ? (
             <p className="py-10 text-center text-sm text-slate-500">正在加载 Agent 池…</p>
           ) : agents.length ? (
-            <AgentTable agents={agents} catalog={catalog} onEdit={setSelectedAgent} />
+            <AgentTable
+              agents={agents}
+              catalog={catalog}
+              onEdit={setSelectedAgent}
+              onToggle={(agent) => void toggleAgent(agent)}
+              pendingAgentId={pendingAgentId}
+            />
           ) : (
             <AdminFeedback
               message="该规则还没有 Agent。请先启用 Agent 音色或检查默认模型。"
@@ -200,10 +277,14 @@ function AgentTable({
   agents,
   catalog,
   onEdit,
+  onToggle,
+  pendingAgentId,
 }: {
   agents: AgentRow[];
   catalog: Catalog;
   onEdit: (agent: AgentRow) => void;
+  onToggle: (agent: AgentRow) => void;
+  pendingAgentId: string;
 }) {
   const voices = new Map(catalog.voices.map((voice) => [voice.id, voice]));
   const models = new Map(catalog.models.map((model) => [model.id, model.name]));
@@ -216,13 +297,23 @@ function AgentTable({
             <th className="px-4 py-3">音色</th>
             <th className="px-4 py-3">模型</th>
             <th className="px-4 py-3">Prompt</th>
-            <th className="px-4 py-3">状态</th>
+            <th className="px-4 py-3">本赛制启用</th>
+            <th className="px-4 py-3">当前可用状态</th>
             <th className="px-4 py-3 text-right">操作</th>
           </tr>
         </thead>
         <tbody className="divide-y divide-slate-200">
           {agents.map((agent) => {
             const voice = voices.get(agent.voice_profile_id);
+            const model = catalog.models.find((item) => item.id === agent.model_profile_id);
+            const reason =
+              agent.status !== 'ENABLED'
+                ? '本赛制已停用'
+                : (agent.voice_status ?? voice?.status) !== 'ENABLED'
+                  ? '音色已停用'
+                  : (agent.model_status ?? model?.status) !== 'ENABLED'
+                    ? '模型已停用'
+                    : null;
             return (
               <tr key={agent.id}>
                 <td className="px-4 py-3">
@@ -245,7 +336,29 @@ function AgentTable({
                     : '使用赛制默认'}
                 </td>
                 <td className="px-4 py-3">
-                  <StatusBadge status={agent.status} />
+                  <label className="flex cursor-pointer items-center gap-2 whitespace-nowrap">
+                    <input
+                      type="checkbox"
+                      role="switch"
+                      aria-label={`${agent.name} 本赛制启用`}
+                      checked={agent.status === 'ENABLED'}
+                      disabled={Boolean(pendingAgentId)}
+                      onChange={() => onToggle(agent)}
+                      className="size-4 accent-blue-700"
+                    />
+                    {pendingAgentId === agent.id
+                      ? '保存中…'
+                      : agent.status === 'ENABLED'
+                        ? '启用'
+                        : '停用'}
+                  </label>
+                </td>
+                <td className="px-4 py-3">
+                  {reason ? (
+                    <span className="text-xs text-slate-600">{reason}</span>
+                  ) : (
+                    <StatusBadge status="ENABLED" />
+                  )}
                 </td>
                 <td className="px-4 py-3 text-right">
                   <AdminButton onClick={() => onEdit(agent)} size="sm">
@@ -371,7 +484,7 @@ function AgentEditor({
           ))}
         </EditorSelect>
         <EditorSelect
-          label="状态"
+          label="本赛制启用状态"
           onChange={(value) => setStatus(value as typeof status)}
           value={status}
         >

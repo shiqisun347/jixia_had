@@ -16,6 +16,7 @@ from livekit import api
 from pydantic import ValidationError
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import load_only
 
 from ..audit.service import AuditService
 from ..auth.dependencies import (
@@ -63,6 +64,8 @@ from .service import MatchRuntimeManager
 
 router = APIRouter()
 MATCH_TOKEN_TTL_SECONDS = 600
+MAX_TRANSCRIPT_SPEECHES = 1024
+MAX_TRANSCRIPT_CHARS = 512_000
 logger = logging.getLogger(__name__)
 
 
@@ -276,8 +279,8 @@ def _snapshot_response(
                 opportunity_generation=state.opportunity_generation,
                 selection_phase=state.selection_phase,
                 agent_status=state.agent_effective_status,
-                selection_remaining_ms=state.selection_remaining_ms,
-                human_wait_remaining_ms=state.human_wait_remaining_ms,
+                selection_remaining_ms=view.selection_remaining_ms,
+                human_wait_remaining_ms=view.human_wait_remaining_ms,
             )
             if state.free_competition_enabled and can_view_team
             else None
@@ -413,8 +416,10 @@ async def _member(
         if fallback is not None:
             match, room = fallback
             # Virtual spectator: admins must not consume room capacity or alter seats.
-            return match, room, RoomMember(
-                room_id=room.id, user_id=user_id, member_role="SPECTATOR"
+            return (
+                match,
+                room,
+                RoomMember(room_id=room.id, user_id=user_id, member_role="SPECTATOR"),
             )
     if row is None:
         _raise("room_member_required")
@@ -541,11 +546,46 @@ async def start_match_runtime(
 ) -> MatchSnapshotResponse:
     manager = _manager(request.app)
     try:
+        state = await manager.start_existing_match_runtime(
+            session,
+            room_id=room_id,
+            actor_user_id=context.user_id,
+            actor_role=context.role,
+        )
+    except (AuthError, MatchDomainError) as error:
+        _raise(error.code)
+    view = await manager.snapshot_view(session, state.match_id)
+    _, _, member = await _member(session, state.match_id, context.user_id, context.role)
+    return _snapshot_response(
+        view,
+        room_id,
+        viewer_user_id=context.user_id,
+        member_role=member.member_role,
+        admin_control=context.role == "ADMIN",
+    )
+
+
+@router.post(
+    "/api/rooms/{room_id}/prepare-match",
+    response_model=MatchSnapshotResponse,
+    response_model_exclude_none=True,
+    tags=["matches"],
+    dependencies=[Depends(require_browser_origin)],
+)
+async def prepare_match(
+    room_id: UUID,
+    request: Request,
+    context: Annotated[AuthContext, Depends(get_changed_password_auth)],
+    session: Annotated[AsyncSession, Depends(get_database_session)],
+) -> MatchSnapshotResponse:
+    manager = _manager(request.app)
+    try:
         state = await manager.start_room_match(
             session,
             room_id=room_id,
             actor_user_id=context.user_id,
             actor_role=context.role,
+            launch_runtime=False,
         )
     except (AuthError, MatchDomainError) as error:
         _raise(error.code)
@@ -612,11 +652,41 @@ async def get_match_transcript(
         (
             await session.scalars(
                 select(Speech)
+                .options(
+                    load_only(
+                        Speech.id,
+                        Speech.match_id,
+                        Speech.action_key,
+                        Speech.user_id,
+                        Speech.speaker_kind,
+                        Speech.origin,
+                        Speech.agent_profile_id,
+                        Speech.generation_id,
+                        Speech.side,
+                        Speech.seat_no,
+                        Speech.status,
+                        Speech.asr_raw_final_text,
+                        Speech.display_text,
+                        Speech.audio_duration_ms,
+                        Speech.finalized_at,
+                        Speech.audio_truncated,
+                    )
+                )
                 .where(Speech.match_id == match_id, Speech.status == "FINALIZED")
                 .order_by(Speech.created_at)
+                .limit(MAX_TRANSCRIPT_SPEECHES + 1)
             )
         ).all()
     )
+    if (
+        len(speeches) > MAX_TRANSCRIPT_SPEECHES
+        or sum(
+            len(speech.display_text or "") + len(speech.asr_raw_final_text or "")
+            for speech in speeches
+        )
+        > MAX_TRANSCRIPT_CHARS
+    ):
+        _raise("transcript_too_large")
     return TranscriptResponse(
         match_id=match_id,
         context_version=match.context_version,
@@ -627,6 +697,7 @@ async def get_match_transcript(
                 action_key=speech.action_key,
                 user_id=speech.user_id,
                 speaker_kind=speech.speaker_kind,
+                origin="ADMIN_PLACEHOLDER" if speech.origin == "ADMIN_PLACEHOLDER" else "ORIGINAL",
                 agent_profile_id=speech.agent_profile_id,
                 # Generation IDs are internal callback identities. They are
                 # useful to administrators for diagnostics, but must not be
@@ -936,52 +1007,98 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
             room_id=room.id,
             connection_id=connection_id,
         )
-    async with factory() as session:
-        presence = getattr(websocket.app.state, "presence", None)
-        presence_joined = False
-        if presence is not None and member.member_role == "DEBATER":
-            try:
-                await presence.websocket_joined(
+    presence = getattr(websocket.app.state, "presence", None)
+    presence_joined = False
+    presence_attempted = False
+    fallback_online_attempted = False
+    queue: asyncio.Queue[MatchEvent] | None = None
+    try:
+        async with factory() as session:
+            if presence is not None and member.member_role == "DEBATER":
+                presence_attempted = True
+                try:
+                    await presence.websocket_joined(
+                        match_id, context.user_id, lease.connection_epoch, connection_id
+                    )
+                    presence_joined = True
+                except Exception as error:
+                    logger.warning(
+                        "WebSocket presence registration failed",
+                        extra={
+                            "error_code": "websocket_presence_registration_failed",
+                            "match_id": str(match_id),
+                            "connection_epoch": lease.connection_epoch,
+                            "details": {"exception_type": type(error).__name__},
+                        },
+                    )
+            if member.member_role == "DEBATER" and (presence is None or not presence_joined):
+                fallback_online_attempted = True
+                try:
+                    await manager.submit(
+                        match_id,
+                        MatchCommand(
+                            type="member.online",
+                            message_id=f"member-online:{context.user_id}:{lease.connection_epoch}",
+                            actor_user_id=context.user_id,
+                            payload={"connection_epoch": lease.connection_epoch},
+                        ),
+                    )
+                except MatchDomainError:
+                    pass
+        # Subscribe before taking the final snapshot.  Otherwise an authoritative
+        # transition between the initial query and subscription can be lost, leaving
+        # a reconnecting browser with a stale action/timer indefinitely.
+        queue = await manager.subscribe(match_id)
+        async with factory() as snapshot_session:
+            view = await manager.snapshot_view(snapshot_session, match.id)
+        # Do not reuse the session from the previous context.  A WebSocket can
+        # remain open for hours; querying a closed AsyncSession here reopens a
+        # transaction without a surrounding context and leaks a pool connection.
+        if view.state.status in {"PAUSED", "SYSTEM_RECOVERY", "ERROR"}:
+            async with factory() as resume_session:
+                resume_reasons = await _resume_reasons(resume_session, room.id)
+        else:
+            resume_reasons = []
+    except BaseException:
+        # Lease acquisition, presence registration, subscription and snapshot
+        # form one handshake.  Cancellation or a database failure at any point
+        # must roll back every resource before the socket is accepted.
+        if queue is not None:
+            await manager.unsubscribe(match_id, queue)
+        async with factory() as session:
+            released = await RoomConnectionService().release(
+                session,
+                user_id=context.user_id,
+                connection_id=connection_id,
+                connection_epoch=lease.connection_epoch,
+            )
+        if (
+            presence is not None
+            and member.member_role == "DEBATER"
+            and (presence_joined or presence_attempted)
+        ):
+            with suppress(Exception):
+                await presence.websocket_left(
                     match_id, context.user_id, lease.connection_epoch, connection_id
                 )
-                presence_joined = True
-            except Exception as error:
-                logger.warning(
-                    "WebSocket presence registration failed",
-                    extra={
-                        "error_code": "websocket_presence_registration_failed",
-                        "match_id": str(match_id),
-                        "connection_epoch": lease.connection_epoch,
-                        "details": {"exception_type": type(error).__name__},
-                    },
-                )
-        if member.member_role == "DEBATER" and (presence is None or not presence_joined):
-            try:
+        if member.member_role == "DEBATER" and fallback_online_attempted and released:
+            with suppress(Exception):
                 await manager.submit(
                     match_id,
                     MatchCommand(
-                        type="member.online",
-                        message_id=f"member-online:{context.user_id}:{lease.connection_epoch}",
+                        type="member.offline",
+                        message_id=f"member-offline:{context.user_id}:{lease.connection_epoch}",
                         actor_user_id=context.user_id,
                         payload={"connection_epoch": lease.connection_epoch},
                     ),
                 )
-            except MatchDomainError:
-                pass
-    # Subscribe before taking the final snapshot.  Otherwise an authoritative
-    # transition between the initial query and subscription can be lost, leaving
-    # a reconnecting browser with a stale action/timer indefinitely.
-    queue = await manager.subscribe(match_id)
-    async with factory() as snapshot_session:
-        view = await manager.snapshot_view(snapshot_session, match.id)
-    # Do not reuse the session from the previous context.  A WebSocket can
-    # remain open for hours; querying a closed AsyncSession here reopens a
-    # transaction without a surrounding context and leaks a pool connection.
-    if view.state.status in {"PAUSED", "SYSTEM_RECOVERY", "ERROR"}:
-        async with factory() as resume_session:
-            resume_reasons = await _resume_reasons(resume_session, room.id)
-    else:
-        resume_reasons = []
+        if member.member_role != "DEBATER" and released:
+            async with factory() as session:
+                await _set_member_online(
+                    session, room_id=room.id, user_id=context.user_id, online=False
+                )
+        raise
+    assert queue is not None
     sender_boundary = _SerializedWebSocketSender(websocket)
 
     async def send_events() -> None:

@@ -34,7 +34,10 @@ export class ApiClientError extends Error {
 
 const INVALID_API_RESPONSE_MESSAGE = '服务返回异常，请稍后重试。';
 
-export async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+export async function requestJsonWithHeaders<T>(
+  path: string,
+  init?: RequestInit,
+): Promise<{ data: T; headers: Headers }> {
   const response = await fetch(path, {
     ...init,
     credentials: 'include',
@@ -56,12 +59,17 @@ export async function requestJson<T>(path: string, init?: RequestInit): Promise<
     throw new ApiClientError(response.status, payload);
   }
   try {
-    return (await response.json()) as T;
+    return { data: (await response.json()) as T, headers: response.headers };
   } catch {
     throw new ApiClientError(response.status, {
       error: { code: 'invalid_api_response', message: INVALID_API_RESPONSE_MESSAGE },
     });
   }
+}
+
+export async function requestJson<T>(path: string, init?: RequestInit): Promise<T> {
+  const result = await requestJsonWithHeaders<T>(path, init);
+  return result.data;
 }
 
 export const authApi = {

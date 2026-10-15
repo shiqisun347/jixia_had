@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import shutil
 from contextlib import suppress
@@ -19,17 +20,29 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.sql.elements import ColumnElement
 
 from .agent.audio import apply_ogg_opus_gain
-from .agent.llm import LlmProviderError, OpenAIStreamingClient
+from .agent.llm import (
+    LlmCapacityLimiter,
+    LlmProviderError,
+    OpenAIStreamingClient,
+    close_llm_client_bounded,
+)
 from .agent.tts import QwenTtsConnection
 from .audit.service import AuditService
 from .auth.dependencies import get_admin_auth, get_database_session, require_browser_origin
 from .auth.session import AuthContext
 from .config import Settings
 from .data_capture.content import load_content_blob
+from .data_capture.content_gc import collect_match_blob_ids, collect_unreferenced_content_blobs
 from .data_capture.diagnostics import DiagnosticWriter
-from .data_capture.provider import PROVIDER_CAPTURE_VERSION, ProviderCallCapture
-from .data_capture.provider_persistence import persist_provider_capture
-from .matches.domain import MatchCommand, MatchDomainError
+from .data_capture.provider import PROVIDER_CAPTURE_VERSION
+from .data_capture.provider_writer import (
+    ProviderCaptureWriter,
+    new_provider_capture,
+    prepare_capture,
+    submit_capture,
+)
+from .matches.domain import MatchCommand, MatchCommandResult, MatchDomainError
+from .matches.emergency import MatchEmergencyCoordinator
 from .matches.service import MatchRuntimeManager
 from .models import (
     AgentFreeDebateDecision,
@@ -37,7 +50,6 @@ from .models import (
     AgentProfile,
     AuditLog,
     BackgroundTask,
-    CallContentBlob,
     DeviceCheck,
     ExperimentMatchAttempt,
     ExperimentResultOverride,
@@ -75,7 +87,11 @@ from .postmatch import PostmatchService
 from .security.crypto import decrypt_secret
 
 router = APIRouter(prefix="/api/admin", tags=["admin"])
+logger = logging.getLogger("jx-core.admin")
+MODEL_TEST_DIAGNOSTIC_TIMEOUT_SECONDS = 0.5
 VOICE_PREVIEW_TEXT = "观点需要证据支撑，反驳也应准确回应对方的核心论证。"
+VOICE_PREVIEW_CONCURRENCY = 2
+_VOICE_PREVIEW_SEMAPHORE = asyncio.Semaphore(VOICE_PREVIEW_CONCURRENCY)
 
 
 class UserPatch(BaseModel):
@@ -85,7 +101,62 @@ class UserPatch(BaseModel):
 
 
 class MatchControlRequest(BaseModel):
-    action: Literal["terminate", "resume", "recover", "reset_speech"]
+    model_config = ConfigDict(extra="forbid")
+    action: Literal[
+        "pause",
+        "terminate",
+        "resume",
+        "recover",
+        "reset_speech",
+        "reset_stage",
+        "skip_speech",
+        "cancel_skip",
+    ]
+    operation_id: UUID | None = None
+    expected_sequence: int | None = Field(default=None, ge=0)
+    expected_action_key: str | None = Field(default=None, max_length=32)
+    expected_stage_generation: int | None = Field(default=None, ge=0)
+    expected_speech_id: UUID | None = None
+    expected_context_version: int | None = Field(default=None, ge=0)
+
+    @model_validator(mode="after")
+    def require_emergency_identity(self) -> MatchControlRequest:
+        if (
+            self.action in {"reset_stage", "skip_speech", "cancel_skip"}
+            and self.operation_id is None
+        ):
+            raise ValueError("应急操作需要稳定的操作编号")
+        if (
+            self.action in {"reset_speech", "reset_stage", "skip_speech"}
+            and self.operation_id is not None
+        ):
+            if any(
+                getattr(self, field) is None
+                for field in (
+                    "expected_sequence",
+                    "expected_action_key",
+                    "expected_stage_generation",
+                    "expected_context_version",
+                )
+            ):
+                raise ValueError("请刷新当前比赛状态后再执行应急操作")
+        return self
+
+
+class MatchControlTargetResponse(BaseModel):
+    match_id: UUID
+    status: str
+    action_state: str
+    stage_name: str
+    sequence: int
+    context_version: int
+    action_key: str | None
+    stage_generation: int
+    speech_id: UUID | None
+    can_reset_stage: bool
+    can_reset_speech: bool
+    can_skip_speech: bool
+    operation: dict[str, Any] | None
 
 
 class AgentGenerationView(BaseModel):
@@ -370,7 +441,15 @@ async def get_admin_overview(
     )
     enabled_agents = int(
         await session.scalar(
-            select(func.count()).select_from(AgentProfile).where(AgentProfile.status == "ENABLED")
+            select(func.count())
+            .select_from(AgentProfile)
+            .join(ModelProfile, ModelProfile.id == AgentProfile.model_profile_id)
+            .join(VoiceProfile, VoiceProfile.id == AgentProfile.voice_profile_id)
+            .where(
+                AgentProfile.status == "ENABLED",
+                ModelProfile.status == "ENABLED",
+                VoiceProfile.status == "ENABLED",
+            )
         )
         or 0
     )
@@ -668,8 +747,14 @@ async def list_match_ids(
     limit: int = Query(default=5000, ge=1, le=10000),
 ) -> dict[str, Any]:
     statuses = {
-        "RUNNING", "PAUSED", "FINISHED", "TERMINATED", "START_PENDING_RUNTIME",
-        "START_COUNTDOWN", "SYSTEM_RECOVERY", "ERROR",
+        "RUNNING",
+        "PAUSED",
+        "FINISHED",
+        "TERMINATED",
+        "START_PENDING_RUNTIME",
+        "START_COUNTDOWN",
+        "SYSTEM_RECOVERY",
+        "ERROR",
     }
     if status and status not in statuses:
         _api_error("admin_query_invalid")
@@ -931,20 +1016,52 @@ async def control_match(
     try:
         actor = await manager.ensure_actor(session, match_id)
         previous_sequence = actor.state.sequence
-        result = await manager.submit(
-            match_id,
-            MatchCommand(
-                type={
-                    "terminate": "match.terminate",
-                    "resume": "match.resume",
-                    "recover": "system.recover",
-                    "reset_speech": "speech.reset",
-                }[payload.action],
-                message_id=f"admin-control:{payload.action}:{match_id}:{uuid4().hex}",
-                actor_user_id=context.user_id,
-                payload={"privileged": True, "authorized": True, "preserve_failed": False},
-            ),
+        values = payload.model_dump(mode="json", exclude={"action"}, exclude_none=True)
+        if payload.operation_id is not None:
+            values["expected_speech_id"] = (
+                str(payload.expected_speech_id) if payload.expected_speech_id else None
+            )
+        emergency = cast(
+            MatchEmergencyCoordinator | None,
+            getattr(request.app.state, "match_emergency_coordinator", None),
         )
+        if payload.action == "skip_speech":
+            if emergency is None:
+                _api_error("match_runtime_unavailable")
+            result = await emergency.start_skip(
+                match_id, actor_user_id=context.user_id, payload=values
+            )
+        elif payload.action == "cancel_skip":
+            operation = actor.state.emergency_operation or {}
+            if emergency is None or operation.get("id") != str(payload.operation_id):
+                _api_error("match_state_conflict")
+            await emergency.cancel(match_id)
+            result = MatchCommandResult(state=actor.state, events=())
+        else:
+            result = await manager.submit(
+                match_id,
+                MatchCommand(
+                    type={
+                        "pause": "match.pause",
+                        "terminate": "match.terminate",
+                        "resume": "match.resume",
+                        "recover": "system.recover",
+                        "reset_speech": "speech.reset",
+                        "reset_stage": "stage.reset",
+                    }[payload.action],
+                    message_id=(
+                        f"admin-control:{payload.action}:{match_id}:"
+                        f"{payload.operation_id or uuid4()}"
+                    ),
+                    actor_user_id=context.user_id,
+                    payload={
+                        **values,
+                        "privileged": True,
+                        "authorized": True,
+                        "preserve_failed": False,
+                    },
+                ),
+            )
     except MatchDomainError as error:
         _api_error(error.code)
     await session.rollback()
@@ -955,13 +1072,83 @@ async def control_match(
             action=f"admin.match.{payload.action}",
             target_type="match",
             target_id=str(match_id),
-            details={"previous_sequence": previous_sequence},
+            details={
+                "previous_sequence": previous_sequence,
+                "operation_id": str(payload.operation_id) if payload.operation_id else None,
+            },
         )
     return {
         "status": result.state.status,
         "action_state": result.state.action_state,
         "sequence": result.state.sequence,
     }
+
+
+@router.get("/matches/{match_id}/control-target", response_model=MatchControlTargetResponse)
+async def match_control_target(
+    match_id: UUID,
+    request: Request,
+    _: Annotated[AuthContext, Depends(get_admin_auth)],
+    session: Annotated[AsyncSession, Depends(get_database_session)],
+) -> MatchControlTargetResponse:
+    manager = cast(MatchRuntimeManager | None, request.app.state.match_runtime_manager)
+    if manager is None:
+        _api_error("match_runtime_unavailable")
+    row = await session.get(Match, match_id)
+    if row is None:
+        _api_error("match_not_found")
+    actor = await manager.ensure_actor(session, match_id)
+    state = actor.state
+    room = await session.get(Room, row.room_id)
+    action = state.current_action
+    stage: dict[str, Any] = next(
+        (
+            item
+            for item in (room.rule_snapshot if room else {}).get("stages", [])
+            if action is not None and item.get("position") == action.stage_position
+        ),
+        cast(dict[str, Any], {}),
+    )
+    operation = dict(state.emergency_operation) if state.emergency_operation else None
+    pending = bool(operation and operation.get("status") == "PENDING")
+    active = state.status in {"RUNNING", "PAUSED", "ERROR", "SYSTEM_RECOVERY"} and not pending
+    current = state.action_state if state.status == "RUNNING" else state.paused_from_action_state
+    speaker = bool(state.current_speaker_user_id or state.current_agent_profile_id)
+    return MatchControlTargetResponse(
+        match_id=match_id,
+        status=state.status,
+        action_state=state.action_state,
+        stage_name=str(stage.get("name") or "当前阶段"),
+        sequence=state.sequence,
+        context_version=row.context_version,
+        action_key=action.action_key if action else None,
+        stage_generation=state.stage_generation,
+        speech_id=state.current_speech_id,
+        can_reset_stage=active and bool(state.stage_checkpoint),
+        can_reset_speech=active
+        and speaker
+        and current
+        in {
+            "HUMAN_READY_TO_START",
+            "HUMAN_SPEAKING",
+            "SPEECH_FINALIZING",
+            "AGENT_PREPARING",
+            "AGENT_SPEAKING",
+            "AGENT_FINALIZING",
+        },
+        can_skip_speech=active
+        and speaker
+        and current
+        in {
+            "HUMAN_READY_TO_START",
+            "HUMAN_SPEAKING",
+            "SPEECH_FINALIZING",
+            "AGENT_PREPARING",
+            "AGENT_SPEAKING",
+            "AGENT_FINALIZING",
+        },
+        operation=operation,
+    )
 
 
 @router.post(
@@ -1182,31 +1369,6 @@ async def delete_match(
         ).all()
     )
     storage_paths = [item.storage_path for item in files if item.storage_path]
-    blob_ids: set[UUID] = set()
-    for request_blob_id, response_blob_id in (
-        await session.execute(
-            select(AgentGeneration.request_blob_id, AgentGeneration.response_blob_id).where(
-                AgentGeneration.match_id == match_id
-            )
-        )
-    ).all():
-        blob_ids.update(item for item in (request_blob_id, response_blob_id) if item is not None)
-    for request_blob_id, response_blob_id in (
-        await session.execute(
-            select(JudgeResult.request_blob_id, JudgeResult.response_blob_id).where(
-                JudgeResult.match_id == match_id
-            )
-        )
-    ).all():
-        blob_ids.update(item for item in (request_blob_id, response_blob_id) if item is not None)
-    for request_blob_id, response_blob_id in (
-        await session.execute(
-            select(ExternalCall.request_blob_id, ExternalCall.response_blob_id).where(
-                ExternalCall.match_id == match_id
-            )
-        )
-    ).all():
-        blob_ids.update(item for item in (request_blob_id, response_blob_id) if item is not None)
     processing_task = await session.scalar(
         select(BackgroundTask.id).where(
             BackgroundTask.status == "RUNNING",
@@ -1340,6 +1502,7 @@ async def delete_match(
                 _api_error("match_not_found")
             if locked_match.status not in {"FINISHED", "TERMINATED", "ERROR"}:
                 _api_error("match_delete_forbidden")
+            blob_ids = await collect_match_blob_ids(session, match_id)
             await session.execute(
                 delete(BackgroundTask).where(
                     func.jsonb_extract_path_text(BackgroundTask.payload, "match_id")
@@ -1348,30 +1511,7 @@ async def delete_match(
             )
             await session.delete(locked_match)
             await session.flush()
-            if blob_ids:
-                await session.execute(
-                    delete(CallContentBlob).where(
-                        CallContentBlob.id.in_(blob_ids),
-                        ~select(AgentGeneration.id)
-                        .where(
-                            (AgentGeneration.request_blob_id == CallContentBlob.id)
-                            | (AgentGeneration.response_blob_id == CallContentBlob.id)
-                        )
-                        .exists(),
-                        ~select(JudgeResult.id)
-                        .where(
-                            (JudgeResult.request_blob_id == CallContentBlob.id)
-                            | (JudgeResult.response_blob_id == CallContentBlob.id)
-                        )
-                        .exists(),
-                        ~select(ExternalCall.id)
-                        .where(
-                            (ExternalCall.request_blob_id == CallContentBlob.id)
-                            | (ExternalCall.response_blob_id == CallContentBlob.id)
-                        )
-                        .exists(),
-                    )
-                )
+            await collect_unreferenced_content_blobs(session, blob_ids)
             room = await session.get(Room, room_id, with_for_update=True)
             if room is not None:
                 await session.delete(room)
@@ -1691,81 +1831,157 @@ async def test_model_connection(
     )
     call_id = uuid4()
     logical_call_id = uuid4()
-    capture = ProviderCallCapture()
-    session.add(
-        ExternalCall(
-            id=call_id,
-            call_kind="LLM_SPEECH",
-            provider="OPENAI_COMPATIBLE",
-            operation="chat.completions.stream",
-            model=model.model_id,
-            attempt_no=1,
-            status="STARTED",
-            capture_version=PROVIDER_CAPTURE_VERSION,
-            captured_at=datetime.now(UTC),
-            source_kind="CONFIG_TEST",
-            source_resource_id=str(model_id),
-            logical_call_id=logical_call_id,
-            started_at=datetime.now(UTC),
-        )
+    capture_writer = cast(
+        ProviderCaptureWriter | None, getattr(request.app.state, "provider_capture_writer", None)
     )
-    await session.commit()
-    client = OpenAIStreamingClient(
-        base_url=model.base_url,
-        api_key=api_key,
-        model=model.model_id,
-    )
+    capture = new_provider_capture(capture_writer)
     try:
-        result = await client.stream_chat(
-            messages=[{"role": "user", "content": "只回复：连接成功"}],
-            max_tokens=16,
-            generation_params={"temperature": 0},
-            on_delta=_ignore_delta,
-            capture=capture,
+        session.add(
+            ExternalCall(
+                id=call_id,
+                call_kind="LLM_SPEECH",
+                provider="OPENAI_COMPATIBLE",
+                operation="chat.completions.stream",
+                model=model.model_id,
+                attempt_no=1,
+                status="STARTED",
+                capture_version=PROVIDER_CAPTURE_VERSION,
+                capture_storage_mode="ASYNC_V1",
+                captured_at=datetime.now(UTC),
+                source_kind="CONFIG_TEST",
+                source_resource_id=str(model_id),
+                logical_call_id=logical_call_id,
+                started_at=datetime.now(UTC),
+            )
         )
+        await session.commit()
+    except BaseException:
+        capture.close()
+        raise
+
+    async def record_failure(error_code: str, status: str = "FAILED") -> None:
+        submission = None
+        try:
+            async with session.begin():
+                call = await session.get(ExternalCall, call_id, with_for_update=True)
+                if call is not None:
+                    call.status = status
+                    call.error_code = error_code
+                    call.completed_at = datetime.now(UTC)
+                    await session.flush()
+                    submission = prepare_capture(capture_writer, call, capture)
+                AuditService().record(
+                    session,
+                    actor_user_id=context.user_id,
+                    action="admin.model.tested",
+                    target_type="model_profile",
+                    target_id=str(model_id),
+                    result="FAILURE",
+                    details={"error_code": error_code},
+                )
+            submit_capture(capture_writer, submission)
+        finally:
+            if submission is not None:
+                submission.close()
+            capture.close()
+
+    limiter = cast(LlmCapacityLimiter, request.app.state.llm_capacity_limiter)
+    leases: tuple[asyncio.Semaphore, asyncio.Semaphore] | None = None
+    client: OpenAIStreamingClient | None = None
+    try:
+        try:
+            leases = await limiter.acquire(str(model.id), model.max_concurrency)
+            client = OpenAIStreamingClient(
+                base_url=model.base_url,
+                api_key=api_key,
+                model=model.model_id,
+            )
+            result = await client.stream_chat(
+                messages=[{"role": "user", "content": "只回复：连接成功"}],
+                max_tokens=16,
+                generation_params={"temperature": 0},
+                on_delta=_ignore_delta,
+                capture=capture,
+            )
+        finally:
+            # Release synchronously before close or diagnostics can block.
+            if leases is not None:
+                limiter.release(leases)
+                leases = None
+            if client is not None:
+                closing_client, client = client, None
+                await close_llm_client_bounded(closing_client)
     except LlmProviderError as error:
+        try:
+            async with asyncio.timeout(MODEL_TEST_DIAGNOSTIC_TIMEOUT_SECONDS):
+                await record_failure(error.code)
+        except Exception as diagnostic_error:
+            logger.warning(
+                "Model test failure capture failed",
+                extra={
+                    "error_code": "model_test_capture_failed",
+                    "exception_type": type(diagnostic_error).__name__,
+                },
+            )
+        _api_error(error.code)
+    except asyncio.CancelledError:
+        try:
+            async with asyncio.timeout(MODEL_TEST_DIAGNOSTIC_TIMEOUT_SECONDS):
+                await record_failure("cancelled", "CANCELLED")
+        except BaseException as diagnostic_error:
+            logger.warning(
+                "Model test cancellation capture failed",
+                extra={
+                    "error_code": "model_test_capture_failed",
+                    "exception_type": type(diagnostic_error).__name__,
+                },
+            )
+        raise
+    except Exception:
+        try:
+            async with asyncio.timeout(MODEL_TEST_DIAGNOSTIC_TIMEOUT_SECONDS):
+                await record_failure("llm_provider_failed")
+        except Exception as diagnostic_error:
+            logger.warning(
+                "Model test failure capture failed",
+                extra={
+                    "error_code": "model_test_capture_failed",
+                    "exception_type": type(diagnostic_error).__name__,
+                },
+            )
+        raise
+    submission = None
+    try:
         async with session.begin():
             call = await session.get(ExternalCall, call_id, with_for_update=True)
             if call is not None:
-                await persist_provider_capture(session, call, capture)
-                call.status = "FAILED"
-                call.error_code = error.code
+                call.status = "SUCCEEDED"
+                call.first_result_latency_ms = result.first_token_latency_ms
+                call.completed_latency_ms = result.completed_latency_ms
+                call.completion_tokens = result.completion_tokens
+                call.first_result_at = call.started_at + timedelta(
+                    milliseconds=result.first_token_latency_ms
+                )
                 call.completed_at = datetime.now(UTC)
+                await session.flush()
+                submission = prepare_capture(capture_writer, call, capture)
             AuditService().record(
                 session,
                 actor_user_id=context.user_id,
                 action="admin.model.tested",
                 target_type="model_profile",
                 target_id=str(model_id),
-                result="FAILURE",
-                details={"error_code": error.code},
+                details={
+                    "first_token_latency_ms": result.first_token_latency_ms,
+                    "completed_latency_ms": result.completed_latency_ms,
+                },
             )
-        _api_error(error.code)
+        submit_capture(capture_writer, submission)
     finally:
-        await client.close()
-    async with session.begin():
-        call = await session.get(ExternalCall, call_id, with_for_update=True)
-        if call is not None:
-            await persist_provider_capture(session, call, capture)
-            call.status = "SUCCEEDED"
-            call.first_result_latency_ms = result.first_token_latency_ms
-            call.completed_latency_ms = result.completed_latency_ms
-            call.completion_tokens = result.completion_tokens
-            call.first_result_at = call.started_at + timedelta(
-                milliseconds=result.first_token_latency_ms
-            )
-            call.completed_at = datetime.now(UTC)
-        AuditService().record(
-            session,
-            actor_user_id=context.user_id,
-            action="admin.model.tested",
-            target_type="model_profile",
-            target_id=str(model_id),
-            details={
-                "first_token_latency_ms": result.first_token_latency_ms,
-                "completed_latency_ms": result.completed_latency_ms,
-            },
-        )
+        if submission is not None:
+            submission.close()
+        capture.close()
+
     return {
         "status": "ok",
         "first_token_latency_ms": result.first_token_latency_ms,
@@ -1818,34 +2034,43 @@ async def regenerate_voice_preview(
     path.parent.mkdir(parents=True, exist_ok=True)
     last_error = "voice_preview_failed"
     logical_call_id = uuid4()
+    capture_writer = cast(
+        ProviderCaptureWriter | None, getattr(request.app.state, "provider_capture_writer", None)
+    )
     for attempt in (1, 2):
         call_id = uuid4()
-        capture = ProviderCallCapture()
-        session.add(
-            ExternalCall(
-                id=call_id,
-                call_kind="TTS",
-                provider="BAILIAN",
-                operation="duplex.server_commit",
-                model=settings.tts_model,
-                voice=voice.provider_voice,
-                attempt_no=attempt,
-                status="STARTED",
-                capture_version=PROVIDER_CAPTURE_VERSION,
-                captured_at=datetime.now(UTC),
-                source_kind="CONFIG_TEST",
-                source_resource_id=str(voice_id),
-                logical_call_id=logical_call_id,
-                started_at=datetime.now(UTC),
+        capture = new_provider_capture(capture_writer)
+        submission = None
+        try:
+            session.add(
+                ExternalCall(
+                    id=call_id,
+                    call_kind="TTS",
+                    provider="BAILIAN",
+                    operation="duplex.server_commit",
+                    model=settings.tts_model,
+                    voice=voice.provider_voice,
+                    attempt_no=attempt,
+                    status="STARTED",
+                    capture_version=PROVIDER_CAPTURE_VERSION,
+                    capture_storage_mode="ASYNC_V1",
+                    captured_at=datetime.now(UTC),
+                    source_kind="CONFIG_TEST",
+                    source_resource_id=str(voice_id),
+                    logical_call_id=logical_call_id,
+                    started_at=datetime.now(UTC),
+                )
             )
-        )
-        await session.commit()
-        connection = QwenTtsConnection(
-            url=settings.tts_ws_url,
-            api_key=key.get_secret_value(),
-            model=settings.tts_model,
-            workspace_id=settings.tts_workspace_id,
-        )
+            await session.commit()
+            connection = QwenTtsConnection(
+                url=settings.tts_ws_url,
+                api_key=key.get_secret_value(),
+                model=settings.tts_model,
+                workspace_id=settings.tts_workspace_id,
+            )
+        except BaseException:
+            capture.close()
+            raise
         audio = bytearray()
 
         async def chunks():
@@ -1855,24 +2080,24 @@ async def regenerate_voice_preview(
             target.extend(chunk)
 
         try:
-            result = await connection.synthesize(
-                chunks(),
-                voice=voice.provider_voice,
-                rate=voice.rate,
-                on_audio=on_audio,
-                capture=capture,
-            )
-            preview_audio = await asyncio.to_thread(
-                apply_ogg_opus_gain, bytes(audio), voice.playback_gain
-            )
-            temporary = path.with_suffix(f".attempt-{attempt}.part")
-            await asyncio.to_thread(temporary.write_bytes, preview_audio)
-            os.replace(temporary, path)
+            async with _VOICE_PREVIEW_SEMAPHORE:
+                result = await connection.synthesize(
+                    chunks(),
+                    voice=voice.provider_voice,
+                    rate=voice.rate,
+                    on_audio=on_audio,
+                    capture=capture,
+                )
+                preview_audio = await asyncio.to_thread(
+                    apply_ogg_opus_gain, bytes(audio), voice.playback_gain
+                )
+                temporary = path.with_suffix(f".attempt-{attempt}.part")
+                await asyncio.to_thread(temporary.write_bytes, preview_audio)
+                os.replace(temporary, path)
             await session.commit()
             async with session.begin():
                 call = await session.get(ExternalCall, call_id, with_for_update=True)
                 if call is not None:
-                    await persist_provider_capture(session, call, capture)
                     call.status = "SUCCEEDED"
                     call.first_result_latency_ms = result.first_audio_latency_ms
                     call.completed_latency_ms = result.completed_latency_ms
@@ -1881,6 +2106,8 @@ async def regenerate_voice_preview(
                         milliseconds=result.first_audio_latency_ms
                     )
                     call.completed_at = datetime.now(UTC)
+                    await session.flush()
+                    submission = prepare_capture(capture_writer, call, capture)
                 voice.calibration_status = "READY"
                 voice.calibrated_at = datetime.now(UTC)
                 AuditService().record(
@@ -1891,21 +2118,30 @@ async def regenerate_voice_preview(
                     target_id=str(voice_id),
                     details={"attempt": attempt, "byte_count": len(preview_audio)},
                 )
+            submit_capture(capture_writer, submission)
             return {
                 "status": "ready",
                 "byte_count": len(preview_audio),
                 "first_audio_latency_ms": result.first_audio_latency_ms,
             }
         except Exception as error:
+            if submission is not None:
+                submission.close()
+                submission = None
             last_error = str(getattr(error, "code", "voice_preview_failed"))
             async with session.begin():
                 call = await session.get(ExternalCall, call_id, with_for_update=True)
                 if call is not None:
-                    await persist_provider_capture(session, call, capture)
                     call.status = "FAILED"
                     call.error_code = last_error
                     call.completed_at = datetime.now(UTC)
+                    await session.flush()
+                    submission = prepare_capture(capture_writer, call, capture)
+            submit_capture(capture_writer, submission)
         finally:
+            if submission is not None:
+                submission.close()
+            capture.close()
             await connection.close()
     await session.rollback()
     async with session.begin():

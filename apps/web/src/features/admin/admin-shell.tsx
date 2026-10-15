@@ -29,7 +29,11 @@ import type { zhCN } from '@/i18n/messages';
 import { cn } from '@/lib/cn';
 
 type AdminMessageKey = keyof typeof zhCN.Admin;
-type NavItem = { href: string; label: AdminMessageKey; icon: ComponentType<{ className?: string }> };
+type NavItem = {
+  href: string;
+  label: AdminMessageKey;
+  icon: ComponentType<{ className?: string }>;
+};
 type NavGroup = { label: AdminMessageKey; items: NavItem[] };
 
 const navGroups: NavGroup[] = [
@@ -146,7 +150,9 @@ export function AdminShell({ children, user }: { children: ReactNode; user: ApiU
             <span className="size-2 rounded-full bg-green-500 ring-4 ring-green-100" />
             <p className="truncate text-sm font-black">{user.real_name}</p>
           </div>
-            <p className="mt-1.5 pl-4 text-[0.68rem] text-slate-500">{t('soleAdmin')} · @{user.username}</p>
+          <p className="mt-1.5 pl-4 text-[0.68rem] text-slate-500">
+            {t('soleAdmin')} · @{user.username}
+          </p>
         </div>
       </aside>
 
@@ -154,19 +160,21 @@ export function AdminShell({ children, user }: { children: ReactNode; user: ApiU
         <header className="sticky top-0 z-20 flex h-16 items-center justify-between border-b border-slate-200/80 bg-white/92 px-4 backdrop-blur-xl sm:px-6 lg:px-8">
           <div className="flex items-center gap-3">
             <div>
-              <p className="text-[0.65rem] font-bold tracking-[0.08em] text-slate-600">{t('title')}</p>
+              <p className="text-[0.65rem] font-bold tracking-[0.08em] text-slate-600">
+                {t('title')}
+              </p>
               <p className="text-sm font-black">{currentLabel}</p>
             </div>
           </div>
           <div className="flex items-center gap-3">
-          <LocaleSwitcher />
-          <Link
-            className="inline-flex min-h-10 items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 text-sm font-bold text-slate-600 shadow-sm transition hover:border-blue-300 hover:text-blue-700 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-blue-100"
-            href="/"
-          >
-            <Home className="size-4" aria-hidden="true" />
-            {t('returnToApp')}
-          </Link>
+            <LocaleSwitcher />
+            <Link
+              className="inline-flex min-h-10 items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 text-sm font-bold text-slate-600 shadow-sm transition hover:border-blue-300 hover:text-blue-700 focus-visible:outline-none focus-visible:ring-4 focus-visible:ring-blue-100"
+              href="/"
+            >
+              <Home className="size-4" aria-hidden="true" />
+              {t('returnToApp')}
+            </Link>
           </div>
         </header>
         <main className="mx-auto w-full max-w-[1560px] px-4 py-6 sm:px-6 lg:px-8 lg:py-8">

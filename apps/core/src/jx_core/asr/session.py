@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from uuid import UUID, uuid4
 
 from ..data_capture.provider import ProviderCallCapture
 from .protocol import FunAsrConnection, FunAsrError, FunAsrSentence, SegmentResult
+
+logger = logging.getLogger("jx-core.asr")
 
 PCM_FRAME_BYTES = 3200
 PCM_SAMPLES_PER_FRAME = 1600
@@ -53,7 +56,10 @@ class AsrSpeechSession:
         initial_text: str = "",
         initial_sample_count: int = 0,
         initial_first_interim_latency_ms: int | None = None,
+        callback_timeout_seconds: float = 10.0,
     ) -> None:
+        if callback_timeout_seconds <= 0:
+            raise ValueError("ASR callback timeout must be positive")
         self.speech_id = speech_id
         self._connection = connection
         self._on_interim = on_interim
@@ -68,6 +74,7 @@ class AsrSpeechSession:
         self._start_segment_no = start_segment_no
         self._initial_text = initial_text
         self._initial_first_interim_latency_ms = initial_first_interim_latency_ms
+        self._callback_timeout_seconds = callback_timeout_seconds
         self._ready = asyncio.Event()
         self._current_segment_no = start_segment_no
         self._completed_results: list[SegmentResult] = []
@@ -75,17 +82,23 @@ class AsrSpeechSession:
     async def wait_ready(self, timeout_seconds: float = 10.0) -> None:
         await asyncio.wait_for(self._ready.wait(), timeout=timeout_seconds)
 
+    @property
+    def input_closed(self) -> bool:
+        return self._closed
+
     def feed_pcm(self, pcm: bytes) -> None:
         if self._closed:
             return
+        total_pending = len(self._pending) + len(pcm)
+        complete_frames = total_pending // PCM_FRAME_BYTES
+        available_frames = self._queue.maxsize - self._queue.qsize()
+        if complete_frames > available_frames:
+            raise AsrQueueFull("asr_pcm_queue_full")
         self._pending.extend(pcm)
         while len(self._pending) >= PCM_FRAME_BYTES:
             frame = bytes(self._pending[:PCM_FRAME_BYTES])
             del self._pending[:PCM_FRAME_BYTES]
-            try:
-                self._queue.put_nowait(frame)
-            except asyncio.QueueFull as error:
-                raise AsrQueueFull("asr_pcm_queue_full") from error
+            self._queue.put_nowait(frame)
 
     async def finish(self) -> None:
         if self._closed:
@@ -160,7 +173,9 @@ class AsrSpeechSession:
 
             task_id = uuid4()
             if self._on_segment_started is not None:
-                await self._on_segment_started(self.speech_id, segment_no, task_id)
+                await self._invoke_callback(
+                    self._on_segment_started, self.speech_id, segment_no, task_id
+                )
             try:
                 result = await self._connection.recognize_segment(
                     chunks(),
@@ -170,17 +185,22 @@ class AsrSpeechSession:
                 )
             except Exception as error:
                 capture = self._connection.take_capture(task_id)
-                if capture is not None and self._on_capture is not None:
-                    await self._on_capture(task_id, capture)
+                await self._emit_capture(task_id, capture)
                 if self._on_segment_failed is not None:
                     code = getattr(error, "code", "asr_stream_failed")
-                    await self._on_segment_failed(self.speech_id, segment_no, task_id, str(code))
+                    await self._invoke_callback(
+                        self._on_segment_failed,
+                        self.speech_id,
+                        segment_no,
+                        task_id,
+                        str(code),
+                    )
                 raise
             capture = self._connection.take_capture(task_id)
-            if capture is not None and self._on_capture is not None:
-                await self._on_capture(task_id, capture)
+            await self._emit_capture(task_id, capture)
             results.append(result)
-            await self._on_segment(
+            await self._invoke_callback(
+                self._on_segment,
                 self.speech_id,
                 segment_no,
                 result,
@@ -198,6 +218,37 @@ class AsrSpeechSession:
             first_interim_latency_ms=first_interim,
             last_segment_no=segment_no,
         )
+
+    async def _emit_capture(self, task_id: UUID, capture: ProviderCallCapture | None) -> None:
+        if capture is None:
+            return
+        if self._on_capture is None:
+            capture.close()
+            return
+        try:
+            await asyncio.wait_for(
+                self._on_capture(task_id, capture), timeout=self._callback_timeout_seconds
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "ASR provider capture callback failed",
+                extra={
+                    "error_code": "asr_capture_persist_failed",
+                    "exception_type": type(error).__name__,
+                },
+            )
+
+    async def _invoke_callback(
+        self, callback: Callable[..., Awaitable[object]], *args: object
+    ) -> None:
+        try:
+            await asyncio.wait_for(callback(*args), timeout=self._callback_timeout_seconds)
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError as error:
+            raise FunAsrError("asr_callback_timeout") from error
 
     def checkpoint(self) -> AsrSpeechResult:
         results = tuple(self._completed_results)

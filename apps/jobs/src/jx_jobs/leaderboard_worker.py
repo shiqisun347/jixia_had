@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID, uuid4
@@ -11,6 +12,57 @@ from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from .task_queue import claim_next, complete, fail
+
+
+async def _close_stream_result(result: Any) -> None:
+    close = getattr(result, "close", None)
+    if close is None:
+        return
+    outcome = close()
+    if hasattr(outcome, "__await__"):
+        await outcome
+
+
+def _accumulate_leaderboard_row(
+    totals: dict[tuple[str, UUID], dict[str, Any]], row: Mapping[Any, Any]
+) -> None:
+    match_id = cast(UUID, row["match_id"])
+    result = cast(dict[str, Any], row["result"])
+    match_participant_id = row["match_participant_id"]
+    participant_id = cast(UUID, row["participant_id"])
+    kind = str(row["kind"])
+    display_name = row["display_name"]
+    side = row["side"]
+    personal = next(
+        (
+            item
+            for item in cast(list[dict[str, Any]], result.get("participants", []))
+            if str(item.get("participant_id")) == str(match_participant_id)
+        ),
+        None,
+    )
+    if personal is None:
+        return
+    winner = str(result.get("winner"))
+    outcome = 20 if winner == "DRAW" else 30 if winner == side else 10
+    bucket = totals[(kind, participant_id)]
+    bucket["name"] = str(display_name)
+    score = int(float(personal.get("score", 0)))
+    bucket["points"] += score
+    bucket["score_sum"] += score
+    bucket["score_count"] += 1
+    match_outcomes = cast(dict[UUID, tuple[int, bool]], bucket["match_outcomes"])
+    previous_outcome = match_outcomes.get(match_id)
+    current_outcome = (outcome, winner == side)
+    if previous_outcome is None:
+        bucket["points"] += outcome
+        bucket["wins"] += int(winner == side)
+        bucket["matches"] += 1
+        match_outcomes[match_id] = current_outcome
+    elif current_outcome[0] > previous_outcome[0]:
+        bucket["points"] += current_outcome[0] - previous_outcome[0]
+        bucket["wins"] += int(current_outcome[1]) - int(previous_outcome[1])
+        match_outcomes[match_id] = current_outcome
 
 
 async def ensure_daily_tasks(session_factory: async_sessionmaker[AsyncSession]) -> None:
@@ -50,11 +102,21 @@ async def process_one_leaderboard(
     if claim is None:
         return False
     try:
+        totals: dict[tuple[str, UUID], dict[str, Any]] = defaultdict(
+            lambda: {
+                "points": 0,
+                "wins": 0,
+                "matches": 0,
+                "score_sum": 0.0,
+                "score_count": 0,
+                "name": "",
+                "match_outcomes": {},
+            }
+        )
         async with session_factory() as session:
-            rows = (
-                await session.execute(
-                    text(
-                        """
+            result = await session.stream(
+                text(
+                    """
                         WITH latest AS (
                             SELECT DISTINCT ON (jr.match_id) jr.match_id, jr.result
                             FROM judge_results jr
@@ -85,58 +147,13 @@ async def process_one_leaderboard(
                         FROM latest
                         JOIN match_participants mp ON mp.match_id = latest.match_id
                         """
-                    )
                 )
-            ).all()
-        totals: dict[tuple[str, UUID], dict[str, Any]] = defaultdict(
-            lambda: {
-                "points": 0,
-                "wins": 0,
-                "matches": 0,
-                "scores": [],
-                "name": "",
-                "match_outcomes": {},
-            }
-        )
-        for (
-            match_id,
-            result_value,
-            match_participant_id,
-            participant_id,
-            kind,
-            display_name,
-            side,
-        ) in rows:
-            result = cast(dict[str, Any], result_value)
-            personal = next(
-                (
-                    item
-                    for item in cast(list[dict[str, Any]], result.get("participants", []))
-                    if str(item.get("participant_id")) == str(match_participant_id)
-                ),
-                None,
             )
-            if personal is None:
-                continue
-            winner = str(result.get("winner"))
-            outcome = 20 if winner == "DRAW" else 30 if winner == side else 10
-            bucket = totals[(str(kind), participant_id)]
-            bucket["name"] = str(display_name)
-            score = int(float(personal.get("score", 0)))
-            bucket["points"] += score
-            match_outcomes = cast(dict[UUID, tuple[int, bool]], bucket["match_outcomes"])
-            previous_outcome = match_outcomes.get(match_id)
-            current_outcome = (outcome, winner == side)
-            if previous_outcome is None:
-                bucket["points"] += outcome
-                bucket["wins"] += int(winner == side)
-                bucket["matches"] += 1
-                match_outcomes[match_id] = current_outcome
-            elif current_outcome[0] > previous_outcome[0]:
-                bucket["points"] += current_outcome[0] - previous_outcome[0]
-                bucket["wins"] += int(current_outcome[1]) - int(previous_outcome[1])
-                match_outcomes[match_id] = current_outcome
-            cast(list[float], bucket["scores"]).append(float(score))
+            try:
+                async for row in result.mappings():
+                    _accumulate_leaderboard_row(totals, row)
+            finally:
+                await _close_stream_result(result)
         generated_at = datetime.now(UTC)
         batch_id = uuid4()
         async with session_factory() as session:
@@ -147,12 +164,11 @@ async def process_one_leaderboard(
                         key=lambda item: (
                             -int(item[1]["points"]),
                             -int(item[1]["wins"]),
-                            -sum(cast(list[float], item[1]["scores"])),
+                            -float(item[1]["score_sum"]),
                             str(item[0][1]),
                         ),
                     )
                     for rank, ((_, participant_id), value) in enumerate(ranked, 1):
-                        scores = cast(list[float], value["scores"])
                         await session.execute(
                             text(
                                 """
@@ -174,7 +190,8 @@ async def process_one_leaderboard(
                                 "points": value["points"],
                                 "wins": value["wins"],
                                 "matches": value["matches"],
-                                "average": sum(scores) / len(scores),
+                                "average": float(value["score_sum"])
+                                / int(value["score_count"]),
                                 "generated_at": generated_at,
                             },
                         )

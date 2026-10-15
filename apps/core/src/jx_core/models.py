@@ -21,8 +21,8 @@ from sqlalchemy import (
     Text,
     UniqueConstraint,
     func,
-    text,
 )
+from sqlalchemy import text as sql_text
 from sqlalchemy.dialects.postgresql import BYTEA, JSONB
 from sqlalchemy.dialects.postgresql import UUID as PostgreSQLUUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
@@ -50,7 +50,10 @@ class User(Base):
         CheckConstraint("avatar_version >= 0", name="ck_users_avatar_version_nonnegative"),
         Index("ix_users_status", "status"),
         Index(
-            "ux_users_single_admin", "role", unique=True, postgresql_where=text("role = 'ADMIN'")
+            "ux_users_single_admin",
+            "role",
+            unique=True,
+            postgresql_where=sql_text("role = 'ADMIN'"),
         ),
         UniqueConstraint("username_normalized", name="uq_users_username_normalized"),
     )
@@ -177,7 +180,7 @@ class AuditLog(Base):
     details: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,
-        server_default=text("'{}'::jsonb"),
+        server_default=sql_text("'{}'::jsonb"),
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -190,7 +193,7 @@ class SystemSetting(Base):
     __tablename__ = "system_settings"
     key: Mapped[str] = mapped_column(String(64), primary_key=True)
     value: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     updated_by_user_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
@@ -294,12 +297,12 @@ class ModelProfile(Base):
     max_concurrency: Mapped[int] = mapped_column(Integer, nullable=False, server_default="50")
     token_per_char: Mapped[float] = mapped_column(nullable=False, server_default="1.0")
     generation_params: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     capability_schema: Mapped[dict[str, Any]] = mapped_column(
         JSONB,
         nullable=False,
-        server_default=text(
+        server_default=sql_text(
             "jsonb_build_object("
             "'temperature', jsonb_build_object('minimum', 0.0, 'maximum', 2.0), "
             "'top_p', jsonb_build_object('minimum', 0.0, 'maximum', 1.0), "
@@ -327,7 +330,7 @@ class AgentProfile(Base):
             "rule_id",
             "voice_profile_id",
             unique=True,
-            postgresql_where=text("rule_id IS NOT NULL"),
+            postgresql_where=sql_text("rule_id IS NOT NULL"),
         ),
     )
 
@@ -352,7 +355,7 @@ class AgentProfile(Base):
     system_prompt: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     debater_prompt: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     generation_params: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="ENABLED")
     created_at: Mapped[datetime] = mapped_column(
@@ -402,13 +405,13 @@ class FormatVersion(Base):
             "ux_format_versions_one_draft",
             "format_key",
             unique=True,
-            postgresql_where=text("status = 'DRAFT'"),
+            postgresql_where=sql_text("status = 'DRAFT'"),
         ),
         Index(
             "ux_format_versions_one_published",
             "format_key",
             unique=True,
-            postgresql_where=text("status = 'PUBLISHED'"),
+            postgresql_where=sql_text("status = 'PUBLISHED'"),
         ),
     )
 
@@ -447,7 +450,7 @@ class PromptTemplate(Base):
             "stage_key",
             "purpose",
             unique=True,
-            postgresql_where=text("agent_profile_id IS NULL"),
+            postgresql_where=sql_text("agent_profile_id IS NULL"),
         ),
         Index(
             "ux_prompt_templates_agent_slot",
@@ -456,7 +459,7 @@ class PromptTemplate(Base):
             "stage_key",
             "purpose",
             unique=True,
-            postgresql_where=text("agent_profile_id IS NOT NULL"),
+            postgresql_where=sql_text("agent_profile_id IS NOT NULL"),
         ),
     )
 
@@ -473,7 +476,7 @@ class PromptTemplate(Base):
     purpose: Mapped[str] = mapped_column(String(64), nullable=False)
     template_text: Mapped[str] = mapped_column(Text, nullable=False)
     variables: Mapped[list[str]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'[]'::jsonb")
     )
     output_contract: Mapped[str] = mapped_column(String(64), nullable=False, server_default="TEXT")
     created_at: Mapped[datetime] = mapped_column(
@@ -499,7 +502,7 @@ class FormatModule(Base):
     module_key: Mapped[str] = mapped_column(String(64), nullable=False)
     enabled: Mapped[bool] = mapped_column(nullable=False, server_default="true")
     config: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
 
 
@@ -521,10 +524,10 @@ class FormatJudgeProfile(Base):
     system_prompt: Mapped[str] = mapped_column(Text, nullable=False)
     judge_prompt: Mapped[str] = mapped_column(Text, nullable=False)
     generation_params: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     dimensions: Mapped[list[dict[str, Any]]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'[]'::jsonb")
     )
     output_contract: Mapped[str] = mapped_column(
         String(64), nullable=False, server_default="JUDGE_RESULT_V1"
@@ -563,6 +566,10 @@ class Rule(Base):
             "'GENERATING_AUDIO_FAILED', 'ARCHIVED')",
             name="ck_rules_status",
         ),
+        CheckConstraint(
+            "lifecycle_status IN ('DISABLED', 'ENABLED', 'ARCHIVED')",
+            name="ck_rules_lifecycle_status",
+        ),
         CheckConstraint("side_size BETWEEN 1 AND 5", name="ck_rules_side_size"),
         CheckConstraint(
             "topic_policy IN ('PRESET_ONLY', 'CUSTOM_ONLY', 'BOTH')",
@@ -580,6 +587,9 @@ class Rule(Base):
     side_size: Mapped[int] = mapped_column(Integer, nullable=False)
     estimated_seconds: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False, server_default="DRAFT")
+    lifecycle_status: Mapped[str] = mapped_column(
+        String(16), nullable=False, server_default="DISABLED"
+    )
     host_voice_profile_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True), ForeignKey("voice_profiles.id", ondelete="RESTRICT")
     )
@@ -602,6 +612,9 @@ class Rule(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
     audio_reviewed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    current_audio_generation_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("rule_audio_generations.id", ondelete="SET NULL")
+    )
 
 
 class RuleStage(Base):
@@ -625,7 +638,7 @@ class RuleStage(Base):
     start_host_text: Mapped[str] = mapped_column(String(2000), nullable=False, server_default="")
     end_host_text: Mapped[str] = mapped_column(String(2000), nullable=False, server_default="")
     parameters: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
 
 
@@ -645,7 +658,7 @@ class StageAction(Base):
     seat_no: Mapped[int | None] = mapped_column(Integer)
     duration_seconds: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     parameters: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
 
 
@@ -665,7 +678,7 @@ class StagePromptTemplate(Base):
     purpose: Mapped[str] = mapped_column(String(16), nullable=False)
     template_text: Mapped[str] = mapped_column(Text, nullable=False)
     variables: Mapped[list[str]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'[]'::jsonb")
     )
     output_contract: Mapped[str] = mapped_column(String(32), nullable=False, server_default="TEXT")
     created_at: Mapped[datetime] = mapped_column(
@@ -697,7 +710,7 @@ class AgentPromptOverride(Base):
     purpose: Mapped[str] = mapped_column(String(16), nullable=False)
     template_text: Mapped[str] = mapped_column(Text, nullable=False)
     variables: Mapped[list[str]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'[]'::jsonb")
     )
     output_contract: Mapped[str] = mapped_column(String(32), nullable=False, server_default="TEXT")
     created_at: Mapped[datetime] = mapped_column(
@@ -735,18 +748,85 @@ class RuleJudgeConfig(Base):
     )
 
 
-class HostAudioAsset(Base):
-    __tablename__ = "host_audio_assets"
+class RuleAudioGeneration(Base):
+    __tablename__ = "rule_audio_generations"
     __table_args__ = (
         CheckConstraint(
-            "status IN ('PENDING', 'READY', 'FAILED')", name="ck_host_audio_assets_status"
+            "status IN ('NOT_REQUIRED', 'QUEUED', 'RUNNING', 'SUCCEEDED', 'FAILED', 'SUPERSEDED')",
+            name="ck_rule_audio_generations_status",
         ),
-        UniqueConstraint("rule_id", "segment_key", name="uq_host_audio_assets_segment"),
+        CheckConstraint(
+            "review_status IN ('NOT_REQUIRED', 'PENDING', 'APPROVED')",
+            name="ck_rule_audio_generations_review_status",
+        ),
+        CheckConstraint("total_count >= 0", name="ck_rule_audio_generations_total_nonnegative"),
+        CheckConstraint("ready_count >= 0", name="ck_rule_audio_generations_ready_nonnegative"),
+        CheckConstraint("failed_count >= 0", name="ck_rule_audio_generations_failed_nonnegative"),
+        Index("ix_rule_audio_generations_rule_current", "rule_id", "is_current"),
     )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
     rule_id: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True), ForeignKey("rules.id", ondelete="CASCADE"), nullable=False
+    )
+    config_revision: Mapped[int] = mapped_column(Integer, nullable=False)
+    manifest_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    manifest: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="QUEUED")
+    review_status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="PENDING")
+    requested_by: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    requested_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    started_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    approved_by: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    approved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    total_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    ready_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    failed_count: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
+    last_error_code: Mapped[str | None] = mapped_column(String(128))
+    is_current: Mapped[bool] = mapped_column(nullable=False, server_default="true")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class WorkerHeartbeat(Base):
+    __tablename__ = "worker_heartbeats"
+    service: Mapped[str] = mapped_column(String(32), primary_key=True)
+    capabilities: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class HostAudioAsset(Base):
+    __tablename__ = "host_audio_assets"
+    __table_args__ = (
+        CheckConstraint(
+            "status IN ('PENDING', 'RUNNING', 'READY', 'FAILED')",
+            name="ck_host_audio_assets_status",
+        ),
+        UniqueConstraint(
+            "generation_id", "segment_key", name="uq_host_audio_assets_generation_segment"
+        ),
+        Index("ix_host_audio_assets_generation", "generation_id"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    rule_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("rules.id", ondelete="CASCADE"), nullable=False
+    )
+    generation_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("rule_audio_generations.id", ondelete="CASCADE")
     )
     segment_key: Mapped[str] = mapped_column(String(128), nullable=False)
     text: Mapped[str] = mapped_column(String(2000), nullable=False)
@@ -759,6 +839,13 @@ class HostAudioAsset(Base):
     storage_path: Mapped[str | None] = mapped_column(String(512))
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="PENDING")
     error_code: Mapped[str | None] = mapped_column(String(128))
+    input_hash: Mapped[str | None] = mapped_column(String(64))
+    input_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
+    )
+    active_task_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    byte_count: Mapped[int | None] = mapped_column(Integer)
+    checksum: Mapped[str | None] = mapped_column(String(64))
     duration_ms: Mapped[int | None] = mapped_column(Integer)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -933,7 +1020,7 @@ class DeviceCheck(Base):
     check_version: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     details: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     warning_confirmed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     checked_at: Mapped[datetime] = mapped_column(
@@ -957,7 +1044,7 @@ class BrowserDeviceCheck(Base):
     token_hash: Mapped[str] = mapped_column(String(64), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False)
     details: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     issued_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     valid_until: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
@@ -990,7 +1077,7 @@ class BackgroundTask(Base):
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
     task_type: Mapped[str] = mapped_column(String(32), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="PENDING")
     attempts: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
@@ -1111,7 +1198,7 @@ class MatchEvent(Base):
     sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     event_type: Mapped[str] = mapped_column(String(64), nullable=False)
     payload: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -1126,6 +1213,7 @@ class Speech(Base):
             name="ck_speeches_status",
         ),
         CheckConstraint("speaker_kind IN ('HUMAN', 'AGENT')", name="ck_speeches_speaker_kind"),
+        CheckConstraint("origin IN ('ORIGINAL', 'ADMIN_PLACEHOLDER')", name="ck_speeches_origin"),
         CheckConstraint(
             "(speaker_kind = 'HUMAN' AND user_id IS NOT NULL AND agent_profile_id IS NULL) OR "
             "(speaker_kind = 'AGENT' AND user_id IS NULL AND agent_profile_id IS NOT NULL)",
@@ -1147,6 +1235,9 @@ class Speech(Base):
         PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT")
     )
     speaker_kind: Mapped[str] = mapped_column(String(16), nullable=False, server_default="HUMAN")
+    origin: Mapped[str] = mapped_column(
+        String(24), nullable=False, server_default="ORIGINAL", default="ORIGINAL"
+    )
     agent_profile_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True), ForeignKey("agent_profiles.id", ondelete="RESTRICT")
     )
@@ -1240,7 +1331,7 @@ class JudgeProfile(Base):
     system_prompt: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     judge_prompt: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     generation_params: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="ENABLED")
     created_at: Mapped[datetime] = mapped_column(
@@ -1274,11 +1365,11 @@ class JudgeResult(Base):
     )
     context_version: Mapped[int] = mapped_column(Integer, nullable=False)
     input_snapshot: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="PENDING")
     result: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     error_code: Mapped[str | None] = mapped_column(String(128))
     attempt_no: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
@@ -1296,6 +1387,96 @@ class JudgeResult(Base):
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+
+
+class PostmatchShowcase(Base):
+    __tablename__ = "postmatch_showcases"
+    __table_args__ = (
+        CheckConstraint(
+            "phase IN ('JUDGE_REVIEW', 'AUDIENCE_VOTE', 'AUDIENCE_RESULTS', 'AWARDS', 'CLOSED')",
+            name="ck_postmatch_showcases_phase",
+        ),
+        Index("ix_postmatch_showcases_phase", "phase", "is_published"),
+    )
+
+    match_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("matches.id", ondelete="CASCADE"), primary_key=True
+    )
+    phase: Mapped[str] = mapped_column(String(24), nullable=False, server_default="JUDGE_REVIEW")
+    is_published: Mapped[bool] = mapped_column(nullable=False, server_default="false")
+    display_payload: Mapped[dict[str, Any]] = mapped_column(
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
+    )
+    updated_by_user_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="SET NULL")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class PostmatchJudgeEntry(Base):
+    __tablename__ = "postmatch_judge_entries"
+    __table_args__ = (
+        CheckConstraint(
+            "winner_side IN ('AFFIRMATIVE', 'NEGATIVE', 'DRAW')",
+            name="ck_postmatch_judge_entries_winner",
+        ),
+        UniqueConstraint("match_id", name="uq_postmatch_judge_entries_match"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    match_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("matches.id", ondelete="CASCADE"), nullable=False
+    )
+    judge_user_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    comments: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
+    winner_side: Mapped[str] = mapped_column(String(16), nullable=False)
+    best_participant_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("match_participants.id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    is_published: Mapped[bool] = mapped_column(nullable=False, server_default="false")
+    published_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
+    )
+
+
+class AudienceVote(Base):
+    __tablename__ = "audience_votes"
+    __table_args__ = (
+        CheckConstraint(
+            "winner_side IN ('AFFIRMATIVE', 'NEGATIVE', 'DRAW')",
+            name="ck_audience_votes_winner",
+        ),
+        UniqueConstraint("match_id", "voter_user_id", name="uq_audience_votes_voter"),
+        Index("ix_audience_votes_match", "match_id", "created_at"),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    match_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("matches.id", ondelete="CASCADE"), nullable=False
+    )
+    voter_user_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
+    )
+    winner_side: Mapped[str] = mapped_column(String(16), nullable=False)
+    ranking: Mapped[list[str]] = mapped_column(
+        JSONB, nullable=False, server_default=sql_text("'[]'::jsonb")
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
 
 
 class LeaderboardSnapshot(Base):
@@ -1385,7 +1566,7 @@ class MatchExport(Base):
     total_items: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     processed_items: Mapped[int] = mapped_column(Integer, nullable=False, server_default="0")
     scope: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     storage_path: Mapped[str | None] = mapped_column(String(512))
     byte_count: Mapped[int] = mapped_column(BIGINT, nullable=False, server_default="0")
@@ -1411,6 +1592,10 @@ class MatchExportItem(Base):
         ),
         UniqueConstraint("export_id", "match_id", name="uq_match_export_items_match"),
         Index("ix_match_export_items_export_status", "export_id", "status"),
+        CheckConstraint(
+            "capture_snapshot_version IS NULL OR capture_snapshot_version >= 1",
+            name="ck_match_export_items_capture_snapshot_version",
+        ),
     )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -1426,6 +1611,7 @@ class MatchExportItem(Base):
     match_status: Mapped[str] = mapped_column(String(32), nullable=False)
     cutoff_sequence: Mapped[int] = mapped_column(Integer, nullable=False)
     cutoff_context_version: Mapped[int] = mapped_column(Integer, nullable=False)
+    capture_snapshot_version: Mapped[int | None] = mapped_column(Integer)
     error_code: Mapped[str | None] = mapped_column(String(128))
     completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
@@ -1488,13 +1674,13 @@ class AgentGeneration(Base):
     attempt_no: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="STARTED")
     input_snapshot: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     call_type: Mapped[str] = mapped_column(String(32), nullable=False, server_default="LLM_SPEECH")
     provider: Mapped[str | None] = mapped_column(String(64))
     model_snapshot: Mapped[str | None] = mapped_column(String(128))
     generation_params_snapshot: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     request_blob_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
@@ -1581,7 +1767,7 @@ class AgentFreeDebateDecision(Base):
     stale: Mapped[bool] = mapped_column(nullable=False, server_default="false")
     invalidated_reason: Mapped[str | None] = mapped_column(String(128))
     human_hand_snapshot: Mapped[list[Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'[]'::jsonb")
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -1652,6 +1838,11 @@ class ExternalCall(Base):
         Index("ix_external_calls_capture_started", "capture_version", "started_at", "id"),
         Index("ix_external_calls_source_started", "source_kind", "started_at"),
         Index("ix_external_calls_logical_attempt", "logical_call_id", "attempt_no"),
+        Index("ix_external_calls_capture_mode_started", "capture_storage_mode", "started_at", "id"),
+        CheckConstraint(
+            "capture_storage_mode IS NULL OR capture_storage_mode IN ('LEGACY', 'ASYNC_V1')",
+            name="ck_external_calls_capture_storage_mode",
+        ),
         CheckConstraint(
             "source_kind IS NULL OR source_kind IN "
             "('MATCH', 'HOST_AUDIO', 'CONFIG_TEST', 'OPS_PROBE')",
@@ -1722,6 +1913,7 @@ class ExternalCall(Base):
     audio_duration_ms: Mapped[int | None] = mapped_column(Integer)
     error_code: Mapped[str | None] = mapped_column(String(128))
     capture_version: Mapped[int | None] = mapped_column(Integer)
+    capture_storage_mode: Mapped[str | None] = mapped_column(String(16))
     captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     source_kind: Mapped[str | None] = mapped_column(String(32))
     source_resource_id: Mapped[str | None] = mapped_column(String(128))
@@ -1739,6 +1931,123 @@ class ExternalCall(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
+
+
+class ProviderCallCapture(Base):
+    """Non-authoritative provider research capture, independent of call updates."""
+
+    __tablename__ = "provider_call_captures"
+    __table_args__ = (
+        UniqueConstraint("external_call_id", name="uq_provider_call_captures_call"),
+        CheckConstraint("revision >= 1", name="ck_provider_call_captures_revision"),
+        CheckConstraint("schema_version >= 1", name="ck_provider_call_captures_schema_version"),
+        CheckConstraint(
+            "request_capture_status IS NULL OR request_capture_status IN "
+            "('COMPLETE', 'TRUNCATED', 'REJECTED_SENSITIVE', 'UNAVAILABLE')",
+            name="ck_provider_call_captures_request_status",
+        ),
+        CheckConstraint(
+            "response_capture_status IS NULL OR response_capture_status IN "
+            "('COMPLETE', 'TRUNCATED', 'REJECTED_SENSITIVE', 'UNAVAILABLE')",
+            name="ck_provider_call_captures_response_status",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    external_call_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("external_calls.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    schema_version: Mapped[int] = mapped_column(Integer, nullable=False, server_default="1")
+    captured_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+    provider_request_id: Mapped[str | None] = mapped_column(String(256))
+    request_blob_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("call_content_blobs.id", ondelete="RESTRICT")
+    )
+    response_blob_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("call_content_blobs.id", ondelete="RESTRICT")
+    )
+    request_capture_status: Mapped[str | None] = mapped_column(String(32))
+    response_capture_status: Mapped[str | None] = mapped_column(String(32))
+    request_original_bytes: Mapped[int | None] = mapped_column(BIGINT)
+    response_original_bytes: Mapped[int | None] = mapped_column(BIGINT)
+    request_stored_bytes: Mapped[int | None] = mapped_column(BIGINT)
+    response_stored_bytes: Mapped[int | None] = mapped_column(BIGINT)
+    request_sha256: Mapped[str | None] = mapped_column(String(64))
+    response_sha256: Mapped[str | None] = mapped_column(String(64))
+    capture_error_code: Mapped[str | None] = mapped_column(String(128))
+
+
+class ExportProviderCaptureSnapshot(Base):
+    """Immutable scalar input for an existing match export item."""
+
+    __tablename__ = "export_provider_capture_snapshots"
+    __table_args__ = (
+        UniqueConstraint(
+            "export_item_id", "external_call_id", name="uq_export_provider_capture_snapshots_call"
+        ),
+        Index(
+            "ix_export_provider_capture_snapshots_order",
+            "export_item_id",
+            "started_at",
+            "external_call_id",
+        ),
+        CheckConstraint(
+            "capture_revision IS NULL OR capture_revision >= 1",
+            name="ck_export_provider_capture_snapshots_revision",
+        ),
+    )
+
+    id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
+    export_item_id: Mapped[UUID] = mapped_column(
+        PostgreSQLUUID(as_uuid=True),
+        ForeignKey("match_export_items.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    # A frozen input survives standalone call deletion until its export item
+    # is deleted. Whole-match deletion already cascades the owning item.
+    external_call_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
+    call_kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    provider: Mapped[str] = mapped_column(String(64), nullable=False)
+    operation: Mapped[str] = mapped_column(String(128), nullable=False)
+    model: Mapped[str | None] = mapped_column(String(128))
+    voice: Mapped[str | None] = mapped_column(String(128))
+    attempt_no: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    speech_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    generation_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    decision_round_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    context_version: Mapped[int | None] = mapped_column(Integer)
+    started_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    first_result_latency_ms: Mapped[int | None] = mapped_column(Integer)
+    completed_latency_ms: Mapped[int | None] = mapped_column(Integer)
+    error_code: Mapped[str | None] = mapped_column(String(128))
+    source_kind: Mapped[str | None] = mapped_column(String(32))
+    source_resource_id: Mapped[str | None] = mapped_column(String(128))
+    logical_call_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
+    capture_revision: Mapped[int | None] = mapped_column(Integer)
+    capture_version: Mapped[int | None] = mapped_column(Integer)
+    captured_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    provider_request_id: Mapped[str | None] = mapped_column(String(256))
+    request_blob_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("call_content_blobs.id", ondelete="RESTRICT")
+    )
+    response_blob_id: Mapped[UUID | None] = mapped_column(
+        PostgreSQLUUID(as_uuid=True), ForeignKey("call_content_blobs.id", ondelete="RESTRICT")
+    )
+    request_capture_status: Mapped[str | None] = mapped_column(String(32))
+    response_capture_status: Mapped[str | None] = mapped_column(String(32))
+    request_original_bytes: Mapped[int | None] = mapped_column(BIGINT)
+    response_original_bytes: Mapped[int | None] = mapped_column(BIGINT)
+    request_stored_bytes: Mapped[int | None] = mapped_column(BIGINT)
+    response_stored_bytes: Mapped[int | None] = mapped_column(BIGINT)
+    request_sha256: Mapped[str | None] = mapped_column(String(64))
+    response_sha256: Mapped[str | None] = mapped_column(String(64))
+    capture_error_code: Mapped[str | None] = mapped_column(String(128))
 
 
 class SystemLogEvent(Base):
@@ -1773,7 +2082,7 @@ class SystemLogEvent(Base):
     connection_epoch: Mapped[int | None] = mapped_column(BIGINT)
     incident_id: Mapped[UUID | None] = mapped_column(PostgreSQLUUID(as_uuid=True))
     details: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     happened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
@@ -1828,7 +2137,7 @@ class AgentAudioAsset(Base):
     )
 
     id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True, default=uuid4)
-    generation_id: Mapped[UUID] = mapped_column(
+    generation_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True),
         ForeignKey("agent_generations.id", ondelete="CASCADE"),
         nullable=False,
@@ -2087,7 +2396,7 @@ class ExperimentMatchAttempt(Base):
             "uq_experiment_match_attempts_active",
             "scheduled_match_id",
             unique=True,
-            postgresql_where=text("status IN ('CREATED', 'WAITING', 'RUNNING', 'PAUSED')"),
+            postgresql_where=sql_text("status IN ('CREATED', 'WAITING', 'RUNNING', 'PAUSED')"),
         ),
     )
 
@@ -2204,7 +2513,7 @@ class FreeDebateOpportunity(Base):
         String(32), nullable=False, server_default="PENDING"
     )
     frozen_context: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     opened_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -2255,7 +2564,7 @@ class SpeakerAllocation(Base):
             "uq_speaker_allocations_effective",
             "opportunity_id",
             unique=True,
-            postgresql_where=text("effective = true"),
+            postgresql_where=sql_text("effective = true"),
         ),
     )
 
@@ -2436,7 +2745,7 @@ class PostmatchSurveyTask(Base):
         String(64), nullable=False, server_default="postmatch-v1"
     )
     answers: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -2463,7 +2772,7 @@ class PersonalAiSurveyVersion(Base):
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[str] = mapped_column(Text, nullable=False, server_default="")
     questions: Mapped[list[dict[str, Any]]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'[]'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'[]'::jsonb")
     )
     created_by: Mapped[UUID] = mapped_column(
         PostgreSQLUUID(as_uuid=True), ForeignKey("users.id", ondelete="RESTRICT"), nullable=False
@@ -2498,7 +2807,7 @@ class PersonalAiSurveyResponse(Base):
     )
     status: Mapped[str] = mapped_column(String(16), nullable=False, server_default="DRAFT")
     answers: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -2528,7 +2837,7 @@ class PersonalAiSurveyResponseRevision(Base):
         nullable=False,
     )
     answers: Mapped[dict[str, Any]] = mapped_column(
-        JSONB, nullable=False, server_default=text("'{}'::jsonb")
+        JSONB, nullable=False, server_default=sql_text("'{}'::jsonb")
     )
     submitted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -2654,6 +2963,8 @@ __all__ = [
     "RoomConnection",
     "RoomConnectionLease",
     "Rule",
+    "RuleAudioGeneration",
+    "WorkerHeartbeat",
     "RuleStage",
     "Seat",
     "ScheduledMatch",

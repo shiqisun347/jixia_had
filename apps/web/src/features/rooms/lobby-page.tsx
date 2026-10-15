@@ -104,14 +104,29 @@ function RoomCard({ room }: Readonly<{ room: LobbyRoom }>) {
         <span
           className={`rounded-lg px-2.5 py-1.5 ${room.spectator_capacity_full ? 'bg-amber-50 text-amber-800' : 'bg-lime-50 text-lime-800'}`}
         >
-          {room.spectator_capacity_full ? t('spectatorsFull') : t('spectatorRemaining', { count: room.spectator_remaining })}
+          {room.spectator_capacity_full
+            ? t('spectatorsFull')
+            : t('spectatorRemaining', { count: room.spectator_remaining })}
         </span>
       </div>
       <Link
         className="mt-6 inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-slate-950 px-4 py-2.5 text-sm font-black !text-white transition hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600 focus-visible:ring-offset-2"
         href={entry.href}
       >
-        {entry.kind === 'POSTMATCH' ? t('postmatch') : entry.kind === 'CLOSED' ? t('roomClosed') : entry.kind === 'LIVE_MATCH' ? t('returnMatch') : room.viewer_membership_state === 'ACTIVE' ? (room.match_id ? t('enter') : t('returnRoom')) : (room.match_id ? t('watch') : t('enterRoom'))} <ArrowRight className="size-4" aria-hidden="true" />
+        {entry.kind === 'POSTMATCH'
+          ? t('postmatch')
+          : entry.kind === 'CLOSED'
+            ? t('roomClosed')
+            : entry.kind === 'LIVE_MATCH'
+              ? t('returnMatch')
+              : room.viewer_membership_state === 'ACTIVE'
+                ? room.match_id
+                  ? t('enter')
+                  : t('returnRoom')
+                : room.match_id
+                  ? t('watch')
+                  : t('enterRoom')}{' '}
+        <ArrowRight className="size-4" aria-hidden="true" />
       </Link>
     </article>
   );

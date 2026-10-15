@@ -60,23 +60,46 @@ const steps = [
 ] as const;
 
 const capabilities = [
-  { title: '多元协作', description: '真人与智能体自由组队，共创观点，协同辩论。', icon: UsersRound, tone: 'text-emerald-600 bg-emerald-50 border-emerald-100' },
-  { title: '实时语音', description: '低延迟语音交互，流畅自然的表达体验。', icon: AudioLines, tone: 'text-blue-600 bg-blue-50 border-blue-100' },
-  { title: '公平竞技', description: '严谨的规则与评分机制，保障每一场对决的公平。', icon: ShieldCheck, tone: 'text-green-600 bg-green-50 border-green-100' },
-  { title: '成长体系', description: '积分、排行与成就系统，见证你的每一次进步。', icon: BarChart3, tone: 'text-violet-600 bg-violet-50 border-violet-100' },
+  {
+    title: '多元协作',
+    description: '真人与智能体自由组队，共创观点，协同辩论。',
+    icon: UsersRound,
+    tone: 'text-emerald-600 bg-emerald-50 border-emerald-100',
+  },
+  {
+    title: '实时语音',
+    description: '低延迟语音交互，流畅自然的表达体验。',
+    icon: AudioLines,
+    tone: 'text-blue-600 bg-blue-50 border-blue-100',
+  },
+  {
+    title: '公平竞技',
+    description: '严谨的规则与评分机制，保障每一场对决的公平。',
+    icon: ShieldCheck,
+    tone: 'text-green-600 bg-green-50 border-green-100',
+  },
+  {
+    title: '成长体系',
+    description: '积分、排行与成就系统，见证你的每一次进步。',
+    icon: BarChart3,
+    tone: 'text-violet-600 bg-violet-50 border-violet-100',
+  },
 ] as const;
 
 function SignalNetwork() {
   return (
     <div className="relative overflow-hidden rounded-2xl bg-transparent" aria-hidden="true">
-      <Image
-        src="/assets/jixia-debate-hero-v5-transparent.png"
-        alt=""
-        width={1693}
-        height={929}
-        priority
-        className="jx-hero-visual h-auto w-full object-contain object-center"
-      />
+      <picture>
+        <source srcSet="/assets/jixia-debate-hero-v5-transparent.webp" type="image/webp" />
+        <Image
+          src="/assets/jixia-debate-hero-v5-transparent.png"
+          alt=""
+          width={1693}
+          height={929}
+          loading="eager"
+          className="jx-hero-visual h-auto w-full object-contain object-center"
+        />
+      </picture>
     </div>
   );
 }
@@ -135,7 +158,9 @@ function RoomCard({
             isFull ? 'bg-amber-50 text-amber-800' : 'bg-lime-50 text-lime-800'
           }`}
         >
-          {isFull ? t('spectatorsFull') : t('spectatorRemaining', { count: room.spectatorRemaining })}
+          {isFull
+            ? t('spectatorsFull')
+            : t('spectatorRemaining', { count: room.spectatorRemaining })}
         </span>
       </div>
 
@@ -376,7 +401,10 @@ export function HomePrototype({
                 href="/lobby"
                 prefetch={false}
               >
-                <span className="grid size-6 place-items-center rounded-full bg-green-500 text-white"><Radio className="size-3.5" aria-hidden="true" /></span> {t('publicLobby')}
+                <span className="grid size-6 place-items-center rounded-full bg-green-500 text-white">
+                  <Radio className="size-3.5" aria-hidden="true" />
+                </span>{' '}
+                {t('publicLobby')}
                 <ChevronRight className="size-4" aria-hidden="true" />
               </Link>
             </div>
@@ -387,7 +415,10 @@ export function HomePrototype({
           </div>
         </section>
 
-        <section className="grid gap-4 pb-10 sm:grid-cols-2 xl:grid-cols-4" aria-label={t('capabilities')}>
+        <section
+          className="grid gap-4 pb-10 sm:grid-cols-2 xl:grid-cols-4"
+          aria-label={t('capabilities')}
+        >
           {capabilities.map((capability, index) => {
             const Icon = capability.icon;
             return (
@@ -395,12 +426,18 @@ export function HomePrototype({
                 key={capability.title}
                 className="flex min-h-[112px] items-start gap-3 rounded-2xl border border-blue-100/80 bg-white/85 p-3.5 shadow-[0_16px_42px_rgba(40,76,142,0.06)]"
               >
-                <span className={`grid size-14 shrink-0 place-items-center rounded-2xl border ${capability.tone}`}>
+                <span
+                  className={`grid size-14 shrink-0 place-items-center rounded-2xl border ${capability.tone}`}
+                >
                   <Icon className="size-7" aria-hidden="true" />
                 </span>
                 <span>
-                  <h2 className="text-base font-black text-slate-900">{t(`capability${index + 1}Title`)}</h2>
-                  <p className="mt-2 text-sm leading-6 text-slate-500">{t(`capability${index + 1}Description`)}</p>
+                  <h2 className="text-base font-black text-slate-900">
+                    {t(`capability${index + 1}Title`)}
+                  </h2>
+                  <p className="mt-2 text-sm leading-6 text-slate-500">
+                    {t(`capability${index + 1}Description`)}
+                  </p>
                 </span>
               </article>
             );
@@ -502,9 +539,7 @@ export function HomePrototype({
               <div>
                 <Radio className="mx-auto size-8 text-blue-500" aria-hidden="true" />
                 <h3 className="mt-4 text-lg font-black">{t('empty')}</h3>
-                <p className="mt-2 text-sm text-slate-600">
-                  {t('emptyDetail')}
-                </p>
+                <p className="mt-2 text-sm text-slate-600">{t('emptyDetail')}</p>
                 <a
                   className="mt-5 inline-flex items-center gap-2 rounded-xl bg-slate-950 px-4 py-2.5 text-sm font-bold text-white focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600 focus-visible:ring-offset-2"
                   href="#how-it-works"
@@ -536,8 +571,12 @@ export function HomePrototype({
                     <span className="block text-xs font-black tracking-[0.12em] text-lime-700">
                       {step.number}
                     </span>
-                    <span className="mt-1 block text-base font-black">{t(`step${index + 1}Title`)}</span>
-                    <span className="mt-1 block text-sm text-slate-500">{t(`step${index + 1}Description`)}</span>
+                    <span className="mt-1 block text-base font-black">
+                      {t(`step${index + 1}Title`)}
+                    </span>
+                    <span className="mt-1 block text-sm text-slate-500">
+                      {t(`step${index + 1}Description`)}
+                    </span>
                   </span>
                   {step.number !== '03' ? (
                     <ChevronRight

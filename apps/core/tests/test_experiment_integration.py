@@ -40,6 +40,7 @@ from jx_core.models import (
     ParticipantAnnotationTask,
     Room,
     Rule,
+    RuleStage,
     ScheduledMatch,
     ScheduledSeat,
     Seat,
@@ -135,10 +136,20 @@ async def test_v21_experiment_management_closes_real_postgres_loop() -> None:
                     side_size=4,
                     estimated_seconds=900,
                     status="ENABLED",
+                    lifecycle_status="ENABLED",
                     created_by=admin.id,
                     audio_reviewed_at=datetime.now(UTC),
                 )
                 session.add(rule)
+                await session.flush()
+                session.add(
+                    RuleStage(
+                        rule_id=rule.id,
+                        position=1,
+                        name="结束",
+                        stage_kind="END",
+                    )
+                )
                 await session.flush()
                 for agent in agents:
                     agent.rule_id = rule.id

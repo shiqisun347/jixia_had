@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+from typing import cast
+
 import pytest
 
 from jx_core.auth.errors import APIError
 from jx_core.survey_definitions import (
-    AI_APPROPRIATENESS,
-    AI_MATCH_REASONS,
     AI_ACCEPTABLE_ACTIONS,
     AI_ACTION_REALIZATION,
+    AI_APPROPRIATENESS,
+    AI_MATCH_REASONS,
     HUMAN_GOAL_DESCRIPTIONS,
     HUMAN_GOALS,
     HUMAN_PRIMARY_REASONS,
@@ -21,9 +24,12 @@ from jx_core.survey_service import (
     PERSONAL_DEFAULT_QUESTIONS,
     POSTMATCH_SCOPE_FREE_DEBATE,
     POSTMATCH_SCOPE_LEGACY,
+    POSTMATCH_TASK_PAGE_DEFAULT,
+    POSTMATCH_TASK_PAGE_MAX,
     POSTMATCH_WORKFLOW_KEY,
     POSTMATCH_WORKFLOW_VERSION,
     _annotation_scope,
+    _bounded_page_limit,
     _participant_answers_projection,
     _review_projection,
     _validate_answers,
@@ -31,7 +37,23 @@ from jx_core.survey_service import (
     _validate_strict_prespeech_answers_immutable,
     _validate_strict_progression,
     _validate_strict_speech_answer,
+    _visible_target_ids,
 )
+
+
+def test_postmatch_list_page_is_bounded() -> None:
+    assert POSTMATCH_TASK_PAGE_DEFAULT == 25
+    assert _bounded_page_limit(0) == 1
+    assert _bounded_page_limit(POSTMATCH_TASK_PAGE_MAX + 100) == POSTMATCH_TASK_PAGE_MAX
+
+
+def test_summary_projection_keeps_visible_answer_ids_without_items() -> None:
+    speeches = cast(list, [SimpleNamespace(id="context"), SimpleNamespace(id="current")])
+    assert _visible_target_ids(
+        speeches,
+        [False, True],
+        [(True, "CONTEXT"), (True, "CURRENT_POST")],
+    ) == {"current"}
 
 
 def test_personal_survey_requires_all_scale_answers_on_submit() -> None:

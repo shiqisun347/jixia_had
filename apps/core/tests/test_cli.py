@@ -24,5 +24,6 @@ def test_cli_uses_bounded_graceful_shutdown(monkeypatch) -> None:
     assert captured["host"] == settings.core_host
     assert captured["port"] == settings.core_port
     assert captured["workers"] == 1
+    assert captured["ws_max_size"] == 256 * 1024
     assert captured["timeout_graceful_shutdown"] == 2
     assert captured["log_config"] is None

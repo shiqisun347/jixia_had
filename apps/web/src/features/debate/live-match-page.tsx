@@ -1,19 +1,18 @@
 'use client';
 
-import { useQuery, useQueryClient } from '@tanstack/react-query';
-import { CircleAlert, ClipboardCheck, LoaderCircle } from 'lucide-react';
+import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
+import { CircleAlert, LoaderCircle } from 'lucide-react';
 import Link from 'next/link';
-import { useRouter } from 'next/navigation';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
 import { buttonVariants } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast-provider';
 import { useCurrentUser } from '@/features/auth/use-auth';
+import { AdminEmergencyControls } from '@/features/admin/admin-emergency-controls';
 import { ApiClientError } from '@/lib/auth-api';
 import { matchesApi } from '@/lib/matches-api';
 import { roomsApi, type RoomSnapshot } from '@/lib/rooms-api';
-import { surveyApi } from '@/lib/experiments-api';
 import { useSubmissionGate } from '@/lib/use-submission-gate';
 import { useAppTranslations } from '@/i18n';
 
@@ -27,7 +26,7 @@ import {
   type RemoteAudioSource,
 } from './match-audio-playback';
 import { shouldConnectMatchAudio } from './match-audio-policy';
-import { resolveCurrentSeat } from './match-presentation';
+import { canRequestHand, resolveCurrentSeat } from './match-presentation';
 import { useMatchRuntime } from './use-match-runtime';
 import { shouldRestoreMicrophone, useMatchCommand } from './use-match-command';
 import { useSmoothMatchSnapshot } from './use-smooth-match-snapshot';
@@ -56,7 +55,10 @@ function errorText(error: unknown, fallback = '比赛连接暂时不可用，请
   return error instanceof ApiClientError ? error.message : fallback;
 }
 
-export function transcriptSaveErrorText(error: unknown, fallback = '保存失败，请稍后重试。'): string {
+export function transcriptSaveErrorText(
+  error: unknown,
+  fallback = '保存失败，请稍后重试。',
+): string {
   return error instanceof ApiClientError ? error.message : fallback;
 }
 
@@ -72,9 +74,7 @@ export function canManageMatch(
 ): boolean {
   if (!room || !userId) return false;
   if (room.organizer_user_id === userId) return true;
-  return Boolean(
-    room.experiment_mode && (room.viewer_is_experiment_controller || role === 'ADMIN'),
-  );
+  return role === 'ADMIN';
 }
 
 export function shouldShowPostmatchPrompt(
@@ -88,26 +88,35 @@ export function shouldShowPostmatchPrompt(
 
 type MatchConfirmation = 'finish' | 'pause' | 'reset' | 'terminate' | 'leave';
 
-function confirmationCopy(t: ReturnType<typeof useAppTranslations>): Record<
-  MatchConfirmation,
-  { title: string; description: string; confirmLabel: string }
-> {
+function confirmationCopy(
+  t: ReturnType<typeof useAppTranslations>,
+): Record<MatchConfirmation, { title: string; description: string; confirmLabel: string }> {
   return {
-  finish: {
-    title: t('dialog.finishTitle'), description: t('dialog.finishDescription'), confirmLabel: t('dialog.finishConfirm'),
-  },
-  pause: {
-    title: t('dialog.pauseTitle'), description: t('dialog.pauseDescription'), confirmLabel: t('dialog.pauseConfirm'),
-  },
-  reset: {
-    title: t('dialog.resetTitle'), description: t('dialog.resetDescription'), confirmLabel: t('dialog.resetConfirm'),
-  },
-  terminate: {
-    title: t('dialog.terminateTitle'), description: t('dialog.terminateDescription'), confirmLabel: t('terminate'),
-  },
-  leave: {
-    title: t('dialog.leaveTitle'), description: t('dialog.leaveDescription'), confirmLabel: t('dialog.leaveConfirm'),
-  },
+    finish: {
+      title: t('dialog.finishTitle'),
+      description: t('dialog.finishDescription'),
+      confirmLabel: t('dialog.finishConfirm'),
+    },
+    pause: {
+      title: t('dialog.pauseTitle'),
+      description: t('dialog.pauseDescription'),
+      confirmLabel: t('dialog.pauseConfirm'),
+    },
+    reset: {
+      title: t('dialog.resetTitle'),
+      description: t('dialog.resetDescription'),
+      confirmLabel: t('dialog.resetConfirm'),
+    },
+    terminate: {
+      title: t('dialog.terminateTitle'),
+      description: t('dialog.terminateDescription'),
+      confirmLabel: t('terminate'),
+    },
+    leave: {
+      title: t('dialog.leaveTitle'),
+      description: t('dialog.leaveDescription'),
+      confirmLabel: t('dialog.leaveConfirm'),
+    },
   };
 }
 
@@ -121,56 +130,136 @@ export function actionLabel(
   title: string;
   detail: string;
 } {
-  const t = translate ?? ((key: string, values?: Record<string, string>) => {
-    if (key === 'humanReady.otherTitle') return `轮到${values?.speaker ?? currentSpeakerLabel}发言`;
-    const legacy: Record<string, string> = {
-      'hostAnnouncing.eyebrow': '赛制播报', 'hostAnnouncing.title': '主持音频播放中', 'hostAnnouncing.detail': '播报结束后进入当前阶段。',
-      'humanReady.eyebrow': '当前发言席位已就绪', 'humanReady.ownTitle': '轮到你发言了！', 'humanReady.ownDetail': '点击开始后才会开启麦克风并启动正式计时。', 'humanReady.otherDetail': '当前发言者开始后，其他辩手请保持关注。',
-      'humanSpeaking.eyebrow': '实时发言中', 'humanSpeaking.title': '麦克风已开启', 'humanSpeaking.detail': '服务端正在控制发言时长，你可以提前结束。',
-      'finalizing.eyebrow': '文字整理中', 'finalizing.title': '正在整理文字记录', 'finalizing.detail': '发言已经结束，正在等待 ASR 最终结果。',
-      'agentPreparing.eyebrow': 'Agent 准备中', 'agentPreparing.title': 'Agent 正在思考中', 'agentPreparing.detail': '正在生成正式发言并建立实时语音，等待时间不计入发言时长。',
-      'agentSpeaking.eyebrow': 'Agent 实时发言', 'agentSpeaking.title': 'Agent 正在发言', 'agentSpeaking.detail': '语音正在实时播放，文字记录同步更新。',
-      'agentFinalizing.eyebrow': 'Agent 发言收尾', 'agentFinalizing.title': '正在提交正式记录', 'agentFinalizing.detail': '系统正在确认实际播放文字和音频文件。',
-      'preparing.eyebrow': '准备阶段', 'preparing.title': '准备时间进行中', 'preparing.detail': '倒计时结束后自动进入下一动作。',
-      'finished.eyebrow': '比赛结束', 'finished.title': '本场辩论已完成', 'finished.detail': '完整文字记录已经归档，AI 裁判正在生成或已经完成评分。',
-      'recovery.eyebrow': '系统恢复保护', 'recovery.title': '比赛已安全暂停', 'recovery.detail': '计时与实时语音均已冻结；满足在线和设备条件后可以申请恢复。',
-      'selecting.eyebrow': '自由辩论候选中', 'selecting.title': '申请下一次发言', 'selecting.detail': '人类举手优先；无人举手时由本方 Agent 独立决策并选择发言者。',
-      'resuming.eyebrow': '比赛即将恢复', 'resuming.title': '3 秒后恢复比赛', 'resuming.detail': '请保持设备连接，当前发言将从安全起点重新开始。',
-      'starting.eyebrow': '比赛启动', 'starting.title': '正在建立实时状态', 'starting.detail': '请保持页面打开。',
-    };
-    return legacy[key] ?? key;
-  });
+  const t =
+    translate ??
+    ((key: string, values?: Record<string, string>) => {
+      if (key === 'humanReady.otherTitle')
+        return `轮到${values?.speaker ?? currentSpeakerLabel}发言`;
+      const legacy: Record<string, string> = {
+        'hostAnnouncing.eyebrow': '赛制播报',
+        'hostAnnouncing.title': '主持音频播放中',
+        'hostAnnouncing.detail': '播报结束后进入当前阶段。',
+        'humanReady.eyebrow': '当前发言席位已就绪',
+        'humanReady.ownTitle': '轮到你发言了！',
+        'humanReady.ownDetail': '点击开始后才会开启麦克风并启动正式计时。',
+        'humanReady.otherDetail': '当前发言者开始后，其他辩手请保持关注。',
+        'humanSpeaking.eyebrow': '实时发言中',
+        'humanSpeaking.title': '麦克风已开启',
+        'humanSpeaking.detail': '服务端正在控制发言时长，你可以提前结束。',
+        'finalizing.eyebrow': '文字整理中',
+        'finalizing.title': '正在整理文字记录',
+        'finalizing.detail': '发言已经结束，正在等待 ASR 最终结果。',
+        'agentPreparing.eyebrow': 'Agent 准备中',
+        'agentPreparing.title': 'Agent 正在思考中',
+        'agentPreparing.detail': '正在生成正式发言并建立实时语音，等待时间不计入发言时长。',
+        'agentSpeaking.eyebrow': 'Agent 实时发言',
+        'agentSpeaking.title': 'Agent 正在发言',
+        'agentSpeaking.detail': '语音正在实时播放，文字记录同步更新。',
+        'agentFinalizing.eyebrow': 'Agent 发言收尾',
+        'agentFinalizing.title': '正在提交正式记录',
+        'agentFinalizing.detail': '系统正在确认实际播放文字和音频文件。',
+        'preparing.eyebrow': '准备阶段',
+        'preparing.title': '准备时间进行中',
+        'preparing.detail': '倒计时结束后自动进入下一动作。',
+        'finished.eyebrow': '比赛结束',
+        'finished.title': '本场辩论已完成',
+        'finished.detail': '感谢各位辩手与观众。可在赛后记录中查看整理与评分进度。',
+        'recovery.eyebrow': '系统恢复保护',
+        'recovery.title': '比赛已安全暂停',
+        'recovery.detail': '计时与实时语音均已冻结；满足在线和设备条件后可以申请恢复。',
+        'selecting.eyebrow': '自由辩论候选中',
+        'selecting.title': '申请下一次发言',
+        'selecting.detail': '人类举手优先；无人举手时由本方 Agent 独立决策并选择发言者。',
+        'resuming.eyebrow': '比赛即将恢复',
+        'resuming.title': '3 秒后恢复比赛',
+        'resuming.detail': '请保持设备连接，当前发言将从安全起点重新开始。',
+        'starting.eyebrow': '比赛启动',
+        'starting.title': '正在建立实时状态',
+        'starting.detail': '请保持页面打开。',
+      };
+      return legacy[key] ?? key;
+    });
   switch (actionState) {
     case 'HOST_ANNOUNCING':
-      return { eyebrow: t('hostAnnouncing.eyebrow'), title: t('hostAnnouncing.title'), detail: t('hostAnnouncing.detail') };
+      return {
+        eyebrow: t('hostAnnouncing.eyebrow'),
+        title: t('hostAnnouncing.title'),
+        detail: t('hostAnnouncing.detail'),
+      };
     case 'HUMAN_READY_TO_START':
       return {
         eyebrow: t('humanReady.eyebrow'),
-        title: isCurrentSpeaker ? t('humanReady.ownTitle') : t('humanReady.otherTitle', { speaker: currentSpeakerLabel }),
+        title: isCurrentSpeaker
+          ? t('humanReady.ownTitle')
+          : t('humanReady.otherTitle', { speaker: currentSpeakerLabel }),
         detail: isCurrentSpeaker ? t('humanReady.ownDetail') : t('humanReady.otherDetail'),
       };
     case 'HUMAN_SPEAKING':
-      return { eyebrow: t('humanSpeaking.eyebrow'), title: t('humanSpeaking.title'), detail: t('humanSpeaking.detail') };
+      return {
+        eyebrow: t('humanSpeaking.eyebrow'),
+        title: t('humanSpeaking.title'),
+        detail: t('humanSpeaking.detail'),
+      };
     case 'SPEECH_FINALIZING':
-      return { eyebrow: t('finalizing.eyebrow'), title: t('finalizing.title'), detail: t('finalizing.detail') };
+      return {
+        eyebrow: t('finalizing.eyebrow'),
+        title: t('finalizing.title'),
+        detail: t('finalizing.detail'),
+      };
     case 'AGENT_PREPARING':
-      return { eyebrow: t('agentPreparing.eyebrow'), title: t('agentPreparing.title'), detail: t('agentPreparing.detail') };
+      return {
+        eyebrow: t('agentPreparing.eyebrow'),
+        title: t('agentPreparing.title'),
+        detail: t('agentPreparing.detail'),
+      };
     case 'AGENT_SPEAKING':
-      return { eyebrow: t('agentSpeaking.eyebrow'), title: t('agentSpeaking.title'), detail: t('agentSpeaking.detail') };
+      return {
+        eyebrow: t('agentSpeaking.eyebrow'),
+        title: t('agentSpeaking.title'),
+        detail: t('agentSpeaking.detail'),
+      };
     case 'AGENT_FINALIZING':
-      return { eyebrow: t('agentFinalizing.eyebrow'), title: t('agentFinalizing.title'), detail: t('agentFinalizing.detail') };
+      return {
+        eyebrow: t('agentFinalizing.eyebrow'),
+        title: t('agentFinalizing.title'),
+        detail: t('agentFinalizing.detail'),
+      };
     case 'PREPARING':
-      return { eyebrow: t('preparing.eyebrow'), title: t('preparing.title'), detail: t('preparing.detail') };
+      return {
+        eyebrow: t('preparing.eyebrow'),
+        title: t('preparing.title'),
+        detail: t('preparing.detail'),
+      };
     case 'MATCH_FINISHED':
-      return { eyebrow: t('finished.eyebrow'), title: t('finished.title'), detail: t('finished.detail') };
+      return {
+        eyebrow: t('finished.eyebrow'),
+        title: t('finished.title'),
+        detail: t('finished.detail'),
+      };
     case 'RECOVERY_REQUIRED':
-      return { eyebrow: t('recovery.eyebrow'), title: t('recovery.title'), detail: t('recovery.detail') };
+      return {
+        eyebrow: t('recovery.eyebrow'),
+        title: t('recovery.title'),
+        detail: t('recovery.detail'),
+      };
     case 'FREE_SELECTING':
-      return { eyebrow: t('selecting.eyebrow'), title: t('selecting.title'), detail: t('selecting.detail') };
+      return {
+        eyebrow: t('selecting.eyebrow'),
+        title: t('selecting.title'),
+        detail: t('selecting.detail'),
+      };
     case 'RESUME_COUNTDOWN':
-      return { eyebrow: t('resuming.eyebrow'), title: t('resuming.title'), detail: t('resuming.detail') };
+      return {
+        eyebrow: t('resuming.eyebrow'),
+        title: t('resuming.title'),
+        detail: t('resuming.detail'),
+      };
     default:
-      return { eyebrow: t('starting.eyebrow'), title: t('starting.title'), detail: t('starting.detail') };
+      return {
+        eyebrow: t('starting.eyebrow'),
+        title: t('starting.title'),
+        detail: t('starting.detail'),
+      };
   }
 }
 
@@ -178,11 +267,14 @@ export function terminalPresentation(
   status: string,
   translate?: (key: string) => string,
 ): ReturnType<typeof actionLabel> | null {
-  const t = translate ?? ((key: string) => ({
-    'terminated.eyebrow': '比赛终止',
-    'terminated.title': '本场比赛已终止',
-    'terminated.detail': '比赛已由房主终止，不能继续发言；现有文字记录仍可查看。',
-  })[key] ?? key);
+  const t =
+    translate ??
+    ((key: string) =>
+      ({
+        'terminated.eyebrow': '比赛终止',
+        'terminated.title': '本场比赛已终止',
+        'terminated.detail': '比赛已由房主终止，不能继续发言；现有文字记录仍可查看。',
+      })[key] ?? key);
   if (status === 'TERMINATED') {
     return {
       eyebrow: t('terminated.eyebrow'),
@@ -200,7 +292,6 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
   useEffect(() => {
     debateTRef.current = debateT;
   }, [debateT]);
-  const router = useRouter();
   const { showToast } = useToast();
   const queryClient = useQueryClient();
   const currentUser = useCurrentUser();
@@ -236,7 +327,9 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
     sampledAt: number | null;
   }>({ rttMs: null, packetLossPercent: null, sampledAt: null });
   const [networkOpen, setNetworkOpen] = useState(false);
+  const [presentationMode, setPresentationMode] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
+  const [emergencyOpen, setEmergencyOpen] = useState(false);
   const [editingSpeechId, setEditingSpeechId] = useState<string | null>(null);
   const [draftText, setDraftText] = useState('');
   const [savingSpeechId, setSavingSpeechId] = useState<string | null>(null);
@@ -244,22 +337,55 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
   const [leaving, setLeaving] = useState(false);
   const [confirmation, setConfirmation] = useState<MatchConfirmation | null>(null);
   const [confirmationPending, setConfirmationPending] = useState(false);
-  const [postmatchPromptDismissed, setPostmatchPromptDismissed] = useState(
-    () =>
-      typeof window !== 'undefined' &&
-      window.sessionStorage.getItem(`jx:postmatch-prompt:${matchId}`) === '1',
-  );
   const confirmationGate = useSubmissionGate();
-  const hostAudioRef = useRef<HTMLAudioElement | null>(null);
-  const [hostAudioMounted, setHostAudioMounted] = useState(false);
-  const setHostAudioRef = useCallback((element: HTMLAudioElement | null) => {
-    hostAudioRef.current = element;
-    setHostAudioMounted(Boolean(element));
-  }, []);
   const presenceRefreshEpochRef = useRef<number | null>(null);
   const snapshot = runtime.snapshot;
   const shouldConnectAudio = shouldConnectMatchAudio(snapshot?.status);
   const terminal = Boolean(snapshot && !shouldConnectAudio);
+  const runtimeStartMutation = useMutation({
+    mutationFn: () =>
+      roomQuery.data?.id
+        ? matchesApi.startRuntime(roomQuery.data.id)
+        : Promise.reject(new Error('room_not_found')),
+    onSuccess: () => {
+      setEmergencyOpen(false);
+    },
+    onError: (error) =>
+      showToast({ message: errorText(error, '正式开始失败，请刷新后重试。'), tone: 'error' }),
+  });
+
+  useEffect(() => {
+    const syncPresentationMode = () => {
+      setPresentationMode(Boolean(document.fullscreenElement));
+    };
+    document.addEventListener('fullscreenchange', syncPresentationMode);
+    return () => document.removeEventListener('fullscreenchange', syncPresentationMode);
+  }, []);
+
+  useEffect(() => {
+    if (!presentationMode) return;
+    const exitOnEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return;
+      setPresentationMode(false);
+      if (document.fullscreenElement) void document.exitFullscreen().catch(() => undefined);
+    };
+    document.addEventListener('keydown', exitOnEscape);
+    return () => document.removeEventListener('keydown', exitOnEscape);
+  }, [presentationMode]);
+
+  const togglePresentation = useCallback(async () => {
+    try {
+      if (presentationMode || document.fullscreenElement) {
+        if (document.fullscreenElement) await document.exitFullscreen?.();
+        setPresentationMode(false);
+        return;
+      }
+      await document.documentElement.requestFullscreen?.();
+    } catch {
+      // Browsers may reject fullscreen; the layout still provides a fixed big-screen mode.
+    }
+    setPresentationMode(true);
+  }, [presentationMode]);
 
   useEffect(() => {
     knownHumanUserIdsRef.current =
@@ -481,9 +607,7 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
           const needsPlaybackConsent = playbackBlocked || !room.canPlaybackAudio;
           setAudioStatus('ready');
           setPlaybackStatus(needsPlaybackConsent ? 'blocked' : 'ready');
-          setAudioError(
-            needsPlaybackConsent ? debateTRef.current('dialog.audioBlocked') : null,
-          );
+          setAudioError(needsPlaybackConsent ? debateTRef.current('dialog.audioBlocked') : null);
         }
       } catch (error) {
         if (!cancelled) {
@@ -513,34 +637,9 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
   const currentMember = room?.members.find((member) => member.user_id === userId);
   const mySeat = room?.seats.find((seat) => seat.user_id === userId);
   const isDebater = Boolean(mySeat);
-  const postmatchStatusQuery = useQuery({
-    queryKey: ['survey', 'postmatch', matchId, 'status'],
-    queryFn: () => surveyApi.postmatchStatus(matchId),
-    enabled: snapshot?.status === 'FINISHED' && isDebater,
-    staleTime: 5_000,
-  });
-
-  const postmatchPromptOpen = shouldShowPostmatchPrompt(
-    snapshot?.status,
-    isDebater,
-    postmatchStatusQuery.data?.pending === true,
-    postmatchPromptDismissed,
-  );
-
-  const dismissPostmatchPrompt = useCallback(() => {
-    window.sessionStorage.setItem(`jx:postmatch-prompt:${matchId}`, '1');
-    setPostmatchPromptDismissed(true);
-  }, [matchId]);
-  const candidateSide =
-    snapshot?.action_state === 'FREE_SELECTING'
-      ? snapshot.free_holder_side
-      : snapshot?.current_speaker_side === 'AFFIRMATIVE'
-        ? 'NEGATIVE'
-        : 'AFFIRMATIVE';
   const handQueue = snapshot?.hand_queue ?? [];
   const myHandIndex = userId ? handQueue.indexOf(userId) : -1;
-  const canRaiseHand =
-    snapshot?.hand_window_open && Boolean(mySeat) && mySeat?.side === candidateSide;
+  const canRaiseHand = canRequestHand(displaySnapshot ?? snapshot, mySeat?.side);
   const currentSeat = useMemo(
     () => resolveCurrentSeat(room?.seats, snapshot),
     [room?.seats, snapshot],
@@ -603,7 +702,6 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
   const sendMatchCommand = useCallback(
     (
       type:
-        | 'host.finished'
         | 'speech.start'
         | 'speech.finish'
         | 'speech.reset'
@@ -615,7 +713,10 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
     ) => runtime.sendCommand({ type, message_id: crypto.randomUUID() }),
     [runtime],
   );
-  const { command, isPending: commandPending } = useMatchCommand(sendMatchCommand);
+  const { command, isPending: commandPending } = useMatchCommand(
+    sendMatchCommand,
+    runtime.commandFailureMessage,
+  );
 
   async function enableMatchAudio() {
     try {
@@ -625,9 +726,6 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
         return;
       }
       await session.enableAudio();
-      if (snapshot?.action_state === 'HOST_ANNOUNCING' && hostAudioRef.current?.src) {
-        await hostAudioRef.current.play();
-      }
       setPlaybackStatus('ready');
       setAudioError(null);
     } catch {
@@ -641,7 +739,6 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
     outputMutedRef.current = muted;
     setOutputMuted(muted);
     audioSessionRef.current?.setOutputMuted?.(muted);
-    if (hostAudioRef.current) hostAudioRef.current.muted = muted;
   }
 
   function updateMutedHumanUsers(nextUserIds: string[]) {
@@ -766,18 +863,7 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
     }
   }
 
-  const currentActionKey = snapshot?.current_action
-    ? `${snapshot.current_action.stage_position}:${snapshot.current_action.action_position}`
-    : null;
-  const hostAudioPath = snapshot?.current_action?.host_audio_path;
-  const hostAudioUrl =
-    snapshot?.action_state === 'HOST_ANNOUNCING' && currentActionKey && hostAudioPath
-      ? hostAudioPath.startsWith('/api/')
-        ? hostAudioPath
-        : `/api/matches/${matchId}/host-audio/${encodeURIComponent(currentActionKey)}`
-      : null;
-  const visibleAudioError =
-    hostAudioUrl && audioError === debateT('dialog.audioBlocked') ? null : audioError;
+  const visibleAudioError = audioError;
   // After the live page has a valid snapshot, room and user, refresh failures
   // are recoverable transport errors and must not unmount the match UI.
   const hasEnteredMatch = Boolean(snapshot && roomQuery.data && currentUser.data);
@@ -793,7 +879,8 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
     : null;
 
   useEffect(() => {
-    if (entryError) showToast({ message: errorText(entryError, matchT('connectionUnavailable')), tone: 'error' });
+    if (entryError)
+      showToast({ message: errorText(entryError, matchT('connectionUnavailable')), tone: 'error' });
   }, [entryError, matchT, showToast]);
 
   useEffect(() => {
@@ -811,100 +898,14 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
     }
   }, [playbackStatus, showToast, visibleAudioError]);
 
-  useEffect(() => {
-    const element = hostAudioRef.current;
-    if (!element || !hostAudioUrl || !currentActionKey) {
-      if (element) {
-        element.pause();
-        element.removeAttribute('src');
-        element.load();
-      }
-      return;
-    }
-    let objectUrl: string | null = null;
-    let cancelled = false;
-    let cancelMetadataWait: (() => void) | null = null;
-    void (async () => {
-      try {
-        const response = await fetch(hostAudioUrl, { credentials: 'include' });
-        if (!response.ok) {
-          let message = debateTRef.current('dialog.hostAudioUnavailable');
-          try {
-            const payload = (await response.json()) as { error?: { message?: string } };
-            message = payload.error?.message || message;
-          } catch {
-            // Keep the safe fallback when the error body is unavailable.
-          }
-          if (!cancelled) {
-            setAudioError(message);
-          }
-          return;
-        }
-        const blob = await response.blob();
-        if (cancelled) return;
-        objectUrl = URL.createObjectURL(blob);
-        element.src = objectUrl;
-        const remainingMs = snapshot?.host_audio_remaining_ms ?? 0;
-        if (remainingMs <= 0) return;
-        const durationMs = snapshot?.current_action?.host_audio_duration_ms ?? remainingMs;
-        if (element.readyState < HTMLMediaElement.HAVE_METADATA) {
-          await new Promise<void>((resolve, reject) => {
-            const onMetadata = () => {
-              cleanup();
-              resolve();
-            };
-            const onError = () => {
-              cleanup();
-              reject(new Error('host_audio_metadata_unavailable'));
-            };
-            const cleanup = () => {
-              element.removeEventListener('loadedmetadata', onMetadata);
-              element.removeEventListener('error', onError);
-              cancelMetadataWait = null;
-            };
-            cancelMetadataWait = () => {
-              cleanup();
-              resolve();
-            };
-            element.addEventListener('loadedmetadata', onMetadata, { once: true });
-            element.addEventListener('error', onError, { once: true });
-          });
-        }
-        if (cancelled) return;
-        element.currentTime = Math.max(0, durationMs - remainingMs) / 1000;
-        await element.play();
-      } catch (error) {
-        if (cancelled) return;
-        if (error instanceof DOMException && error.name === 'NotAllowedError') {
-          setPlaybackStatus('blocked');
-          setAudioError(debateTRef.current('dialog.audioBlocked'));
-        } else {
-          setAudioError(debateTRef.current('dialog.hostAudioLoadFailed'));
-        }
-      }
-    })();
-    return () => {
-      cancelled = true;
-      cancelMetadataWait?.();
-      element.pause();
-      element.removeAttribute('src');
-      element.load();
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [
-    currentActionKey,
-    hostAudioMounted,
-    hostAudioUrl,
-    snapshot?.current_action?.host_audio_duration_ms,
-    snapshot?.host_audio_remaining_ms,
-  ]);
-
   if (entryError) {
     return (
       <main className="jx-page-grid grid min-h-screen place-items-center px-6">
         <section className="max-w-md rounded-[1.75rem] border border-red-200 bg-white p-8 text-center shadow-xl">
           <CircleAlert className="mx-auto size-9 text-red-600" />
-          <h1 className="mt-4 text-2xl font-black text-slate-950">{debateT('dialog.entryFailedTitle')}</h1>
+          <h1 className="mt-4 text-2xl font-black text-slate-950">
+            {debateT('dialog.entryFailedTitle')}
+          </h1>
           <p className="mt-3 text-sm leading-7 text-slate-600">
             {debateT('dialog.entryFailedDescription')}
           </p>
@@ -953,6 +954,16 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
         matchId={matchId}
         myHandIndex={myHandIndex}
         onCloseDrawer={() => setDrawerOpen(false)}
+        emergencyOpen={emergencyOpen}
+        emergencyControls={
+          currentUser.data?.user.role === 'ADMIN' ? (
+            <AdminEmergencyControls matchId={matchId} />
+          ) : undefined
+        }
+        onOpenEmergency={() => setEmergencyOpen(true)}
+        onCloseEmergency={() => setEmergencyOpen(false)}
+        onStartRuntime={() => runtimeStartMutation.mutate()}
+        runtimeStartPending={runtimeStartMutation.isPending}
         onCommand={(type) => void command(type)}
         onDraftTextChange={setDraftText}
         onEditSpeech={(speechId, text) => {
@@ -975,6 +986,8 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
         networkStats={networkStats}
         onOpenNetwork={() => setNetworkOpen(true)}
         onCloseNetwork={() => setNetworkOpen(false)}
+        onTogglePresentation={() => void togglePresentation()}
+        presentationMode={presentationMode}
         presentation={presentation}
         room={room}
         runtime={{
@@ -983,6 +996,7 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
           interimText: runtime.interimText,
           resumeReasons: runtime.resumeReasons,
           commandReady: runtime.commandReady,
+          commandErrorCode: runtime.commandErrorCode,
         }}
         savingSpeechId={savingSpeechId}
         snapshot={displaySnapshot ?? snapshot}
@@ -1012,41 +1026,6 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
           }
         />
       ) : null}
-      {postmatchPromptOpen && postmatchStatusQuery.data?.pending ? (
-        <ConfirmDialog
-          cancelLabel={debateT('dialog.surveyLater')}
-          confirmLabel={debateT('dialog.surveyComplete')}
-          description={debateT('dialog.surveyDescription')}
-          icon={<ClipboardCheck className="size-5" aria-hidden="true" />}
-          onConfirm={() => {
-            dismissPostmatchPrompt();
-            router.push(postmatchStatusQuery.data?.href ?? '/me/postmatch-surveys');
-          }}
-          onOpenChange={(open) => {
-            if (!open) dismissPostmatchPrompt();
-          }}
-          open
-          title={debateT('dialog.surveyTitle')}
-          tone="primary"
-        />
-      ) : null}
-      {snapshot?.status === 'FINISHED' &&
-      isDebater &&
-      postmatchStatusQuery.data?.pending &&
-      !postmatchPromptOpen ? (
-        <div className="fixed bottom-4 left-1/2 z-[80] w-[min(calc(100vw-2rem),520px)] -translate-x-1/2 rounded-xl border border-blue-200 bg-white p-3 shadow-[0_16px_48px_rgba(15,23,42,0.18)]">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <p className="text-sm font-bold text-slate-800">{debateT('dialog.surveyPending')}</p>
-            <Link
-              className="inline-flex min-h-10 items-center gap-2 rounded-lg bg-blue-600 px-4 text-sm font-bold text-white hover:bg-blue-700"
-              href={postmatchStatusQuery.data.href}
-            >
-              <ClipboardCheck className="size-4" aria-hidden="true" /> {debateT('dialog.surveyComplete')}
-            </Link>
-          </div>
-        </div>
-      ) : null}
-      <audio ref={setHostAudioRef} className="sr-only" muted={outputMuted} preload="auto" />
     </>
   );
 }

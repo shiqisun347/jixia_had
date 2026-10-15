@@ -76,7 +76,11 @@ export default function AdminRulesPage() {
         {loading ? (
           <p className="py-10 text-center text-sm text-slate-500">正在加载规则…</p>
         ) : rules.length ? (
-          <RuleTable rules={rules} />
+          <RuleTable
+            onChanged={load}
+            rules={rules}
+            showMessage={(message, tone) => toast?.showToast({ message, tone })}
+          />
         ) : (
           <AdminFeedback message="还没有赛制规则。" tone="info" />
         )}
@@ -96,7 +100,15 @@ export default function AdminRulesPage() {
   );
 }
 
-function RuleTable({ rules }: { rules: RuleRow[] }) {
+function RuleTable({
+  rules,
+  onChanged,
+  showMessage,
+}: {
+  rules: RuleRow[];
+  onChanged: () => Promise<void>;
+  showMessage: (message: string, tone: 'success' | 'error') => void;
+}) {
   return (
     <div className="overflow-x-auto rounded-lg border border-slate-200">
       <table className="min-w-full text-left text-sm">
@@ -129,15 +141,35 @@ function RuleTable({ rules }: { rules: RuleRow[] }) {
               </td>
               <td className="px-4 py-3">
                 <StatusBadge status={rule.status} />
+                <p className="mt-1 text-xs">
+                  可用 Agent {rule.available_agent_count ?? 0} · 纯 Agent{' '}
+                  {rule.pure_agent_available ? '可用' : '候选不足或未就绪'}
+                </p>
               </td>
               <td className="px-4 py-3 text-right">
-                <Link
-                  className="inline-flex items-center gap-1 font-bold text-blue-700 hover:text-blue-900"
-                  href={`/admin/rules/${rule.id}`}
-                >
-                  打开工作区
-                  <ArrowRight className="size-3.5" />
-                </Link>
+                <div className="flex items-center justify-end gap-3">
+                  <Link
+                    className="inline-flex items-center gap-1 font-bold text-blue-700 hover:text-blue-900"
+                    href={`/admin/rules/${rule.id}`}
+                  >
+                    打开工作区
+                    <ArrowRight className="size-3.5" />
+                  </Link>
+                  <AdminButton
+                    onClick={async () => {
+                      try {
+                        await requestJson(`/api/admin/rules/${rule.id}`, { method: 'DELETE' });
+                        showMessage('规则已归档', 'success');
+                        await onChanged();
+                      } catch (requestError: unknown) {
+                        showMessage(readableAdminError(requestError), 'error');
+                      }
+                    }}
+                    tone="danger"
+                  >
+                    归档
+                  </AdminButton>
+                </div>
               </td>
             </tr>
           ))}

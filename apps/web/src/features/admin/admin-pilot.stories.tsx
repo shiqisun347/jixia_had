@@ -1,6 +1,7 @@
 import type { Meta, StoryObj } from '@storybook/nextjs-vite';
 import { expect, userEvent, within } from 'storybook/test';
 import { delay, http, HttpResponse } from 'msw';
+import { useEffect, useState } from 'react';
 
 import AdminPage from '@/app/admin/page';
 import AdminAgentsPage from '@/app/admin/agents/page';
@@ -53,6 +54,22 @@ const rule = {
   config_revision: 2,
   historical_read_only: false,
 };
+const ruleOptionLabel = `${rule.name} · 已停用 · ${rule.id.slice(0, 8)}`;
+
+/**
+ * Agent stories share a browser context. Clear the remembered rule before
+ * mounting each story so one story's selection cannot race the next story's
+ * MSW handlers.
+ */
+function IsolatedAgentStory() {
+  const [ready, setReady] = useState(false);
+  useEffect(() => {
+    window.localStorage.removeItem('jx-admin-agent-rule-v1');
+    const timer = window.setTimeout(() => setReady(true), 0);
+    return () => window.clearTimeout(timer);
+  }, []);
+  return ready ? <AdminAgentsPage /> : null;
+}
 const ruleAgents = voices.map((voice, index) => ({
   ...agents[index],
   name: voice.name,
@@ -281,7 +298,7 @@ export const OverviewError: Story = {
 };
 
 export const AgentDirectory: Story = {
-  render: () => <AdminAgentsPage />,
+  render: () => <IsolatedAgentStory />,
   parameters: {
     msw: { handlers: adminHandlers() },
     nextjs: { navigation: { pathname: '/admin/agents' } },
@@ -296,19 +313,19 @@ export const AgentDirectory: Story = {
 };
 
 export const AgentFormatWorkspaceEntry: Story = {
-  render: () => <AdminAgentsPage />,
+  render: () => <IsolatedAgentStory />,
   parameters: {
     msw: { handlers: adminHandlers() },
     nextjs: { navigation: { pathname: '/admin/agents' } },
   },
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
-    await expect(await canvas.findByRole('option', { name: '论文实验规则' })).toBeVisible();
+    await expect(await canvas.findByRole('option', { name: ruleOptionLabel })).toBeVisible();
   },
 };
 
 export const AgentDetailDrawer: Story = {
-  render: () => <AdminAgentsPage />,
+  render: () => <IsolatedAgentStory />,
   parameters: {
     msw: { handlers: adminHandlers() },
     nextjs: { navigation: { pathname: '/admin/agents' } },
@@ -316,7 +333,7 @@ export const AgentDetailDrawer: Story = {
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
     const page = within(document.body);
-    await canvas.findByRole('option', { name: '论文实验规则' });
+    await canvas.findByRole('option', { name: ruleOptionLabel });
     await userEvent.selectOptions(await canvas.findByLabelText('赛制规则'), rule.id);
     await canvas.findAllByText('使用赛制默认');
     await userEvent.click(canvas.getAllByRole('button', { name: /编辑/ })[0]);
@@ -328,7 +345,7 @@ export const AgentDetailDrawer: Story = {
 };
 
 export const AgentReadOnlyNotice: Story = {
-  render: () => <AdminAgentsPage />,
+  render: () => <IsolatedAgentStory />,
   parameters: {
     msw: { handlers: adminHandlers() },
     nextjs: { navigation: { pathname: '/admin/agents' } },
@@ -336,7 +353,7 @@ export const AgentReadOnlyNotice: Story = {
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
     const page = within(document.body);
-    await canvas.findByRole('option', { name: '论文实验规则' });
+    await canvas.findByRole('option', { name: ruleOptionLabel });
     await userEvent.selectOptions(await canvas.findByLabelText('赛制规则'), rule.id);
     await canvas.findAllByText('使用赛制默认');
     await userEvent.click(canvas.getAllByRole('button', { name: /编辑/ })[0]);
@@ -347,7 +364,7 @@ export const AgentReadOnlyNotice: Story = {
 };
 
 export const AgentSearch: Story = {
-  render: () => <AdminAgentsPage />,
+  render: () => <IsolatedAgentStory />,
   parameters: {
     msw: { handlers: adminHandlers({ duplicate: true }) },
     nextjs: { navigation: { pathname: '/admin/agents' } },
@@ -355,7 +372,7 @@ export const AgentSearch: Story = {
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
     const page = within(document.body);
-    await canvas.findByRole('option', { name: '论文实验规则' });
+    await canvas.findByRole('option', { name: ruleOptionLabel });
     await userEvent.selectOptions(await canvas.findByLabelText('赛制规则'), rule.id);
     await canvas.findByText('已个性化 1 项');
     await userEvent.click(canvas.getAllByRole('button', { name: /编辑/ })[0]);
@@ -364,7 +381,7 @@ export const AgentSearch: Story = {
 };
 
 export const AgentLoading: Story = {
-  render: () => <AdminAgentsPage />,
+  render: () => <IsolatedAgentStory />,
   parameters: {
     msw: { handlers: adminHandlers({ delayMs: 2_000 }) },
     nextjs: { navigation: { pathname: '/admin/agents' } },
@@ -377,14 +394,14 @@ export const AgentLoading: Story = {
 };
 
 export const AgentEmpty: Story = {
-  render: () => <AdminAgentsPage />,
+  render: () => <IsolatedAgentStory />,
   parameters: {
     msw: { handlers: adminHandlers({ emptyAgents: true }) },
     nextjs: { navigation: { pathname: '/admin/agents' } },
   },
   async play({ canvasElement }) {
     const canvas = within(canvasElement);
-    await canvas.findByRole('option', { name: '论文实验规则' });
+    await canvas.findByRole('option', { name: ruleOptionLabel });
     await userEvent.selectOptions(await canvas.findByLabelText('赛制规则'), rule.id);
     await expect(
       await canvas.findByText('该规则还没有 Agent。请先启用 Agent 音色或检查默认模型。'),

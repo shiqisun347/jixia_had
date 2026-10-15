@@ -10,6 +10,7 @@ export default defineConfig({
   workers: 2,
   use: {
     baseURL: 'http://127.0.0.1:3100',
+    locale: 'zh-CN',
     screenshot: 'only-on-failure',
     trace: 'on-first-retry',
   },

@@ -2,15 +2,17 @@
 
 import {
   ArrowLeft,
-  ArrowRight,
   Bot,
   Check,
   CircleAlert,
   Clock3,
   FileText,
   Flag,
+  LoaderCircle,
+  Maximize2,
   Hand,
   Mic,
+  Minimize2,
   Megaphone,
   Pause,
   Play,
@@ -18,6 +20,7 @@ import {
   RefreshCcw,
   RotateCcw,
   Save,
+  ShieldCheck,
   Sparkles,
   Square,
   UserRound,
@@ -28,17 +31,23 @@ import {
   X,
 } from 'lucide-react';
 import Link from 'next/link';
-import { useRef, useState, type Dispatch, type SetStateAction } from 'react';
+import { useRef, useState, type Dispatch, type ReactNode, type SetStateAction } from 'react';
 import { Dialog, DropdownMenu } from 'radix-ui';
 
 import { Button, buttonVariants } from '@/components/ui/button';
+import { JixiaLogo } from '@/components/brand/jixia-logo';
 import { useAppLocale, useAppTranslations } from '@/i18n';
 import { avatarAssetUrl } from '@/lib/avatar-catalog';
 import type { MatchSnapshot, MatchTranscript } from '@/lib/matches-api';
 import type { RoomSnapshot } from '@/lib/rooms-api';
 
+import {
+  resolveCenterMode,
+  showsFreeDebateBudget,
+  type DebateCenterMode,
+} from './match-presentation';
+
 type CommandType =
-  | 'host.finished'
   | 'speech.start'
   | 'speech.finish'
   | 'speech.reset'
@@ -60,6 +69,7 @@ type RuntimeView = {
   interimText: string;
   resumeReasons: string[];
   commandReady: boolean;
+  commandErrorCode?: string | null;
 };
 type NetworkStats = {
   rttMs: number | null;
@@ -116,11 +126,19 @@ type DebatePageLayoutProps = {
   onToggleHumanOutputMuted: (userId: string) => void;
   onOpenDrawer: () => void;
   onCloseDrawer: () => void;
+  emergencyOpen?: boolean;
+  emergencyControls?: ReactNode;
+  onOpenEmergency?: () => void;
+  onCloseEmergency?: () => void;
+  onStartRuntime?: () => void;
+  runtimeStartPending?: boolean;
   onEditSpeech: (speechId: string, text: string) => void;
   onSaveSpeech: (speechId: string) => void;
   onDraftTextChange: Dispatch<SetStateAction<string>>;
   onOpenNetwork?: () => void;
   onCloseNetwork?: () => void;
+  presentationMode?: boolean;
+  onTogglePresentation?: () => void;
 };
 
 const sideLabel = (side: string, t?: Translator) =>
@@ -155,12 +173,32 @@ export const runtimeErrorLabel = (code: string | null | undefined, t?: Translato
       HUMAN_WAIT_TIMEOUT:
         t?.('errors.humanWait') ?? '60 秒内无人举手，比赛已暂停；恢复后将重新开始完整等待。',
       llm_capacity_full: t?.('errors.llmCapacity') ?? '模型并发已满，比赛已暂停，请稍后申请恢复。',
+      llm_first_token_timeout:
+        t?.('errors.llmFirstTokenTimeout') ??
+        'Agent 10 秒内没有返回首段文字，已重试仍失败，比赛已暂停，请申请恢复。',
+      llm_stream_stalled:
+        t?.('errors.llmStreamStalled') ??
+        'Agent 文本流中断，已重试仍失败，比赛已暂停，请申请恢复。',
+      llm_provider_failed:
+        t?.('errors.llmProviderFailed') ??
+        'Agent 服务暂时没有返回有效结果，已重试仍失败，比赛已暂停，请申请恢复。',
       tts_stream_interrupted:
+        t?.('errors.ttsInterrupted') ?? '语音合成连续失败，比赛已暂停，请申请恢复。',
+      tts_parameter_invalid:
+        t?.('errors.ttsParameterInvalid') ??
+        '语音服务拒绝了当前音色或参数，比赛已暂停，请联系管理员检查音色配置后申请恢复。',
+      tts_task_timeout:
+        t?.('errors.ttsTaskTimeout') ?? '语音合成超过时限，比赛已暂停，请申请恢复。',
+      tts_audio_too_large:
+        t?.('errors.ttsAudioTooLarge') ?? '语音输出超过大小限制，比赛已暂停，请申请恢复。',
+      tts_provider_failed:
         t?.('errors.ttsInterrupted') ?? '语音合成连续失败，比赛已暂停，请申请恢复。',
       asr_stream_interrupted:
         t?.('errors.asrInterrupted') ?? '语音识别连续失败，比赛已暂停，请申请恢复。',
       llm_stream_interrupted:
         t?.('errors.llmInterrupted') ?? 'Agent 文本生成连续失败，比赛已暂停，请申请恢复。',
+      llm_output_too_large:
+        t?.('errors.llmOutputTooLarge') ?? 'Agent 文本输出超过大小限制，比赛已暂停，请申请恢复。',
     }) as Record<string, string>
   )[code ?? ''] ??
   t?.('errors.default') ??
@@ -216,6 +254,8 @@ function currentStageName(
   t?: Translator,
   locale?: string,
 ) {
+  if (snapshot.status === 'FINISHED') return t?.('status.finished') ?? '比赛结束';
+  if (snapshot.status === 'TERMINATED') return t?.('status.terminated') ?? '比赛终止';
   const stagePosition = snapshot.current_action?.stage_position;
   if (!stagePosition) {
     if (snapshot.status === 'FINISHED') return t?.('status.finished') ?? '比赛结束';
@@ -265,7 +305,7 @@ function SpeakerMark({
         : null;
   return (
     <span
-      className={`relative block shrink-0 ${large ? 'size-28 xl:size-32' : 'size-14 xl:size-16'}`}
+      className={`debate-speaker-mark relative block shrink-0 ${large ? 'debate-speaker-mark--large size-28 xl:size-32' : 'size-14 xl:size-16'}`}
     >
       <span
         className={`relative grid size-full place-items-center overflow-hidden border ${
@@ -384,7 +424,7 @@ function SeatCard({
   const tone = sideTone(seat.side);
   return (
     <article
-      className={`group relative flex min-h-0 items-center gap-3 rounded-2xl border px-3 py-2.5 transition ${
+      className={`debate-seat-card group relative flex min-h-0 items-center gap-3 rounded-2xl border px-3 py-2.5 transition ${
         active
           ? 'jx-active-seat-shadow border-[#b7ef00] bg-white ring-2 ring-[#eaff9f]'
           : tone === 'red'
@@ -399,7 +439,7 @@ function SeatCard({
             {seat.occupant_name ?? t('emptySeat')}
           </strong>
           <span
-            className={`rounded-full px-2.5 py-1 text-xs font-black leading-none ${seat.occupant_type === 'AGENT' ? 'bg-blue-100 text-blue-800' : 'bg-red-100 text-red-800'}`}
+            className={`shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-black leading-none ${seat.occupant_type === 'AGENT' ? 'bg-blue-100 text-blue-800' : 'bg-red-100 text-red-800'}`}
           >
             {seat.occupant_type === 'AGENT' ? t('ai') : t('human')}
           </span>
@@ -496,6 +536,7 @@ export function freeDebateProgress(remainingMs: number, totalMs: number | null) 
 function FreeDebateClock({ snapshot }: { snapshot: MatchSnapshot }) {
   const t = useAppTranslations('Debate');
   if (
+    !showsFreeDebateBudget(snapshot) ||
     snapshot.free_affirmative_remaining_ms === null ||
     snapshot.free_affirmative_remaining_ms === undefined
   ) {
@@ -510,8 +551,12 @@ function FreeDebateClock({ snapshot }: { snapshot: MatchSnapshot }) {
       : null;
   const affirmativeProgress = freeDebateProgress(affirmative, total);
   const negativeProgress = freeDebateProgress(negative, total);
-  const affirmativeActive = snapshot.free_holder_side === 'AFFIRMATIVE';
-  const negativeActive = snapshot.free_holder_side === 'NEGATIVE';
+  const mode = resolveCenterMode(snapshot);
+  const holderSide = ['speaking', 'human-ready', 'agent-preparing'].includes(mode)
+    ? snapshot.current_speaker_side
+    : null;
+  const affirmativeActive = holderSide === 'AFFIRMATIVE';
+  const negativeActive = holderSide === 'NEGATIVE';
   return (
     <div
       className="mt-3 w-full max-w-xl rounded-2xl border border-blue-100 bg-white/90 px-3 py-2.5 shadow-[0_8px_24px_rgba(42,83,130,0.08)]"
@@ -524,9 +569,11 @@ function FreeDebateClock({ snapshot }: { snapshot: MatchSnapshot }) {
           {t('affirmative')} {formatRemaining(affirmative)} / {formatRemaining(total)}
         </span>
         <span className="rounded-lg bg-slate-100 px-2 py-1 text-[10px] text-slate-600 sm:text-xs">
-          {snapshot.free_holder_side
-            ? t('holder', { side: sideLabel(snapshot.free_holder_side, t) })
-            : t('freeDebate')}
+          {holderSide
+            ? t('holder', { side: sideLabel(holderSide, t) })
+            : snapshot.free_holder_side
+              ? t('center.applicantSide', { side: sideLabel(snapshot.free_holder_side, t) })
+              : t('freeDebate')}
         </span>
         <span
           className={`rounded-lg px-2 py-1 text-blue-700 ${negativeActive ? 'bg-[#efffc1] ring-1 ring-[#b7ef00]/60' : 'bg-blue-50/60'}`}
@@ -544,8 +591,8 @@ function FreeDebateClock({ snapshot }: { snapshot: MatchSnapshot }) {
           role="progressbar"
         >
           <span
-            className={`block h-full rounded-full transition-[width] duration-200 motion-reduce:transition-none ${affirmativeProgress === null ? 'bg-red-200' : 'bg-red-500'}`}
-            style={{ width: affirmativeProgress === null ? '100%' : `${affirmativeProgress}%` }}
+            className={`block h-full origin-left rounded-full transition-transform duration-200 motion-reduce:transition-none ${affirmativeProgress === null ? 'bg-red-200' : 'bg-red-500'}`}
+            style={{ transform: `scaleX(${(affirmativeProgress ?? 100) / 100})` }}
           />
         </span>
         <span
@@ -557,8 +604,8 @@ function FreeDebateClock({ snapshot }: { snapshot: MatchSnapshot }) {
           role="progressbar"
         >
           <span
-            className={`block h-full rounded-full transition-[width] duration-200 motion-reduce:transition-none ${negativeProgress === null ? 'bg-blue-200' : 'bg-blue-500'}`}
-            style={{ width: negativeProgress === null ? '100%' : `${negativeProgress}%` }}
+            className={`block h-full w-full origin-right rounded-full transition-transform duration-200 motion-reduce:transition-none ${negativeProgress === null ? 'bg-blue-200' : 'bg-blue-500'}`}
+            style={{ transform: `scaleX(${(negativeProgress ?? 100) / 100})` }}
           />
         </span>
       </div>
@@ -636,8 +683,10 @@ function TranscriptFeed({
       ) : null}
       {transcript?.speeches.length ? (
         transcript.speeches.map((speech) => {
-          const canEdit = speech.user_id === currentUserId && speech.status === 'FINALIZED';
-          const editing = editingSpeechId === speech.id;
+          const isPlaceholder = 'origin' in speech && speech.origin === 'ADMIN_PLACEHOLDER';
+          const canEdit =
+            !isPlaceholder && speech.user_id === currentUserId && speech.status === 'FINALIZED';
+          const editing = canEdit && editingSpeechId === speech.id;
           return (
             <article
               className="rounded-2xl border border-slate-100 bg-white/75 p-4"
@@ -652,6 +701,11 @@ function TranscriptFeed({
                 <span className={speech.side === 'AFFIRMATIVE' ? 'text-red-600' : 'text-blue-600'}>
                   {sideLabel(speech.side, t)} {speech.seat_no}
                 </span>
+                {isPlaceholder ? (
+                  <span className="rounded-full bg-amber-50 px-2 py-1 text-amber-800">
+                    {t('detail.adminPlaceholder')}
+                  </span>
+                ) : null}
               </div>
               {editing ? (
                 <textarea
@@ -728,6 +782,251 @@ function TranscriptFeed({
   );
 }
 
+function CenterStatusCard({
+  icon,
+  title,
+  children,
+  testId,
+}: Readonly<{ icon: ReactNode; title: string; children?: ReactNode; testId?: string }>) {
+  return (
+    <div
+      className="debate-center-card mt-4 flex w-full max-w-md flex-col items-center rounded-3xl border border-blue-100 bg-white/80 px-5 py-5"
+      data-testid={testId}
+    >
+      <span className="debate-center-icon grid size-14 shrink-0 place-items-center rounded-full bg-blue-50 text-blue-700">
+        {icon}
+      </span>
+      <strong className="mt-3 text-lg font-black text-slate-950">{title}</strong>
+      {children}
+    </div>
+  );
+}
+
+function CenterTimer({
+  milliseconds,
+  label,
+}: Readonly<{
+  milliseconds: number | null | undefined;
+  label: string;
+}>) {
+  const t = useAppTranslations('Debate');
+  return (
+    <div className="mt-2" data-testid="center-timer">
+      <p className="text-xs font-bold text-slate-500">{label}</p>
+      <p className="debate-center-time mt-1 font-mono text-4xl font-black tracking-tight text-slate-950">
+        {milliseconds == null ? t('center.syncingTime') : formatRemaining(milliseconds)}
+      </p>
+    </div>
+  );
+}
+
+function CenterContent({
+  mode,
+  room,
+  snapshot,
+  currentSeat,
+  matchId,
+  isOrganizer,
+  onStartRuntime,
+  runtimeStartPending,
+  handoffPending,
+}: Readonly<{
+  mode: DebateCenterMode;
+  room: RoomSnapshot;
+  snapshot: MatchSnapshot;
+  currentSeat: Seat | undefined;
+  matchId: string;
+  isOrganizer: boolean;
+  onStartRuntime?: () => void;
+  runtimeStartPending: boolean;
+  handoffPending: boolean;
+}>) {
+  const t = useAppTranslations('Debate');
+  const hint = (text: string) => <p className="mt-2 text-sm leading-6 text-slate-600">{text}</p>;
+  if (mode === 'finished' || mode === 'terminated') {
+    return (
+      <CenterStatusCard
+        icon={mode === 'finished' ? <Check className="size-7" /> : <Square className="size-6" />}
+        title={t(mode === 'finished' ? 'center.thanks' : 'center.recordRetained')}
+        testId="terminal-stage"
+      >
+        {hint(t(mode === 'finished' ? 'center.finishedHint' : 'center.terminatedHint'))}
+        <Link
+          className={`${buttonVariants({ variant: 'primary', size: 'sm' })} mt-4`}
+          href={`/matches/${matchId}`}
+        >
+          <FileText className="size-4" />
+          {t(mode === 'finished' ? 'postmatch' : 'terminatedRecord')}
+        </Link>
+      </CenterStatusCard>
+    );
+  }
+  if (mode === 'frozen') {
+    return (
+      <CenterStatusCard
+        icon={<Pause className="size-7" />}
+        title={t('detail.runtimeFrozen')}
+        testId="runtime-frozen-state"
+      >
+        {hint(t('detail.runtimeFrozenHint'))}
+      </CenterStatusCard>
+    );
+  }
+  if (mode === 'waiting') {
+    return (
+      <CenterStatusCard
+        icon={<Clock3 className="size-7" />}
+        title={t('center.waitingTitle')}
+        testId="match-waiting-stage"
+      >
+        {hint(t('center.waitingHint'))}
+        {isOrganizer ? (
+          <Button
+            className="mt-4"
+            disabled={runtimeStartPending}
+            onClick={onStartRuntime}
+            size="sm"
+            variant="primary"
+          >
+            {runtimeStartPending ? (
+              <LoaderCircle className="size-4 motion-safe:animate-spin" />
+            ) : (
+              <Play className="size-4" />
+            )}
+            {t('center.startMatch')}
+          </Button>
+        ) : null}
+      </CenterStatusCard>
+    );
+  }
+  if (mode === 'countdown')
+    return <CountdownTrack milliseconds={snapshot.countdown_remaining_ms} />;
+  if (mode === 'host') {
+    const identity = room.rule.host_identity;
+    const name =
+      identity &&
+      typeof identity === 'object' &&
+      'name' in identity &&
+      typeof identity.name === 'string'
+        ? identity.name
+        : t('center.hostName');
+    return (
+      <CenterStatusCard
+        icon={<Megaphone className="size-7" />}
+        title={t('detail.hostAnnouncing')}
+        testId="host-announcement-state"
+      >
+        <p className="mt-1 font-bold text-blue-800">{name}</p>
+        {hint(t('detail.hostHint'))}
+        <Waveform />
+      </CenterStatusCard>
+    );
+  }
+  if (mode === 'agent-preparing') {
+    return (
+      <CenterStatusCard
+        icon={<Bot className="size-7" />}
+        title={currentSeat?.occupant_name ?? t('center.agentPreparing')}
+        testId="agent-preparing-stage"
+      >
+        {hint(t('center.agentPreparingHint'))}
+      </CenterStatusCard>
+    );
+  }
+  if (mode === 'finalizing') {
+    return (
+      <CenterStatusCard
+        icon={<FileText className="size-7" />}
+        title={t('center.finalizingTitle')}
+        testId="speech-finalizing-stage"
+      >
+        {hint(t('center.finalizingHint'))}
+      </CenterStatusCard>
+    );
+  }
+  if (mode === 'selection') {
+    return (
+      <CenterStatusCard
+        icon={<Hand className="size-7" />}
+        title={
+          snapshot.free_holder_side
+            ? t('center.selectionSide', { side: sideLabel(snapshot.free_holder_side, t) })
+            : t('freeDebate')
+        }
+        testId="free-selection-stage"
+      >
+        {hint(t('center.selectionHint'))}
+      </CenterStatusCard>
+    );
+  }
+  if (mode === 'preparation') {
+    return (
+      <CenterStatusCard
+        icon={<Clock3 className="size-7" />}
+        title={t('center.preparingTitle')}
+        testId="preparation-stage"
+      >
+        <CenterTimer
+          milliseconds={snapshot.speech_remaining_ms}
+          label={t('center.preparationRemaining')}
+        />
+      </CenterStatusCard>
+    );
+  }
+  if (mode === 'human-ready' || mode === 'speaking') {
+    return (
+      <div
+        className="debate-center-speaker mt-4 flex w-full min-w-0 max-w-full flex-col items-center"
+        data-testid="current-speaker-state"
+      >
+        <SpeakerMark
+          large
+          active={mode === 'speaking'}
+          seat={currentSeat}
+          online={
+            currentSeat?.user_id
+              ? room.members.find((member) => member.user_id === currentSeat.user_id)?.online
+              : undefined
+          }
+        />
+        <h3 className="mt-3 max-w-full truncate text-lg font-black text-slate-950">
+          {currentSeat?.occupant_name ?? t('center.confirmingSpeaker')}
+        </h3>
+        {currentSeat ? (
+          <p
+            className={`mt-1 text-sm font-bold ${currentSeat.side === 'AFFIRMATIVE' ? 'text-red-600' : 'text-blue-700'}`}
+          >
+            {sideLabel(currentSeat.side, t)} · {currentSeat.seat_no}
+          </p>
+        ) : null}
+        {mode === 'speaking' ? (
+          <>
+            <Waveform />
+            <CenterTimer
+              milliseconds={snapshot.speech_remaining_ms}
+              label={t('detail.speechTimer')}
+            />
+          </>
+        ) : (
+          <p
+            className="mt-2 text-sm leading-6 text-slate-600"
+            data-testid={handoffPending ? 'handoff-pending-state' : undefined}
+          >
+            {t(handoffPending ? 'center.handoffHint' : 'center.readyHint')}
+          </p>
+        )}
+      </div>
+    );
+  }
+  return (
+    <CenterStatusCard
+      icon={<Clock3 className="size-7" />}
+      title={t('waitingStage')}
+      testId="idle-stage"
+    />
+  );
+}
+
 export function DebatePageLayout({
   matchId,
   room,
@@ -743,7 +1042,7 @@ export function DebatePageLayout({
   isOrganizer,
   isDebater,
   myHandIndex,
-  canRaiseHand,
+  canRaiseHand: handRequestAllowed,
   audioStatus,
   playbackStatus,
   audioError,
@@ -768,6 +1067,12 @@ export function DebatePageLayout({
   onToggleHumanOutputMuted,
   onOpenDrawer,
   onCloseDrawer,
+  emergencyOpen = false,
+  emergencyControls,
+  onOpenEmergency,
+  onCloseEmergency,
+  onStartRuntime,
+  runtimeStartPending = false,
   onEditSpeech,
   onSaveSpeech,
   onDraftTextChange,
@@ -776,6 +1081,8 @@ export function DebatePageLayout({
   networkStats,
   onOpenNetwork,
   onCloseNetwork,
+  presentationMode = false,
+  onTogglePresentation,
 }: DebatePageLayoutProps) {
   const t = useAppTranslations('Debate');
   const { locale } = useAppLocale();
@@ -788,11 +1095,12 @@ export function DebatePageLayout({
     sampledAt: null,
   };
   const isTerminal = ['FINISHED', 'TERMINATED'].includes(snapshot.status);
+  const centerMode = resolveCenterMode(snapshot);
+  const canRaiseHand = Boolean(handRequestAllowed && showsFreeDebateBudget(snapshot));
   const canShowControls = !isTerminal;
-  const currentTone = sideTone(currentSeat?.side ?? snapshot.free_holder_side ?? 'AFFIRMATIVE');
-  const isHostAnnouncing = snapshot.action_state === 'HOST_ANNOUNCING';
-  const isCountdown =
-    snapshot.status === 'START_COUNTDOWN' || snapshot.action_state === 'RESUME_COUNTDOWN';
+  const isHostAnnouncing = centerMode === 'host';
+  const isWaitingForHost = centerMode === 'waiting';
+  const isCountdown = centerMode === 'countdown';
   const transcriptProps = {
     room,
     transcript,
@@ -811,8 +1119,9 @@ export function DebatePageLayout({
     onRetryTranscript,
   } as const;
   const showRuntimeFault = shouldShowRuntimeFault(snapshot.status, snapshot.error_code);
-  const isRuntimeFrozen = ['PAUSED', 'SYSTEM_RECOVERY', 'ERROR'].includes(snapshot.status);
-  const connectionNotice = !showRuntimeFault ? runtime.socketError || audioError : null;
+  const handoffPending = runtime.commandErrorCode === 'asr_finalization_pending';
+  const connectionNotice =
+    !isTerminal && !showRuntimeFault && !handoffPending ? runtime.socketError || audioError : null;
   const remoteHumanSeats = room.seats.filter(
     (seat) => seat.occupant_type === 'HUMAN' && seat.user_id && seat.user_id !== currentUserId,
   );
@@ -832,12 +1141,23 @@ export function DebatePageLayout({
     : null;
 
   return (
-    <main className="debate-page h-[calc(100dvh-3.85rem-1px)] min-h-[640px] overflow-hidden px-3 py-2 text-slate-950 sm:px-4">
-      <div className="mx-auto flex h-full max-w-[1660px] flex-col">
-        <div className="grid min-h-0 min-w-0 flex-1 gap-2 min-[1580px]:grid-cols-[minmax(0,1fr)_22rem]">
+    <main
+      className={`debate-page ${presentationMode ? 'debate-page--presentation fixed inset-0 z-40 h-dvh min-h-0 px-4 py-3' : 'h-[calc(100dvh-3.85rem-1px)] min-h-0 px-3 py-2'} overflow-hidden text-slate-950 sm:px-4`}
+      data-presentation-mode={presentationMode ? 'true' : 'false'}
+    >
+      <div
+        className={`mx-auto flex h-full w-full flex-col ${presentationMode ? '' : 'max-w-[1660px]'}`}
+      >
+        <div
+          className={`grid min-h-0 min-w-0 flex-1 gap-2 ${presentationMode ? 'grid-cols-1' : 'min-[1580px]:grid-cols-[minmax(0,1fr)_22rem]'}`}
+          data-testid="debate-content-grid"
+        >
           <section className="flex min-h-0 min-w-0 flex-col">
-            <div className="debate-topic grid shrink-0 gap-2 rounded-[1.1rem] border border-blue-100 bg-white/85 px-3 py-2 shadow-[0_10px_30px_rgba(44,85,132,0.06)] sm:grid-cols-[9rem_minmax(0,1fr)_auto] sm:items-center sm:px-4">
+            <div
+              className={`debate-topic grid shrink-0 gap-2 rounded-[1.1rem] border border-blue-100 bg-white/85 px-3 py-2 shadow-[0_10px_30px_rgba(44,85,132,0.06)] sm:grid-cols-[9rem_minmax(0,1fr)_auto] sm:items-center sm:px-4 ${presentationMode ? 'bg-white/95' : ''}`}
+            >
               <div className="rounded-lg border border-blue-100 bg-[#f7fbff] px-2.5 py-1.5">
+                {presentationMode ? <JixiaLogo compact /> : null}
                 <p className="text-[10px] font-black tracking-[0.14em] text-slate-600">
                   {t('roomCode')}
                 </p>
@@ -870,6 +1190,23 @@ export function DebatePageLayout({
                 >
                   <FileText className="size-4" /> {t('transcript')}
                 </Button>
+                {onTogglePresentation ? (
+                  <Button
+                    aria-label={t('presentationAria')}
+                    onClick={onTogglePresentation}
+                    size="sm"
+                    variant={presentationMode ? 'primary' : 'secondary'}
+                  >
+                    {presentationMode ? (
+                      <Minimize2 className="size-4" />
+                    ) : (
+                      <Maximize2 className="size-4" />
+                    )}
+                    <span className="hidden sm:inline">
+                      {presentationMode ? t('exitPresentation') : t('presentation')}
+                    </span>
+                  </Button>
+                ) : null}
               </div>
             </div>
 
@@ -925,8 +1262,10 @@ export function DebatePageLayout({
                         const agentDecision = (snapshot.agent_decisions ?? []).find(
                           (decision) => decision.agent_profile_id === seat.agent_profile_id,
                         );
-                        const selectedAgent =
-                          seat.agent_profile_id === snapshot.current_agent_profile_id;
+                        const selectedAgent = Boolean(
+                          seat.agent_profile_id &&
+                          seat.agent_profile_id === snapshot.current_agent_profile_id,
+                        );
                         const experimentAgentStatus = experimentAgentSeatStatus(
                           snapshot,
                           seat,
@@ -936,29 +1275,39 @@ export function DebatePageLayout({
                           <SeatCard
                             key={seat.id}
                             seat={seat}
-                            active={!isRuntimeFrozen && seat.id === currentSeat?.id}
-                            handOrder={humanQueueEntry?.rank ?? agentDecision?.queue_rank ?? 0}
+                            active={
+                              ['human-ready', 'speaking', 'agent-preparing'].includes(centerMode) &&
+                              seat.id === currentSeat?.id
+                            }
+                            handOrder={
+                              isTerminal
+                                ? 0
+                                : (humanQueueEntry?.rank ?? agentDecision?.queue_rank ?? 0)
+                            }
                             humanSelected={
+                              !isTerminal &&
                               Boolean(humanQueueEntry) &&
                               snapshot.action_state === 'HUMAN_READY_TO_START' &&
                               snapshot.current_speaker_user_id === seat.user_id
                             }
                             agentHandOrder={0}
                             agentStatus={
-                              experimentAgentStatus
-                                ? experimentAgentStatus
-                                : selectedAgent && snapshot.agent_selection_mode === 'VOLUNTEER'
-                                  ? 'SELECTED'
-                                  : selectedAgent && snapshot.agent_selection_mode === 'FALLBACK'
-                                    ? 'FALLBACK'
-                                    : selectedAgent &&
-                                        snapshot.agent_selection_mode === 'ALL_AGENT_SKIP_RANDOM'
+                              isTerminal
+                                ? null
+                                : experimentAgentStatus
+                                  ? experimentAgentStatus
+                                  : selectedAgent && snapshot.agent_selection_mode === 'VOLUNTEER'
+                                    ? 'SELECTED'
+                                    : selectedAgent && snapshot.agent_selection_mode === 'FALLBACK'
                                       ? 'FALLBACK'
-                                      : agentDecision?.status === 'DECIDING'
-                                        ? 'DECIDING'
-                                        : agentDecision?.status === 'SKIP'
-                                          ? 'SKIP'
-                                          : null
+                                      : selectedAgent &&
+                                          snapshot.agent_selection_mode === 'ALL_AGENT_SKIP_RANDOM'
+                                        ? 'FALLBACK'
+                                        : agentDecision?.status === 'DECIDING'
+                                          ? 'DECIDING'
+                                          : agentDecision?.status === 'SKIP'
+                                            ? 'SKIP'
+                                            : null
                             }
                             online={
                               seat.user_id
@@ -974,7 +1323,7 @@ export function DebatePageLayout({
               ))}
 
               <section
-                className="relative col-start-2 row-start-1 min-h-0 min-w-0 px-3 py-3 sm:px-5"
+                className="debate-center-stage relative col-start-2 row-start-1 min-h-0 min-w-0 px-3 py-3 sm:px-5"
                 data-testid="debate-center-stage"
               >
                 <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_42%,rgba(183,239,0,0.12),transparent_30%),radial-gradient(circle_at_50%_60%,rgba(39,116,255,0.1),transparent_52%)]" />
@@ -990,95 +1339,30 @@ export function DebatePageLayout({
                   >
                     {t('detail.stage')} · {currentStageName(room, snapshot, t, locale)}
                   </p>
-                  <h2 className="mt-1 max-w-xl text-4xl font-black tracking-[-0.06em] text-[#587300] xl:text-5xl">
-                    {presentation.title}
+                  <h2 className="debate-stage-title mt-1 max-w-xl text-4xl font-black tracking-[-0.06em] text-[#587300] xl:text-5xl">
+                    {centerMode === 'frozen'
+                      ? t('center.pausedTitle')
+                      : handoffPending && centerMode === 'human-ready'
+                        ? t('center.handoffTitle')
+                        : presentation.title}
                   </h2>
-                  <p className="mt-1 text-xs font-black text-slate-500">{presentation.eyebrow}</p>
-                  {isCountdown ? (
-                    <CountdownTrack milliseconds={snapshot.countdown_remaining_ms} />
-                  ) : null}
-                  {isHostAnnouncing ? (
-                    <div
-                      className="mt-6 flex flex-col items-center justify-center rounded-[1.5rem] border border-[#b7ef00]/50 bg-white/75 px-8 py-7 shadow-[0_16px_45px_rgba(145,170,55,0.12)]"
-                      data-testid="host-announcement-state"
-                    >
-                      <span className="grid size-16 place-items-center rounded-full bg-[#efffc1] text-[#6c9100] shadow-[0_0_30px_rgba(183,239,0,0.32)]">
-                        <Megaphone className="size-8" />
-                      </span>
-                      <strong className="mt-3 text-xl font-black text-slate-950">
-                        {t('detail.hostAnnouncing')}
-                      </strong>
-                      <span className="mt-1 text-xs font-bold text-slate-500">
-                        {t('detail.hostHint')}
-                      </span>
-                      <Waveform />
-                    </div>
-                  ) : isCountdown ? null : isRuntimeFrozen ? (
-                    <div
-                      className="mt-6 flex max-w-md flex-col items-center justify-center rounded-[1.5rem] border border-amber-200 bg-amber-50/80 px-8 py-6 shadow-[0_16px_45px_rgba(146,100,25,0.1)]"
-                      data-testid="runtime-frozen-state"
-                    >
-                      <span className="grid size-16 place-items-center rounded-full border border-amber-200 bg-white text-amber-700 shadow-[0_10px_30px_rgba(146,100,25,0.12)]">
-                        <Pause className="size-8" />
-                      </span>
-                      <strong className="mt-3 text-xl font-black text-slate-950">
-                        {t('detail.runtimeFrozen')}
-                      </strong>
-                      <span className="mt-1 text-xs font-bold text-slate-600">
-                        {t('detail.runtimeFrozenHint')}
-                      </span>
-                    </div>
-                  ) : (
-                    <>
-                      <div className="relative mt-3">
-                        <div
-                          className={`absolute inset-[-14px] rounded-full border border-[#b7ef00]/70 ${['HUMAN_SPEAKING', 'AGENT_SPEAKING'].includes(snapshot.action_state) ? 'motion-safe:animate-[jx-pulse_2s_ease-in-out_infinite]' : ''}`}
-                        />
-                        <SpeakerMark
-                          large
-                          active
-                          seat={currentSeat}
-                          online={
-                            currentSeat?.user_id
-                              ? room.members.find(
-                                  (member) => member.user_id === currentSeat.user_id,
-                                )?.online
-                              : undefined
-                          }
-                        />
-                      </div>
-                      <h3 className="mt-3 text-lg font-black text-slate-950">
-                        {currentSeat?.occupant_name ?? t('detail.noSpeaker')}
-                      </h3>
-                      <p
-                        className={`mt-1 text-sm font-bold ${currentTone === 'red' ? 'text-red-600' : 'text-blue-600'}`}
-                      >
-                        {currentSeat
-                          ? `${sideLabel(currentSeat.side, t)} · ${currentSeat.seat_no}`
-                          : presentation.detail}
-                      </p>
-                      <div className="mt-1 w-full max-w-xl">
-                        <Waveform />
-                      </div>
-                      <p className="mt-1 text-[10px] font-bold text-slate-500">
-                        {['HUMAN_SPEAKING', 'AGENT_SPEAKING'].includes(snapshot.action_state)
-                          ? t('detail.remainingTime')
-                          : t('detail.allowedDuration')}
-                      </p>
-                      <div className="mt-1 flex items-center gap-2">
-                        <span className="font-mono text-3xl font-black tracking-[-0.08em] text-slate-950 xl:text-4xl">
-                          {formatRemaining(snapshot.speech_remaining_ms)}
-                        </span>
-                        <span className="inline-flex items-center gap-1 rounded-full border border-blue-100 bg-white px-2.5 py-1 text-xs font-black text-slate-500">
-                          <Clock3 className="size-3.5" /> {t('detail.speechTimer')}
-                        </span>
-                      </div>
-                    </>
-                  )}
-                  <p className="mt-1 hidden max-w-xl text-[11px] leading-4 text-slate-500 min-[1580px]:block">
-                    {presentation.detail}
+                  <p className="mt-1 text-xs font-black text-slate-500">
+                    {centerMode === 'frozen'
+                      ? matchStatusLabel(snapshot.status, snapshot.action_state, t)
+                      : presentation.eyebrow}
                   </p>
-                  {!isRuntimeFrozen ? <FreeDebateClock snapshot={snapshot} /> : null}
+                  <CenterContent
+                    mode={centerMode}
+                    room={room}
+                    snapshot={snapshot}
+                    currentSeat={currentSeat}
+                    matchId={matchId}
+                    isOrganizer={isOrganizer}
+                    onStartRuntime={onStartRuntime}
+                    runtimeStartPending={runtimeStartPending}
+                    handoffPending={handoffPending}
+                  />
+                  <FreeDebateClock snapshot={snapshot} />
                   {runtimeFaultMessage || connectionNotice ? (
                     <div
                       className={`mt-2 flex max-w-xl items-start gap-2 rounded-xl border px-3 py-2 text-left text-xs ${runtimeFaultMessage ? 'border-red-200 bg-red-50 text-red-700' : 'border-blue-200 bg-blue-50 text-blue-800'}`}
@@ -1095,266 +1379,275 @@ export function DebatePageLayout({
               </section>
             </div>
 
-            <footer className="debate-controls mt-2 grid shrink-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-[1.05rem] border border-blue-100 bg-[#f8fbff] p-2 shadow-[0_10px_30px_rgba(42,83,130,0.07)]">
-              <div
-                className="flex items-center gap-2 rounded-xl border border-blue-100 bg-white px-1.5 py-1"
-                data-testid="match-controls-audio"
-              >
-                <Button
-                  aria-label={outputMuted ? t('restoreSoundAria') : t('muteLocalAria')}
-                  aria-pressed={outputMuted}
-                  onClick={onToggleOutputMuted}
-                  size="sm"
-                  variant={outputMuted ? 'secondary' : 'ghost'}
+            {!presentationMode ? (
+              <footer className="debate-controls mt-2 grid shrink-0 grid-cols-[auto_minmax(0,1fr)_auto] items-center gap-2 rounded-[1.05rem] border border-blue-100 bg-[#f8fbff] p-2 shadow-[0_10px_30px_rgba(42,83,130,0.07)]">
+                <div
+                  className="flex items-center gap-2 rounded-xl border border-blue-100 bg-white px-1.5 py-1"
+                  data-testid="match-controls-audio"
                 >
-                  {outputMuted ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
-                  {outputMuted ? t('restoreSound') : t('muteLocal')}
-                </Button>
-                <DropdownMenu.Root modal={false}>
-                  <DropdownMenu.Trigger asChild>
+                  <Button
+                    aria-label={outputMuted ? t('restoreSoundAria') : t('muteLocalAria')}
+                    aria-pressed={outputMuted}
+                    onClick={onToggleOutputMuted}
+                    size="sm"
+                    variant={outputMuted ? 'secondary' : 'ghost'}
+                  >
+                    {outputMuted ? <VolumeX className="size-4" /> : <Volume2 className="size-4" />}
+                    {outputMuted ? t('restoreSound') : t('muteLocal')}
+                  </Button>
+                  {isOrganizer && canShowControls ? (
                     <Button
-                      aria-label={
-                        mutedRemoteHumanCount > 0
-                          ? t('detail.mutedHumans', { count: mutedRemoteHumanCount })
-                          : t('humanAudioSettings')
-                      }
+                      aria-label="打开应急控制台"
+                      onClick={() => onOpenEmergency?.()}
                       size="sm"
-                      variant={mutedRemoteHumanCount > 0 ? 'secondary' : 'ghost'}
+                      variant="secondary"
                     >
-                      {allRemoteHumansMuted ? (
-                        <VolumeX className="size-4" />
-                      ) : (
-                        <UsersRound className="size-4" />
-                      )}
-                      <span className="hidden sm:inline">{t('humanAudio')}</span>
-                      {mutedRemoteHumanCount > 0 ? (
-                        <span className="rounded-full bg-slate-900 px-1.5 py-0.5 text-[10px] font-black text-white">
-                          {mutedRemoteHumanCount}
-                        </span>
-                      ) : null}
+                      <ShieldCheck className="size-4" />
+                      <span className="hidden sm:inline">应急控制台</span>
                     </Button>
-                  </DropdownMenu.Trigger>
-                  <DropdownMenu.Portal>
-                    <DropdownMenu.Content
-                      align="start"
-                      className="z-50 w-[min(20rem,calc(100vw-1.5rem))] rounded-lg border border-blue-100 bg-white p-1.5 shadow-xl"
-                      collisionPadding={12}
-                      sideOffset={8}
-                    >
-                      <div className="px-2.5 pb-2 pt-1.5">
-                        <p className="text-sm font-black text-slate-950">{t('humanAudio')}</p>
-                        <p className="mt-0.5 text-xs leading-5 text-slate-500">
-                          {t('detail.humanAudioHint')}
-                        </p>
-                      </div>
-                      {remoteHumanSeats.length > 0 ? (
-                        <>
-                          <DropdownMenu.CheckboxItem
-                            checked={
-                              allRemoteHumansMuted
-                                ? true
-                                : someRemoteHumansMuted
-                                  ? 'indeterminate'
-                                  : false
-                            }
-                            className="relative flex cursor-pointer select-none items-center rounded-md px-9 py-2 text-sm font-bold text-slate-800 outline-none data-[highlighted]:bg-blue-50"
-                            onCheckedChange={onToggleAllHumanOutputMuted}
-                            onSelect={(event) => event.preventDefault()}
-                          >
-                            <DropdownMenu.ItemIndicator className="absolute left-3 grid size-4 place-items-center text-blue-700">
-                              {someRemoteHumansMuted ? (
-                                <span className="h-0.5 w-3 rounded-full bg-current" />
-                              ) : (
-                                <Check className="size-4" />
-                              )}
-                            </DropdownMenu.ItemIndicator>
-                            {t('muteAllHumans')}
-                          </DropdownMenu.CheckboxItem>
-                          <DropdownMenu.Separator className="my-1 h-px bg-slate-100" />
-                          {remoteHumanSeats.map((seat) => (
+                  ) : null}
+                  <DropdownMenu.Root modal={false}>
+                    <DropdownMenu.Trigger asChild>
+                      <Button
+                        aria-label={
+                          mutedRemoteHumanCount > 0
+                            ? t('detail.mutedHumans', { count: mutedRemoteHumanCount })
+                            : t('humanAudioSettings')
+                        }
+                        size="sm"
+                        variant={mutedRemoteHumanCount > 0 ? 'secondary' : 'ghost'}
+                      >
+                        {allRemoteHumansMuted ? (
+                          <VolumeX className="size-4" />
+                        ) : (
+                          <UsersRound className="size-4" />
+                        )}
+                        <span className="hidden sm:inline">{t('humanAudio')}</span>
+                        {mutedRemoteHumanCount > 0 ? (
+                          <span className="rounded-full bg-slate-900 px-1.5 py-0.5 text-[10px] font-black text-white">
+                            {mutedRemoteHumanCount}
+                          </span>
+                        ) : null}
+                      </Button>
+                    </DropdownMenu.Trigger>
+                    <DropdownMenu.Portal>
+                      <DropdownMenu.Content
+                        align="start"
+                        className="z-50 w-[min(20rem,calc(100vw-1.5rem))] rounded-lg border border-blue-100 bg-white p-1.5 shadow-xl"
+                        collisionPadding={12}
+                        sideOffset={8}
+                      >
+                        <div className="px-2.5 pb-2 pt-1.5">
+                          <p className="text-sm font-black text-slate-950">{t('humanAudio')}</p>
+                          <p className="mt-0.5 text-xs leading-5 text-slate-500">
+                            {t('detail.humanAudioHint')}
+                          </p>
+                        </div>
+                        {remoteHumanSeats.length > 0 ? (
+                          <>
                             <DropdownMenu.CheckboxItem
-                              checked={Boolean(
-                                seat.user_id && mutedHumanUserIdSet.has(seat.user_id),
-                              )}
-                              className="relative flex cursor-pointer select-none items-center justify-between gap-3 rounded-md py-2 pl-9 pr-3 text-sm outline-none data-[highlighted]:bg-blue-50"
-                              key={seat.user_id}
-                              onCheckedChange={() =>
-                                seat.user_id && onToggleHumanOutputMuted(seat.user_id)
+                              checked={
+                                allRemoteHumansMuted
+                                  ? true
+                                  : someRemoteHumansMuted
+                                    ? 'indeterminate'
+                                    : false
                               }
+                              className="relative flex cursor-pointer select-none items-center rounded-md px-9 py-2 text-sm font-bold text-slate-800 outline-none data-[highlighted]:bg-blue-50"
+                              onCheckedChange={onToggleAllHumanOutputMuted}
                               onSelect={(event) => event.preventDefault()}
                             >
                               <DropdownMenu.ItemIndicator className="absolute left-3 grid size-4 place-items-center text-blue-700">
-                                <Check className="size-4" />
+                                {someRemoteHumansMuted ? (
+                                  <span className="h-0.5 w-3 rounded-full bg-current" />
+                                ) : (
+                                  <Check className="size-4" />
+                                )}
                               </DropdownMenu.ItemIndicator>
-                              <span className="min-w-0 truncate font-bold text-slate-900">
-                                {seat.occupant_name ?? t('detail.humanDebater')}
-                              </span>
-                              <span
-                                className={`shrink-0 text-xs font-bold ${seat.side === 'AFFIRMATIVE' ? 'text-red-600' : 'text-blue-700'}`}
-                              >
-                                {sideLabel(seat.side, t)} {seat.seat_no}
-                              </span>
+                              {t('muteAllHumans')}
                             </DropdownMenu.CheckboxItem>
-                          ))}
-                        </>
-                      ) : (
-                        <p className="rounded-md bg-slate-50 px-3 py-2 text-sm text-slate-500">
-                          {t('noOtherHumans')}
-                        </p>
-                      )}
-                    </DropdownMenu.Content>
-                  </DropdownMenu.Portal>
-                </DropdownMenu.Root>
-                {playbackStatus === 'blocked' ? (
-                  <Button onClick={onEnableAudio} size="sm" variant="primary">
-                    <Radio className="size-4" /> {t('enableMatchAudio')}
-                  </Button>
-                ) : null}
-              </div>
-              <div
-                className="flex min-w-0 flex-wrap items-center justify-center gap-1 rounded-xl border border-[#dce9f5] bg-white px-2 py-1"
-                data-testid="match-controls-speech"
-              >
-                {canShowControls &&
-                snapshot.action_state === 'HUMAN_READY_TO_START' &&
-                isCurrentSpeaker ? (
-                  <Button
-                    disabled={commandPending || audioStatus !== 'ready' || !runtime.commandReady}
-                    onClick={onStartSpeech}
-                    size="sm"
-                    variant="primary"
-                  >
-                    <Mic className="size-4" /> {t('startSpeech')}
-                  </Button>
-                ) : null}
-                {canShowControls &&
-                snapshot.action_state === 'HUMAN_SPEAKING' &&
-                isCurrentSpeaker ? (
-                  <Button
-                    className="gap-1 px-2"
-                    disabled={commandPending}
-                    onClick={onFinishSpeech}
-                    size="sm"
-                    variant="danger"
-                  >
-                    <Square className="size-4 fill-current" /> {t('finishSpeech')}
-                  </Button>
-                ) : null}
-                {canRaiseHand ? (
-                  <Button
-                    disabled={commandPending}
-                    onClick={() => onCommand(myHandIndex >= 0 ? 'hand.cancel' : 'hand.raise')}
-                    size="sm"
-                    variant={myHandIndex >= 0 ? 'secondary' : 'primary'}
-                  >
-                    <Hand className="size-4" />{' '}
-                    {myHandIndex >= 0
-                      ? t('cancelHand', { position: myHandIndex + 1 })
-                      : t('raiseHand')}
-                  </Button>
-                ) : null}
-                {canShowControls &&
-                (((isCurrentSpeaker || isOrganizer) &&
-                  ['HUMAN_SPEAKING', 'SPEECH_FINALIZING'].includes(snapshot.action_state)) ||
-                  (isOrganizer &&
-                    ['AGENT_PREPARING', 'AGENT_SPEAKING', 'AGENT_FINALIZING'].includes(
-                      snapshot.action_state,
-                    ))) ? (
-                  <Button
-                    className="gap-1 px-2"
-                    disabled={commandPending}
-                    onClick={onResetSpeech}
-                    size="sm"
-                    variant="secondary"
-                  >
-                    <RotateCcw className="size-4" /> {t('resetSpeech')}
-                  </Button>
-                ) : null}
-                {isTerminal ? (
-                  <Link
-                    className={buttonVariants({ variant: 'primary', size: 'sm' })}
-                    href={`/matches/${matchId}`}
-                  >
-                    <ArrowRight className="size-4" />{' '}
-                    {snapshot.status === 'TERMINATED' ? t('terminatedRecord') : t('postmatch')}
-                  </Link>
-                ) : null}
-                {!isTerminal &&
-                !(
-                  (canShowControls &&
-                    snapshot.action_state === 'HUMAN_READY_TO_START' &&
-                    isCurrentSpeaker) ||
-                  (canShowControls &&
-                    snapshot.action_state === 'HUMAN_SPEAKING' &&
-                    isCurrentSpeaker) ||
-                  canRaiseHand ||
-                  (canShowControls &&
-                    (((isCurrentSpeaker || isOrganizer) &&
-                      ['HUMAN_SPEAKING', 'SPEECH_FINALIZING'].includes(snapshot.action_state)) ||
-                      (isOrganizer &&
-                        ['AGENT_PREPARING', 'AGENT_SPEAKING', 'AGENT_FINALIZING'].includes(
-                          snapshot.action_state,
-                        ))))
-                ) ? (
-                  <span className="px-2 text-xs font-bold text-slate-600">
-                    {isHostAnnouncing
-                      ? t('waitingHost')
-                      : snapshot.action_state === 'RESUME_COUNTDOWN'
-                        ? t('waitingResume')
-                        : isCountdown
-                          ? t('waitingCountdown')
-                          : t('waitingStage')}
-                  </span>
-                ) : null}
-              </div>
-              <div
-                className="flex items-center justify-end gap-1.5 rounded-xl border border-blue-100 bg-white px-1.5 py-1"
-                data-testid="match-controls-system"
-              >
-                <Button
-                  aria-label={t('network')}
-                  onClick={onOpenNetwork}
-                  ref={networkTriggerRef}
-                  size="sm"
-                  variant="ghost"
+                            <DropdownMenu.Separator className="my-1 h-px bg-slate-100" />
+                            {remoteHumanSeats.map((seat) => (
+                              <DropdownMenu.CheckboxItem
+                                checked={Boolean(
+                                  seat.user_id && mutedHumanUserIdSet.has(seat.user_id),
+                                )}
+                                className="relative flex cursor-pointer select-none items-center justify-between gap-3 rounded-md py-2 pl-9 pr-3 text-sm outline-none data-[highlighted]:bg-blue-50"
+                                key={seat.user_id}
+                                onCheckedChange={() =>
+                                  seat.user_id && onToggleHumanOutputMuted(seat.user_id)
+                                }
+                                onSelect={(event) => event.preventDefault()}
+                              >
+                                <DropdownMenu.ItemIndicator className="absolute left-3 grid size-4 place-items-center text-blue-700">
+                                  <Check className="size-4" />
+                                </DropdownMenu.ItemIndicator>
+                                <span className="min-w-0 truncate font-bold text-slate-900">
+                                  {seat.occupant_name ?? t('detail.humanDebater')}
+                                </span>
+                                <span
+                                  className={`shrink-0 text-xs font-bold ${seat.side === 'AFFIRMATIVE' ? 'text-red-600' : 'text-blue-700'}`}
+                                >
+                                  {sideLabel(seat.side, t)} {seat.seat_no}
+                                </span>
+                              </DropdownMenu.CheckboxItem>
+                            ))}
+                          </>
+                        ) : (
+                          <p className="rounded-md bg-slate-50 px-3 py-2 text-sm text-slate-500">
+                            {t('noOtherHumans')}
+                          </p>
+                        )}
+                      </DropdownMenu.Content>
+                    </DropdownMenu.Portal>
+                  </DropdownMenu.Root>
+                  {playbackStatus === 'blocked' ? (
+                    <Button onClick={onEnableAudio} size="sm" variant="primary">
+                      <Radio className="size-4" /> {t('enableMatchAudio')}
+                    </Button>
+                  ) : null}
+                </div>
+                <div
+                  className="flex min-w-0 flex-nowrap items-center justify-center gap-1 overflow-x-auto rounded-xl border border-[#dce9f5] bg-white px-2 py-1"
+                  data-testid="match-controls-speech"
                 >
-                  <Wifi className="size-4" />
-                  {runtime.socketStatus === 'open' && audioStatus === 'ready'
-                    ? t('networkGood')
-                    : t('connectionCheck')}
-                </Button>
-                {canPauseMatch(snapshot.status, isDebater, isOrganizer) ? (
-                  <Button disabled={commandPending} onClick={onPause} size="sm" variant="secondary">
-                    <Pause className="size-4" /> {t('pause')}
-                  </Button>
-                ) : null}
-                {(isOrganizer || snapshot.pause_initiator_user_id === currentUserId) &&
-                ['PAUSED', 'SYSTEM_RECOVERY', 'ERROR'].includes(snapshot.status) &&
-                snapshot.action_state !== 'RESUME_COUNTDOWN' ? (
+                  {canShowControls &&
+                  snapshot.action_state === 'HUMAN_READY_TO_START' &&
+                  isCurrentSpeaker ? (
+                    <Button
+                      disabled={commandPending || audioStatus !== 'ready' || !runtime.commandReady}
+                      onClick={onStartSpeech}
+                      size="sm"
+                      variant="primary"
+                    >
+                      <Mic className="size-4" /> {t('startSpeech')}
+                    </Button>
+                  ) : null}
+                  {canShowControls &&
+                  snapshot.action_state === 'HUMAN_SPEAKING' &&
+                  isCurrentSpeaker ? (
+                    <Button
+                      className="gap-1 px-2"
+                      disabled={commandPending}
+                      onClick={onFinishSpeech}
+                      size="sm"
+                      variant="danger"
+                    >
+                      <Square className="size-4 fill-current" /> {t('finishSpeech')}
+                    </Button>
+                  ) : null}
+                  {canRaiseHand ? (
+                    <Button
+                      disabled={commandPending}
+                      onClick={() => onCommand(myHandIndex >= 0 ? 'hand.cancel' : 'hand.raise')}
+                      size="sm"
+                      variant={myHandIndex >= 0 ? 'secondary' : 'primary'}
+                    >
+                      <Hand className="size-4" />{' '}
+                      {myHandIndex >= 0
+                        ? t('cancelHand', { position: myHandIndex + 1 })
+                        : t('raiseHand')}
+                    </Button>
+                  ) : null}
+                  {canShowControls &&
+                  (((isCurrentSpeaker || isOrganizer) &&
+                    ['HUMAN_SPEAKING', 'SPEECH_FINALIZING'].includes(snapshot.action_state)) ||
+                    (isOrganizer &&
+                      ['AGENT_PREPARING', 'AGENT_SPEAKING', 'AGENT_FINALIZING'].includes(
+                        snapshot.action_state,
+                      ))) ? (
+                    <Button
+                      className="gap-1 px-2"
+                      disabled={commandPending}
+                      onClick={onResetSpeech}
+                      size="sm"
+                      variant="secondary"
+                    >
+                      <RotateCcw className="size-4" /> {t('resetSpeech')}
+                    </Button>
+                  ) : null}
+                  {!isTerminal &&
+                  !(
+                    (canShowControls &&
+                      snapshot.action_state === 'HUMAN_READY_TO_START' &&
+                      isCurrentSpeaker) ||
+                    (canShowControls &&
+                      snapshot.action_state === 'HUMAN_SPEAKING' &&
+                      isCurrentSpeaker) ||
+                    canRaiseHand ||
+                    (canShowControls &&
+                      (((isCurrentSpeaker || isOrganizer) &&
+                        ['HUMAN_SPEAKING', 'SPEECH_FINALIZING'].includes(snapshot.action_state)) ||
+                        (isOrganizer &&
+                          ['AGENT_PREPARING', 'AGENT_SPEAKING', 'AGENT_FINALIZING'].includes(
+                            snapshot.action_state,
+                          ))))
+                  ) ? (
+                    <span className="px-2 text-xs font-bold text-slate-600">
+                      {isHostAnnouncing
+                        ? t('waitingHost')
+                        : snapshot.action_state === 'RESUME_COUNTDOWN'
+                          ? t('waitingResume')
+                          : isCountdown
+                            ? t('waitingCountdown')
+                            : t('waitingStage')}
+                    </span>
+                  ) : null}
+                </div>
+                <div
+                  className="flex items-center justify-end gap-1.5 rounded-xl border border-blue-100 bg-white px-1.5 py-1"
+                  data-testid="match-controls-system"
+                >
                   <Button
-                    disabled={commandPending}
-                    onClick={() => onCommand('match.resume')}
+                    aria-label={t('network')}
+                    onClick={onOpenNetwork}
+                    ref={networkTriggerRef}
                     size="sm"
-                    variant="primary"
+                    variant="ghost"
                   >
-                    <Play className="size-4" /> {t('resume')}
+                    <Wifi className="size-4" />
+                    {runtime.socketStatus === 'open' && audioStatus === 'ready'
+                      ? t('networkGood')
+                      : t('connectionCheck')}
                   </Button>
-                ) : null}
-                {isOrganizer && canShowControls ? (
-                  <Button
-                    disabled={commandPending}
-                    onClick={onTerminate}
-                    size="sm"
-                    variant="danger"
-                  >
-                    <CircleAlert className="size-4" /> {t('terminate')}
+                  {canPauseMatch(snapshot.status, isDebater, isOrganizer) ? (
+                    <Button
+                      disabled={commandPending}
+                      onClick={onPause}
+                      size="sm"
+                      variant="secondary"
+                    >
+                      <Pause className="size-4" /> {t('pause')}
+                    </Button>
+                  ) : null}
+                  {(isOrganizer || snapshot.pause_initiator_user_id === currentUserId) &&
+                  ['PAUSED', 'SYSTEM_RECOVERY', 'ERROR'].includes(snapshot.status) &&
+                  snapshot.action_state !== 'RESUME_COUNTDOWN' ? (
+                    <Button
+                      disabled={commandPending}
+                      onClick={() => onCommand('match.resume')}
+                      size="sm"
+                      variant="primary"
+                    >
+                      <Play className="size-4" /> {t('resume')}
+                    </Button>
+                  ) : null}
+                  {isOrganizer && canShowControls ? (
+                    <Button
+                      disabled={commandPending}
+                      onClick={onTerminate}
+                      size="sm"
+                      variant="danger"
+                    >
+                      <CircleAlert className="size-4" /> {t('terminate')}
+                    </Button>
+                  ) : null}
+                  <Button disabled={leaving} onClick={onLeave} size="sm" variant="ghost">
+                    <ArrowLeft className="size-4" /> {t('leave')}
                   </Button>
-                ) : null}
-                <Button disabled={leaving} onClick={onLeave} size="sm" variant="ghost">
-                  <ArrowLeft className="size-4" /> {t('leave')}
-                </Button>
-              </div>
-            </footer>
+                </div>
+              </footer>
+            ) : null}
             <Dialog.Root
               open={Boolean(networkOpen)}
               onOpenChange={(nextOpen) => {
@@ -1436,24 +1729,26 @@ export function DebatePageLayout({
             </Dialog.Root>
           </section>
 
-          <aside className="debate-transcript hidden min-h-0 min-[1580px]:flex min-w-0 flex-col overflow-hidden rounded-[1.35rem] border border-blue-100 bg-white/88 shadow-[0_18px_55px_rgba(42,83,130,0.09)]">
-            <div className="shrink-0 border-b border-blue-100 px-4 py-3">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <p className="text-[10px] font-black tracking-[0.18em] text-blue-600">
-                    TRANSCRIPT
-                  </p>
-                  <h2 className="mt-1 text-lg font-black">{t('transcript')}</h2>
+          {!presentationMode ? (
+            <aside className="debate-transcript hidden min-h-0 min-[1580px]:flex min-w-0 flex-col overflow-hidden rounded-[1.35rem] border border-blue-100 bg-white/88 shadow-[0_18px_55px_rgba(42,83,130,0.09)]">
+              <div className="shrink-0 border-b border-blue-100 px-4 py-3">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-[10px] font-black tracking-[0.18em] text-blue-600">
+                      TRANSCRIPT
+                    </p>
+                    <h2 className="mt-1 text-lg font-black">{t('transcript')}</h2>
+                  </div>
+                  <span className="rounded-full bg-blue-50 px-2.5 py-1 text-[10px] font-black text-blue-700">
+                    {t('transcriptLive')}
+                  </span>
                 </div>
-                <span className="rounded-full bg-blue-50 px-2.5 py-1 text-[10px] font-black text-blue-700">
-                  {t('transcriptLive')}
-                </span>
               </div>
-            </div>
-            <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-3">
-              <TranscriptFeed {...transcriptProps} />
-            </div>
-          </aside>
+              <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-3 py-3">
+                <TranscriptFeed {...transcriptProps} />
+              </div>
+            </aside>
+          ) : null}
         </div>
       </div>
 
@@ -1497,6 +1792,97 @@ export function DebatePageLayout({
             >
               <TranscriptFeed {...transcriptProps} />
             </div>
+          </Dialog.Content>
+        </Dialog.Portal>
+      </Dialog.Root>
+
+      <Dialog.Root
+        open={emergencyOpen}
+        onOpenChange={(nextOpen) => {
+          if (!nextOpen) onCloseEmergency?.();
+        }}
+      >
+        <Dialog.Portal>
+          <Dialog.Overlay className="fixed inset-0 z-50 bg-slate-950/25 backdrop-blur-[2px]" />
+          <Dialog.Content
+            aria-describedby={undefined}
+            aria-labelledby="emergency-console-title"
+            className="fixed right-0 top-0 z-50 flex h-full w-full max-w-sm flex-col overflow-y-auto overscroll-contain border-l border-amber-200 bg-[#fffdf7] p-5 shadow-2xl outline-none"
+          >
+            <div className="flex items-center justify-between gap-3 border-b border-amber-100 pb-4">
+              <div>
+                <p className="text-xs font-black tracking-[0.18em] text-amber-700">HOST CONSOLE</p>
+                <Dialog.Title asChild>
+                  <h2 id="emergency-console-title" className="mt-1 text-xl font-black">
+                    应急控制台
+                  </h2>
+                </Dialog.Title>
+              </div>
+              <Dialog.Close asChild>
+                <Button aria-label="关闭应急控制台" size="icon" variant="ghost">
+                  <X className="size-5" />
+                </Button>
+              </Dialog.Close>
+            </div>
+            <p className="mt-4 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-900">
+              所有操作由服务端确认并串行进入比赛状态机。发生异常时先暂停，再按需恢复或重置当前发言。
+            </p>
+            <div className="mt-5 grid gap-2">
+              {isWaitingForHost ? (
+                <Button
+                  disabled={runtimeStartPending}
+                  onClick={() => onStartRuntime?.()}
+                  variant="primary"
+                >
+                  {runtimeStartPending ? (
+                    <LoaderCircle className="size-4 animate-spin" />
+                  ) : (
+                    <Play className="size-4" />
+                  )}
+                  正式开始比赛
+                </Button>
+              ) : null}
+              {canPauseMatch(snapshot.status, isDebater, isOrganizer) ? (
+                <Button disabled={commandPending} onClick={onPause} variant="secondary">
+                  <Pause className="size-4" />
+                  暂停比赛
+                </Button>
+              ) : null}
+              {(isOrganizer || snapshot.pause_initiator_user_id === currentUserId) &&
+              ['PAUSED', 'SYSTEM_RECOVERY', 'ERROR'].includes(snapshot.status) &&
+              snapshot.action_state !== 'RESUME_COUNTDOWN' ? (
+                <Button
+                  disabled={commandPending}
+                  onClick={() => onCommand('match.resume')}
+                  variant="primary"
+                >
+                  <Play className="size-4" />
+                  恢复比赛
+                </Button>
+              ) : null}
+              {isOrganizer &&
+              canShowControls &&
+              !emergencyControls &&
+              [
+                'HUMAN_SPEAKING',
+                'SPEECH_FINALIZING',
+                'AGENT_PREPARING',
+                'AGENT_SPEAKING',
+                'AGENT_FINALIZING',
+              ].includes(snapshot.action_state) ? (
+                <Button disabled={commandPending} onClick={onResetSpeech} variant="secondary">
+                  <RotateCcw className="size-4" />
+                  重置当前发言
+                </Button>
+              ) : null}
+              {isOrganizer && canShowControls ? (
+                <Button disabled={commandPending} onClick={onTerminate} variant="danger">
+                  <CircleAlert className="size-4" />
+                  终止比赛
+                </Button>
+              ) : null}
+            </div>
+            {emergencyControls}
           </Dialog.Content>
         </Dialog.Portal>
       </Dialog.Root>

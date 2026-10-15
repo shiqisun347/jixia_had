@@ -93,18 +93,10 @@ describe('experimentAgentSeatStatus', () => {
       ],
     } as MatchSnapshot;
     expect(
-      experimentAgentSeatStatus(
-        formal,
-        { occupant_type: 'AGENT', side: 'NEGATIVE' },
-        'agent-1',
-      ),
+      experimentAgentSeatStatus(formal, { occupant_type: 'AGENT', side: 'NEGATIVE' }, 'agent-1'),
     ).toBe('RAISE');
     expect(
-      experimentAgentSeatStatus(
-        formal,
-        { occupant_type: 'AGENT', side: 'NEGATIVE' },
-        'agent-2',
-      ),
+      experimentAgentSeatStatus(formal, { occupant_type: 'AGENT', side: 'NEGATIVE' }, 'agent-2'),
     ).toBe('SKIP');
   });
 });
@@ -120,6 +112,19 @@ describe('runtimeErrorLabel', () => {
     expect(runtimeErrorLabel('HUMAN_WAIT_TIMEOUT')).toBe(
       '60 秒内无人举手，比赛已暂停；恢复后将重新开始完整等待。',
     );
+  });
+
+  it.each([
+    ['llm_first_token_timeout', 'Agent 10 秒内没有返回首段文字'],
+    ['llm_stream_stalled', 'Agent 文本流中断'],
+    ['llm_provider_failed', 'Agent 服务暂时没有返回有效结果'],
+    ['llm_output_too_large', 'Agent 文本输出超过大小限制'],
+    ['tts_parameter_invalid', '语音服务拒绝了当前音色或参数'],
+    ['tts_task_timeout', '语音合成超过时限'],
+    ['tts_audio_too_large', '语音输出超过大小限制'],
+    ['tts_provider_failed', '语音合成连续失败'],
+  ])('maps provider failure %s', (code, expected) => {
+    expect(runtimeErrorLabel(code)).toContain(expected);
   });
 
   it.each([

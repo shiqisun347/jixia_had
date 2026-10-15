@@ -5,11 +5,12 @@ set -Eeuo pipefail
 # this script never prints environment values.
 
 readonly EXPECTED_VERSION="2.1.0"
-readonly EXPECTED_REVISION="0043_browser_device_checks"
 readonly REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 readonly CORE_URL="${JX_PREFLIGHT_CORE_URL:-http://127.0.0.1:8100}"
 readonly PYTHON_BIN="${JX_PREFLIGHT_PYTHON:-python3}"
-readonly SERVICES=(jx-core jx-jobs jx-web jx-livekit)
+readonly SERVICES=(jx-core jx-jobs jx-web)
+readonly LIVEKIT_CONTAINER="${JX_PREFLIGHT_LIVEKIT_CONTAINER:-jx-livekit}"
+readonly LIVEKIT_IMAGE_PREFIX="${JX_PREFLIGHT_LIVEKIT_IMAGE_PREFIX:-livekit/livekit-server:}"
 
 failures=0
 
@@ -32,6 +33,63 @@ check_services() {
       fail "service not active: $service"
     fi
   done
+
+  # LiveKit is deployed as either a systemd unit or the explicitly named,
+  # pinned container used by the production host.  Keep this check read-only
+  # and fail closed for an absent/stopped/unexpected container.
+  if systemctl is-active --quiet jx-livekit; then
+    pass "service active: jx-livekit"
+    return
+  fi
+  if systemctl is-active --quiet livekit.service; then
+    pass "service active: livekit.service"
+    return
+  fi
+  if ! command -v docker >/dev/null 2>&1; then
+    fail "LiveKit systemd units inactive and docker unavailable"
+    return
+  fi
+  if [[ -z "$LIVEKIT_IMAGE_PREFIX" ]]; then
+    fail "LiveKit image prefix is empty"
+    return
+  fi
+
+  local inspect_output running image
+  if ! inspect_output="$(docker inspect --format '{{.State.Running}}|{{.Config.Image}}' "$LIVEKIT_CONTAINER" 2>/dev/null)"; then
+    fail "LiveKit systemd units inactive and container not found: $LIVEKIT_CONTAINER"
+    return
+  fi
+  running="${inspect_output%%|*}"
+  image="${inspect_output#*|}"
+  if [[ "$running" != "true" ]]; then
+    fail "LiveKit container is not running: $LIVEKIT_CONTAINER"
+    return
+  fi
+  if [[ "$image" != "$LIVEKIT_IMAGE_PREFIX"* ]]; then
+    fail "LiveKit container image is unexpected: $LIVEKIT_CONTAINER"
+    return
+  fi
+  pass "container active: $LIVEKIT_CONTAINER"
+}
+
+check_runtime_guards() {
+  local minimum_nofile output
+  local -a guard_args
+  minimum_nofile="${JX_PREFLIGHT_MIN_NOFILE:-524288}"
+  guard_args=(--min-nofile "$minimum_nofile")
+  if [[ "${JX_PREFLIGHT_REQUIRE_MEMORY_GUARDS:-0}" == "1" ]]; then
+    guard_args+=(--require-memory-guards)
+  fi
+  if [[ "${JX_PREFLIGHT_REQUIRE_CGROUP_TELEMETRY:-0}" == "1" ]]; then
+    guard_args+=(--require-cgroup-telemetry)
+  fi
+  if ! output="$($REPO_ROOT/scripts/ops/runtime_guard_audit.sh "${guard_args[@]}")"; then
+    printf '%s\n' "$output" >&2
+    fail "effective Core/Jobs runtime resource guards are below the release floor"
+    return
+  fi
+  printf '%s\n' "$output"
+  pass "effective Core/Jobs runtime resource guards satisfy the release floor"
 }
 
 check_python_packages() {
@@ -132,24 +190,78 @@ check_database() {
     PYTHONPATH="$REPO_ROOT/apps/core/src:$REPO_ROOT/apps/jobs/src${PYTHONPATH:+:$PYTHONPATH}" \
       "$PYTHON_BIN" - <<'PY'
 import asyncio
+import json
+from pathlib import Path
 from sqlalchemy import text
 from jx_core.config import load_settings
 from jx_core.database import Database
+from scripts.ops.migration_preflight import current_migration_head
 
 
 async def main() -> None:
+    expected_revision = current_migration_head(Path.cwd())
     settings = load_settings()
     database = Database(settings.database_url_value)
     try:
         async with database.engine.connect() as connection:
-            revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
+            revisions = list(
+                (await connection.scalars(text("SELECT version_num FROM alembic_version"))).all()
+            )
             active_matches = await connection.scalar(
                 text(
                     "SELECT count(*) FROM matches "
                     "WHERE status NOT IN ('FINISHED', 'TERMINATED')"
                 )
             )
-        print(f"revision={revision} active_matches={int(active_matches or 0)}")
+            nonterminal_room_rows = (
+                await connection.execute(
+                    text(
+                        "SELECT status, count(*) FROM rooms "
+                        "WHERE status NOT IN ('FINISHED', 'TERMINATED') "
+                        "GROUP BY status ORDER BY status"
+                    )
+                )
+            ).all()
+            active_status_rows = (
+                await connection.execute(
+                    text(
+                        "SELECT status, count(*) FROM matches "
+                        "WHERE status NOT IN ('FINISHED', 'TERMINATED') "
+                        "GROUP BY status ORDER BY status"
+                    )
+                )
+            ).all()
+            terminal_rooms_missing_end_at = await connection.scalar(
+                text(
+                    "SELECT count(*) FROM rooms "
+                    "WHERE status IN ('FINISHED', 'TERMINATED') AND ended_at IS NULL"
+                )
+            )
+            active_leases = await connection.scalar(
+                text("SELECT count(*) FROM room_connection_leases")
+            )
+            terminal_room_leases = await connection.scalar(
+                text(
+                    "SELECT count(*) FROM room_connection_leases l "
+                    "JOIN rooms r ON r.id = l.room_id "
+                    "WHERE r.status IN ('FINISHED', 'TERMINATED')"
+                )
+            )
+        print(json.dumps({
+            "expected_revision": expected_revision,
+            "revisions": revisions,
+            "active_matches": int(active_matches or 0),
+            "nonterminal_rooms": sum(int(count or 0) for _, count in nonterminal_room_rows),
+            "nonterminal_room_statuses": {
+                str(status): int(count or 0) for status, count in nonterminal_room_rows
+            },
+            "active_statuses": {
+                str(status): int(count or 0) for status, count in active_status_rows
+            },
+            "terminal_rooms_missing_end_at": int(terminal_rooms_missing_end_at or 0),
+            "active_leases": int(active_leases or 0),
+            "terminal_room_leases": int(terminal_room_leases or 0),
+        }))
     finally:
         await database.dispose()
 
@@ -161,16 +273,92 @@ PY
     return
   fi
 
-  printf '%s\n' "$output"
-  if [[ "$output" == *"revision=${EXPECTED_REVISION}"* ]]; then
-    pass "database migration is at the v2.1 head"
+  if DATABASE_OUTPUT="$output" PREFLIGHT_ROOT="$REPO_ROOT" \
+    "$PYTHON_BIN" - <<'PY'
+import json
+import os
+import sys
+
+sys.path.insert(0, os.environ["PREFLIGHT_ROOT"])
+from scripts.ops.migration_preflight import database_at_migration_head
+
+payload = json.loads(os.environ["DATABASE_OUTPUT"])
+expected = payload["expected_revision"]
+revisions = payload["revisions"]
+print(f"expected_revision={expected} revisions={','.join(revisions) or 'none'}")
+raise SystemExit(0 if database_at_migration_head(revisions, expected) else 1)
+PY
+  then
+    pass "database migration matches the checkout head"
   else
-    fail "database migration is not at the v2.1 head"
+    fail "database migration does not match the checkout head"
   fi
-  if [[ "$output" == *"active_matches=0"* ]]; then
+  if DATABASE_OUTPUT="$output" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["DATABASE_OUTPUT"])
+active_matches = payload["active_matches"]
+active_statuses = payload["active_statuses"]
+status_summary = ",".join(
+    f"{status}={count}" for status, count in sorted(active_statuses.items())
+) or "none"
+print(f"active_matches={active_matches} active_statuses={status_summary}")
+raise SystemExit(0 if type(active_matches) is int and active_matches == 0 else 1)
+PY
+  then
     pass "no non-terminal matches"
   else
     fail "non-terminal matches exist; do not deploy"
+  fi
+  if DATABASE_OUTPUT="$output" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["DATABASE_OUTPUT"])
+nonterminal_rooms = payload["nonterminal_rooms"]
+status_summary = ",".join(
+    f"{status}={count}" for status, count in sorted(payload["nonterminal_room_statuses"].items())
+) or "none"
+print(f"nonterminal_rooms={nonterminal_rooms} nonterminal_room_statuses={status_summary}")
+raise SystemExit(0 if type(nonterminal_rooms) is int and nonterminal_rooms == 0 else 1)
+PY
+  then
+    pass "no non-terminal rooms"
+  else
+    fail "non-terminal rooms exist; do not deploy"
+  fi
+  if DATABASE_OUTPUT="$output" python3 - <<'PY'
+import json
+import os
+
+payload = json.loads(os.environ["DATABASE_OUTPUT"])
+missing_end_at = payload["terminal_rooms_missing_end_at"]
+terminal_leases = payload["terminal_room_leases"]
+active_leases = payload["active_leases"]
+print(
+    f"terminal_rooms_missing_end_at={missing_end_at} "
+    f"terminal_room_leases={terminal_leases} active_leases={active_leases}"
+)
+raise SystemExit(0 if missing_end_at == 0 and terminal_leases == 0 else 1)
+PY
+  then
+    pass "terminal room timestamps and leases are reconciled"
+  else
+    fail "terminal rooms are missing ended_at or retain active leases; do not deploy"
+  fi
+  if DATABASE_OUTPUT="$output" python3 - <<'PY'
+import json
+import os
+
+active_leases = json.loads(os.environ["DATABASE_OUTPUT"])["active_leases"]
+print(f"active_leases={active_leases}")
+raise SystemExit(0 if active_leases == 0 else 1)
+PY
+  then
+    pass "no active room connection leases remain"
+  else
+    fail "active room connection leases remain; drain clients before deploy"
   fi
 }
 
@@ -187,6 +375,7 @@ main() {
   printf 'Jixia v2.1 read-only release preflight\n'
   printf 'repo=%s core_url=%s\n' "$REPO_ROOT" "$CORE_URL"
   check_services
+  check_runtime_guards
   check_python_packages
   check_http
   check_database
@@ -198,4 +387,6 @@ main() {
   printf 'Preflight passed. No changes were made.\n'
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

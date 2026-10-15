@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
 from collections.abc import Callable
 from time import time
 from uuid import UUID
@@ -14,6 +14,8 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from .matches.domain import MatchCommand, MatchDomainError
 from .matches.service import MatchRuntimeManager
 from .models import Match, RoomConnectionLease, RoomMember
+
+MAX_CLOSED_MATCH_TOMBSTONES = 4096
 
 
 class MatchPresenceCoordinator:
@@ -33,7 +35,32 @@ class MatchPresenceCoordinator:
         self._seen_events: dict[UUID, set[str]] = defaultdict(set)
         self._online_state: dict[tuple[UUID, UUID], bool] = {}
         self._announced_epoch: dict[tuple[UUID, UUID], int] = {}
+        # A terminal match can still have a browser or LiveKit callback in
+        # flight after close_match() clears its live state. Keep a bounded
+        # tombstone so those late callbacks cannot recreate the dictionaries.
+        self._closed_matches: OrderedDict[UUID, None] = OrderedDict()
         self._transition_sequence = 0
+
+    def _remember_closed_match(self, match_id: UUID) -> None:
+        self._closed_matches[match_id] = None
+        self._closed_matches.move_to_end(match_id)
+        while len(self._closed_matches) > MAX_CLOSED_MATCH_TOMBSTONES:
+            self._closed_matches.popitem(last=False)
+
+    def _clear_match_state(self, match_id: UUID) -> None:
+        for key in tuple(self._websocket):
+            if key[0] == match_id:
+                self._websocket.pop(key, None)
+        for key in tuple(self._media):
+            if key[0] == match_id:
+                self._media.pop(key, None)
+        self._seen_events.pop(match_id, None)
+        for key in tuple(self._online_state):
+            if key[0] == match_id:
+                self._online_state.pop(key, None)
+        for key in tuple(self._announced_epoch):
+            if key[0] == match_id:
+                self._announced_epoch.pop(key, None)
 
     def _complete_epochs(self, match_id: UUID, user_id: UUID, active_epochs: set[int]) -> set[int]:
         return {
@@ -51,11 +78,16 @@ class MatchPresenceCoordinator:
         self, match_id: UUID, user_id: UUID, epoch: int, connection_id: UUID
     ) -> None:
         async with self._lock:
+            if match_id in self._closed_matches:
+                return
             key = (match_id, user_id, epoch)
             previous = set(self._websocket.get(key, ()))
             self._websocket[key].add(connection_id)
             try:
                 await self._transition(match_id, user_id, epoch)
+            except asyncio.CancelledError:
+                self._restore_members(self._websocket, key, previous)
+                raise
             except Exception:
                 self._restore_members(self._websocket, key, previous)
                 raise
@@ -64,6 +96,8 @@ class MatchPresenceCoordinator:
         self, match_id: UUID, user_id: UUID, epoch: int, connection_id: UUID
     ) -> None:
         async with self._lock:
+            if match_id in self._closed_matches:
+                return
             key = (match_id, user_id, epoch)
             previous = set(self._websocket.get(key, ()))
             leases = self._websocket.get(key)
@@ -73,6 +107,9 @@ class MatchPresenceCoordinator:
                     self._websocket.pop(key, None)
             try:
                 await self._transition(match_id, user_id, epoch)
+            except asyncio.CancelledError:
+                self._restore_members(self._websocket, key, previous)
+                raise
             except Exception:
                 self._restore_members(self._websocket, key, previous)
                 raise
@@ -88,6 +125,8 @@ class MatchPresenceCoordinator:
         joined: bool,
     ) -> None:
         async with self._lock:
+            if match_id in self._closed_matches:
+                return
             key = (match_id, user_id, epoch)
             previous = set(self._media.get(key, ()))
             if not self._apply_media_event(
@@ -101,6 +140,10 @@ class MatchPresenceCoordinator:
                 return
             try:
                 await self._transition(match_id, user_id, epoch)
+            except asyncio.CancelledError:
+                self._restore_members(self._media, key, previous)
+                self._seen_events[match_id].discard(event_id)
+                raise
             except Exception:
                 self._restore_members(self._media, key, previous)
                 self._seen_events[match_id].discard(event_id)
@@ -140,6 +183,12 @@ class MatchPresenceCoordinator:
             for match_id, subject_user_id in subjects:
                 await self._transition(match_id, subject_user_id, 0)
 
+    async def close_match(self, match_id: UUID) -> None:
+        """Release all in-memory presence state after a match reaches a terminal state."""
+        async with self._lock:
+            self._remember_closed_match(match_id)
+            self._clear_match_state(match_id)
+
     def _apply_media_event(
         self,
         *,
@@ -169,6 +218,13 @@ class MatchPresenceCoordinator:
         active_epochs: set[int] = set()
         async with self._session_factory() as session:
             async with session.begin():
+                match_status = await session.scalar(
+                    select(Match.status).where(Match.id == match_id)
+                )
+                if match_status is None or match_status in ("FINISHED", "TERMINATED"):
+                    self._remember_closed_match(match_id)
+                    self._clear_match_state(match_id)
+                    return
                 room_id = await session.scalar(select(Match.room_id).where(Match.id == match_id))
                 if room_id is not None:
                     active_epochs = set(

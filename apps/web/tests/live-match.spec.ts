@@ -633,7 +633,7 @@ test('real runtime page connects and starts human speech from server state', asy
   const closeTranscriptButton = page.getByRole('button', { name: '关闭文字记录' });
   if (await closeTranscriptButton.isVisible()) await closeTranscriptButton.click();
   await expect(page.getByText('比赛连接状态')).toHaveCount(0);
-  await expect(page.getByRole('button', { name: '查看网络状态' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '网络状态' })).toBeVisible();
   await expect(page.getByTestId('current-debate-stage')).toHaveText('当前阶段 · 正方一辩立论');
   const controlGroups = [
     page.getByTestId('match-controls-audio'),
@@ -652,7 +652,9 @@ test('real runtime page connects and starts human speech from server state', asy
   const restoreOutputButton = page.getByRole('button', { name: '恢复本机声音' });
   await expect(restoreOutputButton).toHaveAttribute('aria-pressed', 'true');
   await expect.poll(() => page.evaluate(() => window.__JX_OUTPUT_MUTED_STATES__)).toEqual([true]);
-  await expect(page.locator('audio').last()).toHaveJSProperty('muted', true);
+  // This scenario substitutes the LiveKit session. Local output is verified
+  // at that session boundary; server-published host audio has no client player.
+  await expect(page.locator('audio')).toHaveCount(0);
   expect(await page.evaluate(() => window.__JX_MICROPHONE_STATES__)).toEqual(
     microphoneStatesBeforeMute,
   );
@@ -667,8 +669,8 @@ test('real runtime page connects and starts human speech from server state', asy
   await expect
     .poll(() => page.evaluate(() => window.__JX_OUTPUT_MUTED_STATES__))
     .toEqual([true, false]);
-  await expect(page.locator('audio').last()).toHaveJSProperty('muted', false);
-  const networkStatusTrigger = page.getByRole('button', { name: '查看网络状态' });
+  await expect(page.locator('audio')).toHaveCount(0);
+  const networkStatusTrigger = page.getByRole('button', { name: '网络状态' });
   await networkStatusTrigger.click();
   await expect(page.getByRole('dialog', { name: '网络状态' })).toBeVisible();
   await expect(page.getByRole('button', { name: '关闭网络状态' })).toBeFocused();
@@ -680,7 +682,7 @@ test('real runtime page connects and starts human speech from server state', asy
   await expect(networkStatusTrigger).toBeFocused();
   await page.evaluate(() => window.__JX_CLOSE_MATCH_SOCKET__?.());
   await expect.poll(() => page.evaluate(() => window.__JX_MATCH_SOCKET_COUNT__ ?? 0)).toBe(2);
-  await expect(page.getByRole('button', { name: '查看网络状态' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '网络状态' })).toBeVisible();
   await page.getByRole('button', { name: '暂停比赛' }).click();
   const pauseDialog = page.getByRole('alertdialog', { name: '暂停整场比赛？' });
   await expect(pauseDialog).toBeVisible();
@@ -770,7 +772,7 @@ test('real runtime page connects and starts human speech from server state', asy
   await expect(staleFinishDialog).toHaveCount(0);
   await expect(
     page
-      .getByRole('region', { name: '操作提示' })
+      .getByRole('region', { name: '连接错误' })
       .getByRole('status')
       .filter({ hasText: '比赛状态已变化，未执行该操作' }),
   ).toBeVisible();
@@ -797,7 +799,7 @@ test('real runtime page connects and starts human speech from server state', asy
       button.click();
       button.click();
     });
-  await expect(page.getByRole('region', { name: '操作提示' }).getByRole('alert')).toContainText(
+  await expect(page.getByRole('region', { name: '连接错误' }).getByRole('alert')).toContainText(
     '比赛指令未执行，请检查实时连接后重试。',
   );
   await expect.poll(() => page.evaluate(() => window.__JX_FAILED_COMMAND_COUNT__ ?? 0)).toBe(1);
@@ -805,7 +807,7 @@ test('real runtime page connects and starts human speech from server state', asy
     .poll(() => page.evaluate(() => window.__JX_MICROPHONE_STATES__?.slice(-2)))
     .toEqual([false, false]);
   await expect.poll(() => page.evaluate(() => window.__JX_MATCH_SOCKET_COUNT__ ?? 0)).toBe(3);
-  await expect(page.getByRole('button', { name: '查看网络状态' })).toBeVisible();
+  await expect(page.getByRole('button', { name: '网络状态' })).toBeVisible();
 
   const transcriptButton = page.getByRole('button', { name: '文字记录' });
   if (await transcriptButton.isVisible()) await transcriptButton.click();
@@ -838,7 +840,7 @@ test('real runtime page connects and starts human speech from server state', asy
   });
   await expect(
     page
-      .getByRole('region', { name: '操作提示' })
+      .getByRole('region', { name: '连接错误' })
       .getByRole('alert')
       .filter({ hasText: '文字服务暂时不可用，请重试' }),
   ).toBeVisible();
@@ -848,7 +850,7 @@ test('real runtime page connects and starts human speech from server state', asy
   await editableSpeech.getByRole('button', { name: '保存' }).click();
   await expect(
     page
-      .getByRole('region', { name: '操作提示' })
+      .getByRole('region', { name: '连接错误' })
       .getByRole('status')
       .filter({ hasText: '文字修改已保存' }),
   ).toBeVisible();

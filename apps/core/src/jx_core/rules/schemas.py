@@ -8,6 +8,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, model_validator
 
+from ..agent.voice_compatibility import QWEN_31_LEGACY_VOICE_CORRECTIONS
 from .validation import RuleDraft, StageActionDraft
 
 
@@ -20,6 +21,14 @@ class VoiceProfileCreate(BaseModel):
     chars_per_second: float | None = Field(default=None, gt=0, le=20)
     playback_gain: float = Field(default=1.0, ge=0.5, le=2.0)
     avatar_key: str | None = Field(default=None, pattern=r"^agent-(0[1-9]|1[0-2])$")
+
+    @field_validator("provider_voice")
+    @classmethod
+    def reject_unusable_system_voice(cls, value: str) -> str:
+        replacement = QWEN_31_LEGACY_VOICE_CORRECTIONS.get(value)
+        if replacement is not None:
+            raise ValueError(f"此历史音色不支持当前 TTS 模型，请使用 {replacement}")
+        return value
 
     @model_validator(mode="after")
     def validate_avatar_for_kind(self) -> VoiceProfileCreate:
@@ -203,6 +212,16 @@ class RuleStageUpdate(BaseModel):
     actions: list[StageActionDraft] = Field(default_factory=_empty_stage_actions, max_length=50)
 
 
+class RuleStageCreate(RuleStageUpdate):
+    stage_kind: Literal["FIXED_SPEECH", "FREE_DEBATE", "PREPARATION", "END"]
+    position: int | None = Field(default=None, ge=1, le=50)
+
+
+class RuleStageReorder(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    stage_ids: list[UUID] = Field(min_length=1, max_length=50)
+
+
 class RuleJudgeUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
     enabled: bool
@@ -233,6 +252,10 @@ class AgentProfileResponse(BaseModel):
     generation_params: dict[str, object]
     avatar_key: str
     status: str
+    voice_status: str
+    model_status: str
+    available: bool
+    unavailable_reason: Literal["RULE_DISABLED", "VOICE_DISABLED", "MODEL_DISABLED"] | None
     prompt_override_count: int = 0
 
 
@@ -285,6 +308,63 @@ class RuleCreate(BaseModel):
         return self
 
 
+class RuleAudioAssetResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+    generation_id: UUID | None
+    segment_key: str
+    text: str
+    voice_profile_id: UUID
+    status: str
+    error_code: str | None
+    duration_ms: int | None
+    byte_count: int | None
+    checksum: str | None
+    preview_url: str | None = None
+
+
+def _empty_audio_assets() -> list[RuleAudioAssetResponse]:
+    return []
+
+
+class RuleAudioGenerationResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: UUID
+    rule_id: UUID
+    config_revision: int
+    manifest_hash: str
+    status: str
+    review_status: str
+    requested_at: datetime
+    started_at: datetime | None
+    completed_at: datetime | None
+    approved_at: datetime | None
+    total_count: int
+    ready_count: int
+    failed_count: int
+    last_error_code: str | None
+    is_current: bool
+    assets: list[RuleAudioAssetResponse] = Field(default_factory=_empty_audio_assets)
+
+
+class RuleAudioApprove(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    generation_id: UUID
+    manifest_hash: str = Field(pattern=r"^[a-f0-9]{64}$")
+
+
+class RuleBlockerResponse(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    code: str
+    message: str
+    target: str
+    action: str
+
+
+def _empty_blockers() -> list[RuleBlockerResponse]:
+    return []
+
+
 class RuleResponse(BaseModel):
     model_config = ConfigDict(from_attributes=True)
     id: UUID
@@ -295,6 +375,17 @@ class RuleResponse(BaseModel):
     side_size: int
     estimated_seconds: int
     status: str
+    lifecycle_status: str = "DISABLED"
+    readiness: Literal["READY", "BLOCKED"] = "BLOCKED"
+    availability: Literal["AVAILABLE", "BLOCKED", "ARCHIVED"] = "BLOCKED"
+    blockers: list[RuleBlockerResponse] = Field(default_factory=_empty_blockers)
+    pure_human_available: bool = False
+    mixed_available: bool = False
+    pure_agent_available: bool = False
+    available_agent_count: int = 0
+    stage_count: int = 0
+    audio: RuleAudioGenerationResponse | None = None
+    current_audio_generation_id: UUID | None = None
     audio_reviewed_at: datetime | None
     host_voice_profile_id: UUID | None
     default_agent_model_profile_id: UUID | None
@@ -334,7 +425,12 @@ __all__ = [
     "RuleBasicUpdate",
     "RulePromptUpdate",
     "RuleStageUpdate",
+    "RuleStageCreate",
+    "RuleStageReorder",
     "RuleResponse",
+    "RuleAudioAssetResponse",
+    "RuleAudioGenerationResponse",
+    "RuleAudioApprove",
     "TopicCreate",
     "TopicUpdate",
     "TopicResponse",

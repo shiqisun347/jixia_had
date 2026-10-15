@@ -6,8 +6,9 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID
 
-from sqlalchemy import func, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import load_only
 
 from .audit.service import AuditService
 from .auth.errors import APIError
@@ -51,6 +52,16 @@ POSTMATCH_WORKFLOW_KEY = "_workflow"
 POSTMATCH_WORKFLOW_VERSION = "free-debate-chat-v1"
 POSTMATCH_SCOPE_FREE_DEBATE = "FREE_DEBATE"
 POSTMATCH_SCOPE_LEGACY = "LEGACY_ALL"
+
+# The list endpoint is intentionally a small, cursor-friendly window.  The
+# normal 4v4 match has far fewer finalized speeches, while the hard ceiling
+# keeps a damaged/replayed match from expanding one participant response
+# without bound.
+POSTMATCH_TASK_PAGE_DEFAULT = 25
+POSTMATCH_TASK_PAGE_MAX = 50
+POSTMATCH_SPEECHES_PER_MATCH_MAX = 512
+POSTMATCH_SPEECHES_TOTAL_MAX = 16_384
+POSTMATCH_ITEMS_TEXT_BYTES_MAX = 64 * 1024 * 1024
 
 
 def _postmatch_questionnaire(task: PostmatchSurveyTask) -> dict[str, Any] | None:
@@ -350,6 +361,22 @@ def _review_projection(
     return result
 
 
+def _visible_target_ids(
+    speeches: list[Speech],
+    annotatable: list[bool],
+    projections: list[tuple[bool, str]],
+) -> set[str]:
+    """Keep answer visibility correct even when a summary omits ``items``."""
+
+    return {
+        str(speech.id)
+        for speech, is_annotatable, (visible, _review_state) in zip(
+            speeches, annotatable, projections, strict=True
+        )
+        if is_annotatable and visible
+    }
+
+
 def _stage_meta(action_key: str, snapshot: dict[str, Any] | None) -> tuple[int | None, str, str]:
     try:
         stage_position = int(action_key.split(":", 1)[0])
@@ -368,61 +395,155 @@ def _stage_meta(action_key: str, snapshot: dict[str, Any] | None) -> tuple[int |
     return stage_position, "辩论阶段", "UNKNOWN"
 
 
-async def list_postmatch_tasks(session: AsyncSession, *, user_id: UUID) -> list[dict[str, Any]]:
-    rows = list(
+def _bounded_page_limit(limit: int) -> int:
+    return min(POSTMATCH_TASK_PAGE_MAX, max(1, int(limit)))
+
+
+async def list_postmatch_tasks_page(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    limit: int = POSTMATCH_TASK_PAGE_DEFAULT,
+    cursor: tuple[datetime, UUID] | None = None,
+    task_id: UUID | None = None,
+    include_items: bool = False,
+) -> tuple[list[dict[str, Any]], tuple[datetime, UUID] | None]:
+    """Project one bounded page of participant tasks with batched match data.
+
+    The old implementation loaded every task and then issued two or more
+    queries per match.  This helper keeps the public array response intact
+    while making the selected page the only materialized task set.  Matches,
+    participants and finalized speeches are fetched in batches for that page.
+    """
+
+    page_limit = _bounded_page_limit(limit)
+    filters = [PostmatchSurveyTask.user_id == user_id]
+    if task_id is not None:
+        filters.append(PostmatchSurveyTask.id == task_id)
+    elif cursor is not None:
+        filters.append(
+            or_(
+                PostmatchSurveyTask.created_at < cursor[0],
+                and_(
+                    PostmatchSurveyTask.created_at == cursor[0],
+                    PostmatchSurveyTask.id < cursor[1],
+                ),
+            )
+        )
+    task_match_rows = list(
         (
-            await session.scalars(
-                select(PostmatchSurveyTask)
+            await session.execute(
+                select(PostmatchSurveyTask, Match, Room)
                 .join(Match, Match.id == PostmatchSurveyTask.match_id)
-                .where(PostmatchSurveyTask.user_id == user_id)
-                .order_by(PostmatchSurveyTask.created_at.desc())
+                .outerjoin(Room, Room.id == Match.room_id)
+                .where(*filters)
+                .order_by(PostmatchSurveyTask.created_at.desc(), PostmatchSurveyTask.id.desc())
+                .limit(page_limit + 1)
             )
         ).all()
     )
-    result: list[dict[str, Any]] = []
-    for row in rows:
-        match = await session.get(Match, row.match_id)
-        room = await session.get(Room, match.room_id) if match is not None else None
-        participant = await session.scalar(
-            select(MatchParticipant).where(
-                MatchParticipant.match_id == row.match_id,
-                MatchParticipant.user_id == user_id,
+    has_more = task_id is None and len(task_match_rows) > page_limit
+    task_match_rows = task_match_rows[:page_limit]
+    if not task_match_rows:
+        return [], None
+
+    match_ids = [row[0].match_id for row in task_match_rows]
+    participants = list(
+        (
+            await session.scalars(
+                select(MatchParticipant).where(MatchParticipant.match_id.in_(match_ids))
             )
+        ).all()
+    )
+    participant_by_match = {
+        participant.match_id: participant
+        for participant in participants
+        if participant.user_id == user_id
+    }
+    names_by_match: dict[UUID, tuple[dict[UUID, str], dict[UUID, str]]] = {}
+    for participant in participants:
+        human_names, agent_names = names_by_match.setdefault(
+            participant.match_id, ({}, {})
         )
+        if participant.user_id is not None:
+            human_names[participant.user_id] = participant.display_name
+        if participant.agent_profile_id is not None:
+            agent_names[participant.agent_profile_id] = participant.display_name
+
+    # Rank in SQL and fetch one sentinel row per match.  This prevents a
+    # malformed/replayed match from materializing an unbounded speech history.
+    speech_fields: list[Any] = [
+        Speech.id,
+        Speech.match_id,
+        Speech.action_key,
+        Speech.user_id,
+        Speech.speaker_kind,
+        Speech.agent_profile_id,
+        Speech.side,
+        Speech.seat_no,
+        Speech.started_at,
+        Speech.created_at,
+        Speech.ended_at,
+        Speech.finalized_at,
+        Speech.audio_duration_ms,
+    ]
+    if include_items:
+        speech_fields.append(Speech.display_text)
+    speech_rows: list[Speech] = []
+    text_bytes = 0
+    speech_match_ids = list(participant_by_match)
+    if speech_match_ids:
+        speech_rank = func.row_number().over(
+            partition_by=Speech.match_id,
+            order_by=(Speech.started_at, Speech.created_at, Speech.id),
+        ).label("speech_rank")
+        ranked_speeches = (
+            select(Speech.id.label("speech_id"), speech_rank)
+            .where(Speech.match_id.in_(speech_match_ids), Speech.status == "FINALIZED")
+            .subquery()
+        )
+        speech_statement = (
+            select(Speech)
+            .options(load_only(*speech_fields))
+            .join(ranked_speeches, ranked_speeches.c.speech_id == Speech.id)
+            .where(ranked_speeches.c.speech_rank <= POSTMATCH_SPEECHES_PER_MATCH_MAX + 1)
+            .order_by(Speech.match_id, Speech.started_at, Speech.created_at, Speech.id)
+        )
+        speech_result = await session.stream_scalars(speech_statement)
+        try:
+            async for speech in speech_result:
+                if len(speech_rows) >= POSTMATCH_SPEECHES_TOTAL_MAX:
+                    raise APIError("survey_history_too_large")
+                if include_items:
+                    text_bytes += len((speech.display_text or "").encode("utf-8"))
+                    if text_bytes > POSTMATCH_ITEMS_TEXT_BYTES_MAX:
+                        raise APIError("survey_history_too_large")
+                speech_rows.append(speech)
+        finally:
+            await speech_result.close()
+    if len(speech_rows) > POSTMATCH_SPEECHES_TOTAL_MAX:
+        raise APIError("survey_history_too_large")
+    speeches_by_match: dict[UUID, list[Speech]] = {}
+    for speech in speech_rows:
+        speeches_by_match.setdefault(speech.match_id, []).append(speech)
+    for match_id, speeches in speeches_by_match.items():
+        if len(speeches) > POSTMATCH_SPEECHES_PER_MATCH_MAX:
+            raise APIError("survey_history_too_large")
+        # A task without a participant must not cause speech projection work.
+        if match_id not in participant_by_match:
+            speeches_by_match[match_id] = []
+
+    result: list[dict[str, Any]] = []
+    for row, match, room in task_match_rows:
+        participant = participant_by_match.get(row.match_id)
         items: list[dict[str, Any]] = []
+        visible_target_ids: set[str] = set()
         target_total = 0
         confirmed_total = 0
         scope = _annotation_scope(row.answers, status=row.status)
         if participant is not None:
-            speeches = list(
-                (
-                    await session.scalars(
-                        select(Speech)
-                        .where(
-                            Speech.match_id == row.match_id,
-                            Speech.status == "FINALIZED",
-                        )
-                        .order_by(Speech.started_at, Speech.created_at, Speech.id)
-                    )
-                ).all()
-            )
-            match_participants = list(
-                (
-                    await session.scalars(
-                        select(MatchParticipant).where(MatchParticipant.match_id == row.match_id)
-                    )
-                ).all()
-            )
-            human_names = {
-                value.user_id: value.display_name
-                for value in match_participants
-                if value.user_id is not None
-            }
-            agent_names = {
-                value.agent_profile_id: value.display_name
-                for value in match_participants
-                if value.agent_profile_id is not None
-            }
+            speeches = speeches_by_match.get(row.match_id, [])
+            human_names, agent_names = names_by_match.get(row.match_id, ({}, {}))
             subject_kinds = [
                 _speech_subject_kind(speech, user_id=user_id, participant_side=participant.side)
                 for speech in speeches
@@ -448,6 +569,7 @@ async def list_postmatch_tasks(session: AsyncSession, *, user_id: UUID) -> list[
                 subject_kinds=subject_kinds,
                 annotatable=annotatable,
             )
+            visible_target_ids = _visible_target_ids(speeches, annotatable, projections)
             target_ids = [
                 str(speech.id)
                 for speech, is_annotatable in zip(speeches, annotatable, strict=True)
@@ -467,6 +589,8 @@ async def list_postmatch_tasks(session: AsyncSession, *, user_id: UUID) -> list[
             ):
                 speech_id = str(speech.id)
                 visible, review_state = projection
+                if not include_items:
+                    continue
                 if row.status != "SUBMITTED" and review_state == "FUTURE":
                     continue
                 stage_position, stage_name, stage_kind = stage_meta
@@ -499,7 +623,6 @@ async def list_postmatch_tasks(session: AsyncSession, *, user_id: UUID) -> list[
                         "duration_ms": speech.audio_duration_ms,
                     }
                 )
-        visible_target_ids = {item["speech_id"] for item in items if item["annotatable"] is True}
         result.append(
             {
                 "id": str(row.id),
@@ -524,11 +647,30 @@ async def list_postmatch_tasks(session: AsyncSession, *, user_id: UUID) -> list[
                 "target_total": target_total,
                 "confirmed_total": confirmed_total,
                 "workflow_revision": _workflow_revision(row.answers),
-                "items": items,
+                "items": items if include_items else [],
                 "questionnaire": _postmatch_questionnaire(row),
             }
         )
-    return result
+    next_cursor = None
+    if has_more:
+        last_row = task_match_rows[-1][0]
+        next_cursor = (last_row.created_at, last_row.id)
+    return result, next_cursor
+
+
+async def list_postmatch_tasks(
+    session: AsyncSession,
+    *,
+    user_id: UUID,
+    limit: int = POSTMATCH_TASK_PAGE_DEFAULT,
+    include_items: bool = False,
+) -> list[dict[str, Any]]:
+    """Compatibility wrapper returning the first bounded page as an array."""
+
+    tasks, _ = await list_postmatch_tasks_page(
+        session, user_id=user_id, limit=limit, include_items=include_items
+    )
+    return tasks
 
 
 async def get_postmatch_task(
@@ -543,7 +685,9 @@ async def get_postmatch_task(
     )
     if task is None:
         raise APIError("survey_not_found")
-    tasks = await list_postmatch_tasks(session, user_id=user_id)
+    tasks, _ = await list_postmatch_tasks_page(
+        session, user_id=user_id, limit=1, task_id=task_id, include_items=True
+    )
     for item in tasks:
         if item["id"] == str(task_id):
             return item
@@ -598,9 +742,12 @@ def _validate_strict_speech_answer(
         return
     if q1 is not None and (
         not isinstance(q1, list)
-        or not 1 <= len(q1) <= 3
-        or len(set(q1)) != len(q1)
-        or any(not isinstance(item, str) or item not in AI_ACCEPTABLE_ACTIONS for item in q1)
+        or not 1 <= len(cast(list[object], q1)) <= 3
+        or len(set(cast(list[str], q1))) != len(cast(list[object], q1))
+        or any(
+            not isinstance(item, str) or item not in AI_ACCEPTABLE_ACTIONS
+            for item in cast(list[object], q1)
+        )
     ):
         raise APIError("survey_answer_invalid")
     if submit and (not isinstance(q1, list) or not q1):
@@ -951,14 +1098,9 @@ async def save_postmatch_task(
         )
         if task is None:
             raise APIError("survey_not_found")
-        previous_status = task.status
-        previous_answers = task.answers
         scope = _annotation_scope(task.answers, status=task.status)
         if task.status == "SUBMITTED":
-            # Re-opening is intentional for post-match review. Preserve the
-            # prior submitted snapshot in the audit trail before replacing it.
-            task.status = "IN_PROGRESS"
-            task.submitted_at = None
+            raise APIError("survey_locked")
         if stage not in (None, "overall", "speeches"):
             raise APIError("survey_answer_invalid")
         # Keep the retired combined-flow stage readable for historical clients.
@@ -1090,8 +1232,6 @@ async def save_postmatch_task(
             details={
                 "questionnaire_version": task.questionnaire_version,
                 "status": task.status,
-                "reopened_from_submitted": previous_status == "SUBMITTED",
-                "previous_answers": previous_answers if previous_status == "SUBMITTED" else None,
             },
         )
         # PostgreSQL expires server-generated onupdate columns after flush.

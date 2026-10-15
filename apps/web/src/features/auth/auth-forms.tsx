@@ -363,9 +363,7 @@ export function RegisterForm() {
         </fieldset>
         <label className="flex cursor-pointer items-center gap-3 rounded-xl border border-dashed border-blue-200 bg-blue-50/50 px-4 py-3 text-sm font-semibold text-slate-600">
           <Upload className="size-4 text-blue-600" aria-hidden="true" />
-          <span className="min-w-0 flex-1 truncate">
-            {file ? file.name : t('optionalAvatar')}
-          </span>
+          <span className="min-w-0 flex-1 truncate">{file ? file.name : t('optionalAvatar')}</span>
           <input
             className="sr-only"
             type="file"

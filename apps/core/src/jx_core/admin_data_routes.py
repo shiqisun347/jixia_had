@@ -10,8 +10,8 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, select
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import case, func, or_, select
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncSession, async_sessionmaker
 from sqlalchemy.sql.elements import ColumnElement
 
 from .audit.service import AuditService
@@ -19,17 +19,22 @@ from .auth.dependencies import get_admin_auth, get_database_session, require_bro
 from .auth.errors import APIError
 from .auth.session import AuthContext
 from .data_capture.content import load_content_blob
+from .data_capture.export_snapshot import create_frozen_export
+from .data_capture.provider_projection import (
+    capture_projection,
+    capture_projections,
+    project_capture,
+)
 from .models import (
-    AuditLog,
     BackgroundTask,
     ExperimentMatchAttempt,
     ExternalCall,
     Match,
     MatchEvent,
     MatchExport,
-    MatchExportItem,
     MatchFile,
     MatchParticipant,
+    ProviderCallCapture,
     Room,
     RoomConnectionLease,
     ScheduledMatch,
@@ -107,7 +112,8 @@ def _call_explanation(call_kind: str, status: str, error_code: str | None) -> di
     }
 
 
-def _call_view(item: ExternalCall) -> dict[str, Any]:
+def _call_view(item: ExternalCall, projection: dict[str, Any] | None = None) -> dict[str, Any]:
+    projection = projection if projection is not None else project_capture(item, None)
     explanation = _call_explanation(item.call_kind, item.status, item.error_code)
     return {
         "id": str(item.id),
@@ -121,21 +127,21 @@ def _call_view(item: ExternalCall) -> dict[str, Any]:
         "status": item.status,
         "status_label": CALL_STATUS_LABELS.get(item.status, item.status),
         "match_id": str(item.match_id) if item.match_id else None,
-        "capture_version": item.capture_version,
-        "captured_at": item.captured_at,
+        "capture_version": projection["capture_version"],
+        "captured_at": projection["captured_at"],
         "source_kind": item.source_kind,
         "source_resource_id": item.source_resource_id,
         "logical_call_id": str(item.logical_call_id) if item.logical_call_id else None,
-        "provider_request_id": item.provider_request_id,
-        "request_capture_status": item.request_capture_status,
-        "response_capture_status": item.response_capture_status,
-        "request_original_bytes": item.request_original_bytes,
-        "response_original_bytes": item.response_original_bytes,
-        "request_stored_bytes": item.request_stored_bytes,
-        "response_stored_bytes": item.response_stored_bytes,
-        "request_sha256": item.request_sha256,
-        "response_sha256": item.response_sha256,
-        "capture_error_code": item.capture_error_code,
+        "provider_request_id": projection["provider_request_id"],
+        "request_capture_status": projection["request_capture_status"],
+        "response_capture_status": projection["response_capture_status"],
+        "request_original_bytes": projection["request_original_bytes"],
+        "response_original_bytes": projection["response_original_bytes"],
+        "request_stored_bytes": projection["request_stored_bytes"],
+        "response_stored_bytes": projection["response_stored_bytes"],
+        "request_sha256": projection["request_sha256"],
+        "response_sha256": projection["response_sha256"],
+        "capture_error_code": projection["capture_error_code"],
         "speech_id": str(item.speech_id) if item.speech_id else None,
         "generation_id": str(item.agent_generation_id or item.generation_id)
         if item.agent_generation_id or item.generation_id
@@ -153,8 +159,8 @@ def _call_view(item: ExternalCall) -> dict[str, Any]:
         "audio_bytes": item.audio_bytes,
         "audio_duration_ms": item.audio_duration_ms,
         "error_code": item.error_code,
-        "has_request": item.request_blob_id is not None,
-        "has_response": item.response_blob_id is not None,
+        "has_request": projection["request_blob_id"] is not None,
+        "has_response": projection["response_blob_id"] is not None,
         "explanation": explanation,
     }
 
@@ -407,7 +413,8 @@ async def workbench_calls(
         .scalars()
         .all()
     )
-    return _paged([_call_view(item) for item in rows], page, page_size, total)
+    projections = await capture_projections(session, rows)
+    return _paged([_call_view(item, projections[item.id]) for item in rows], page, page_size, total)
 
 
 @router.get("/external-calls")
@@ -434,7 +441,12 @@ async def list_external_calls(
     order: str = Query("desc"),
 ) -> dict[str, Any]:
     page, page_size = _page(page, page_size)
-    filters: list[ColumnElement[bool]] = [ExternalCall.capture_version.is_not(None)]
+    filters: list[ColumnElement[bool]] = [
+        or_(
+            ExternalCall.capture_version.is_not(None),
+            ExternalCall.capture_storage_mode == "ASYNC_V1",
+        )
+    ]
     if call_kind:
         filters.append(ExternalCall.call_kind == call_kind.upper())
     if source_kind:
@@ -458,7 +470,14 @@ async def list_external_calls(
     if logical_call_id is not None:
         filters.append(ExternalCall.logical_call_id == logical_call_id)
     if provider_request_id:
-        filters.append(ExternalCall.provider_request_id == provider_request_id)
+        filters.append(
+            case(
+                (ProviderCallCapture.id.is_not(None), ProviderCallCapture.provider_request_id),
+                (ExternalCall.capture_storage_mode == "ASYNC_V1", None),
+                else_=ExternalCall.provider_request_id,
+            )
+            == provider_request_id
+        )
     if since is not None:
         filters.append(ExternalCall.started_at >= since)
     if until is not None:
@@ -471,6 +490,7 @@ async def list_external_calls(
         raise APIError("admin_query_invalid")
     base = (
         select(ExternalCall)
+        .outerjoin(ProviderCallCapture, ProviderCallCapture.external_call_id == ExternalCall.id)
         .outerjoin(Match, Match.id == ExternalCall.match_id)
         .outerjoin(Room, Room.id == Match.room_id)
         .outerjoin(ExperimentMatchAttempt, ExperimentMatchAttempt.match_id == Match.id)
@@ -488,7 +508,8 @@ async def list_external_calls(
             )
         ).all()
     )
-    return _paged([_call_view(item) for item in rows], page, page_size, total)
+    projections = await capture_projections(session, rows)
+    return _paged([_call_view(item, projections[item.id]) for item in rows], page, page_size, total)
 
 
 @router.get("/external-calls/{call_id}")
@@ -500,13 +521,14 @@ async def external_call_detail(
     call = await session.get(ExternalCall, call_id)
     if call is None:
         raise APIError("admin_call_not_found")
-    detail = _call_view(call)
+    projection = await capture_projection(session, call)
+    detail = _call_view(call, projection)
     request_payload: Any = None
     response_payload: Any = None
     content_errors: list[str] = []
     for field_name, blob_id in (
-        ("request", call.request_blob_id),
-        ("response", call.response_blob_id),
+        ("request", projection["request_blob_id"]),
+        ("response", projection["response_blob_id"]),
     ):
         if blob_id is None:
             continue
@@ -530,8 +552,12 @@ async def external_call_detail(
                 "agent_generation_id": (
                     str(call.agent_generation_id) if call.agent_generation_id else None
                 ),
-                "request_blob_id": str(call.request_blob_id) if call.request_blob_id else None,
-                "response_blob_id": str(call.response_blob_id) if call.response_blob_id else None,
+                "request_blob_id": str(projection["request_blob_id"])
+                if projection["request_blob_id"]
+                else None,
+                "response_blob_id": str(projection["response_blob_id"])
+                if projection["response_blob_id"]
+                else None,
             },
         }
     )
@@ -661,45 +687,16 @@ async def create_export(
     context: Annotated[AuthContext, Depends(get_admin_auth)],
     session: Annotated[AsyncSession, Depends(get_database_session)],
 ) -> dict[str, Any]:
-    rows = await _export_rows(session, payload.match_ids)
-    export = MatchExport(
-        created_by_user_id=context.user_id,
+    # The authentication session may already have executed SQL. Freeze all
+    # export inputs in a separate explicit MVCC transaction from its engine.
+    bind = session.bind
+    engine = bind.engine if isinstance(bind, AsyncConnection) else bind
+    export = await create_frozen_export(
+        async_sessionmaker(engine, expire_on_commit=False),
+        match_ids=payload.match_ids,
         include_audio=payload.include_audio,
-        total_items=len(rows),
-        scope={"kind": "ids", "match_ids": [str(item.id) for item in rows]},
-    )
-    session.add(export)
-    await session.flush()
-    for match in rows:
-        session.add(
-            MatchExportItem(
-                export_id=export.id,
-                match_id=match.id,
-                match_status=match.status,
-                cutoff_sequence=match.sequence,
-                cutoff_context_version=match.context_version,
-            )
-        )
-    session.add(
-        BackgroundTask(
-            task_type="MATCH_EXPORT",
-            payload={"export_id": str(export.id)},
-            status="PENDING",
-            attempts=0,
-            max_attempts=2,
-            available_at=datetime.now(UTC),
-        )
-    )
-    AuditLogEntry = AuditLog(
         actor_user_id=context.user_id,
-        action="admin.export.created",
-        target_type="match_export",
-        target_id=str(export.id),
-        result="SUCCESS",
-        details={"total_items": len(rows), "include_audio": payload.include_audio},
     )
-    session.add(AuditLogEntry)
-    await session.commit()
     return {
         "id": str(export.id),
         "status": export.status,

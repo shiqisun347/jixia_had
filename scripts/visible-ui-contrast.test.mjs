@@ -10,7 +10,7 @@ const checks = [
   },
   {
     path: 'apps/web/src/features/leaderboard/leaderboard-page.tsx',
-    required: /每日排名快照生成后会显示在这里。<\/p>/,
+    required: /className="mt-2 text-xs text-slate-500">\{t\('emptyDetail'\)\}<\/p>/,
     forbidden: /text-xs text-slate-400">每日排名快照/,
     label: 'leaderboard empty-state explanation',
   },

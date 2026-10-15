@@ -64,11 +64,7 @@ type AdminRefreshButtonProps = Omit<AdminButtonProps, 'loading' | 'onClick'> & {
   onRefresh: () => Promise<unknown>;
 };
 
-export function AdminRefreshButton({
-  label,
-  onRefresh,
-  ...props
-}: AdminRefreshButtonProps) {
+export function AdminRefreshButton({ label, onRefresh, ...props }: AdminRefreshButtonProps) {
   const t = useAppTranslations('Admin');
   const resolvedLabel = label ?? t('common.refresh');
   const { isPending, run } = useSingleFlight();
@@ -96,15 +92,24 @@ export function StatusBadge({ status }: { status: string }) {
     string,
     { label: string; tone: 'green' | 'amber' | 'red' | 'blue' | 'neutral' }
   > = {
-    ACTIVE: { label: c('enabled'), tone: 'green' }, ENABLED: { label: c('enabled'), tone: 'green' },
-    READY: { label: c('ready'), tone: 'green' }, NOT_CALIBRATED: { label: c('needsCalibration'), tone: 'amber' },
-    STALE: { label: c('recalibrate'), tone: 'amber' }, FINISHED: { label: c('finished'), tone: 'blue' },
-    SUCCEEDED: { label: c('success'), tone: 'green' }, START_PENDING_RUNTIME: { label: c('waitingRuntime'), tone: 'amber' },
-    START_COUNTDOWN: { label: c('countdown'), tone: 'blue' }, RUNNING: { label: c('running'), tone: 'blue' },
-    PAUSED: { label: c('paused'), tone: 'amber' }, SYSTEM_RECOVERY: { label: c('systemRecovery'), tone: 'amber' },
-    ERROR: { label: c('error'), tone: 'red' }, PENDING: { label: c('pending'), tone: 'amber' },
-    GENERATING_AUDIO: { label: c('generating'), tone: 'amber' }, DISABLED: { label: c('disabled'), tone: 'neutral' },
-    TERMINATED: { label: c('terminated'), tone: 'red' }, FAILED: { label: c('failed'), tone: 'red' },
+    ACTIVE: { label: c('enabled'), tone: 'green' },
+    ENABLED: { label: c('enabled'), tone: 'green' },
+    READY: { label: c('ready'), tone: 'green' },
+    NOT_CALIBRATED: { label: c('needsCalibration'), tone: 'amber' },
+    STALE: { label: c('recalibrate'), tone: 'amber' },
+    FINISHED: { label: c('finished'), tone: 'blue' },
+    SUCCEEDED: { label: c('success'), tone: 'green' },
+    START_PENDING_RUNTIME: { label: c('waitingRuntime'), tone: 'amber' },
+    START_COUNTDOWN: { label: c('countdown'), tone: 'blue' },
+    RUNNING: { label: c('running'), tone: 'blue' },
+    PAUSED: { label: c('paused'), tone: 'amber' },
+    SYSTEM_RECOVERY: { label: c('systemRecovery'), tone: 'amber' },
+    ERROR: { label: c('error'), tone: 'red' },
+    PENDING: { label: c('pending'), tone: 'amber' },
+    GENERATING_AUDIO: { label: c('generating'), tone: 'amber' },
+    DISABLED: { label: c('disabled'), tone: 'neutral' },
+    TERMINATED: { label: c('terminated'), tone: 'red' },
+    FAILED: { label: c('failed'), tone: 'red' },
   };
   const item = map[status] ?? { label: status, tone: 'neutral' as const };
   return (
@@ -183,9 +188,7 @@ export function AdminPagination({
   if (totalPages <= 1) return null;
   return (
     <div className="mt-4 flex flex-wrap items-center justify-between gap-3 border-t border-slate-100 pt-4 text-xs font-semibold text-slate-600">
-      <span>
-        {t('common.page', { page, totalPages, total })}
-      </span>
+      <span>{t('common.page', { page, totalPages, total })}</span>
       <div className="flex gap-2">
         <AdminButton
           disabled={page <= 1}
@@ -208,13 +211,7 @@ export function AdminPagination({
   );
 }
 
-export function AdminActionMenu({
-  label,
-  children,
-}: {
-  label?: string;
-  children: ReactNode;
-}) {
+export function AdminActionMenu({ label, children }: { label?: string; children: ReactNode }) {
   const t = useAppTranslations('Admin');
   const resolvedLabel = label ?? t('common.moreActions');
   return (
@@ -325,7 +322,7 @@ export function AdminDrawer({
               </Dialog.Title>
               {description ? (
                 <Dialog.Description className="mt-1 text-xs leading-5 text-slate-500">
-                {translateAdminText(description, locale)}
+                  {translateAdminText(description, locale)}
                 </Dialog.Description>
               ) : null}
             </div>

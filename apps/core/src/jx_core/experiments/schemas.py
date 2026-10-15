@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import datetime
 from typing import Any, Literal
 from uuid import UUID
@@ -307,11 +308,22 @@ class ParticipantAnnotationAnswerSaveRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     stage: Literal[1, 2]
-    answers: dict[str, Any]
+    answers: dict[str, Any] = Field(max_length=4)
     client_version: int = Field(ge=1)
     response_duration_ms: int | None = Field(default=None, ge=0)
     audio_play_count: int = Field(default=0, ge=0)
     lock_stage: bool = False
+
+    @field_validator("answers")
+    @classmethod
+    def bound_answer_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
+        try:
+            encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        except (TypeError, ValueError) as error:
+            raise ValueError("答案格式不正确") from error
+        if len(encoded) > 64 * 1024:
+            raise ValueError("答案内容超过 64 KiB 限制")
+        return value
 
 
 class ParticipantQuestionnaireSubmitRequest(BaseModel):

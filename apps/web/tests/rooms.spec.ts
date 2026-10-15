@@ -72,7 +72,7 @@ function roomSnapshot(
     is_all_agent: false,
     sequence: ready ? 4 : 3,
     topic: { title: topic.title },
-    rule: { name: rule.name, side_size: 1 },
+    rule: { name: formal4v4Rule.name, side_size: 4 },
     match_id: null,
     viewer_membership_state: 'ACTIVE',
     viewer_member_role: 'DEBATER',
@@ -114,6 +114,21 @@ function roomSnapshot(
         occupant_name: '乾元',
         occupant_avatar_key: 'agent-01',
       },
+      ...(['AFFIRMATIVE', 'NEGATIVE'] as const).flatMap((side, sideIndex) =>
+        [2, 3, 4].map((seatNo) => {
+          const agentNo = sideIndex * 3 + seatNo;
+          return {
+            id: `50000000-0000-4000-8000-${String(agentNo + 10).padStart(12, '0')}`,
+            side,
+            seat_no: seatNo,
+            occupant_type: 'AGENT',
+            user_id: null,
+            agent_profile_id: `60000000-0000-4000-8000-${String(agentNo).padStart(12, '0')}`,
+            occupant_name: `Agent-${side === 'AFFIRMATIVE' ? '正' : '反'}${seatNo}`,
+            occupant_avatar_key: `agent-${String(agentNo).padStart(2, '0')}`,
+          };
+        }),
+      ),
     ],
   };
 }
@@ -257,6 +272,8 @@ test('room creation submits the selected rule, topic and automatic Agent fill', 
       title: '浏览器创建测试',
       rule_id: formal4v4RuleId,
       topic_id: topicId,
+      is_all_agent: false,
+      auto_fill_agents: true,
       human_participation_terms_version: 'human-participation-v1',
     });
     expect(payload).not.toHaveProperty('organizer_seat');
@@ -273,11 +290,10 @@ test('room creation submits the selected rule, topic and automatic Agent fill', 
   await expect(page.getByText('比赛信息', { exact: true })).toBeVisible();
   await expect(page.getByRole('group', { name: /2\s*选择辩题/ })).toBeVisible();
   await page.getByLabel('比赛名称').fill('浏览器创建测试');
-  await expect(page.getByLabel('赛制')).toHaveValue(formal4v4RuleId);
-  await expect(page.getByLabel('赛制').getByRole('option', { name: /1v1/ })).toHaveCount(0);
-  await expect(page.getByLabel('赛制').getByRole('option', { name: '选择已启用赛制' })).toHaveCount(
-    0,
-  );
+  const ruleSelect = page.getByRole('combobox', { name: /^赛制/ });
+  await expect(ruleSelect).toHaveValue(formal4v4RuleId);
+  await expect(ruleSelect.getByRole('option', { name: /1v1/ })).toHaveCount(0);
+  await expect(ruleSelect.getByRole('option', { name: '选择已启用赛制' })).toHaveCount(0);
   await page.getByRole('button', { name: '创建并进入房间' }).click();
   const topicSelect = page.getByLabel(/选择辩题/);
   await expect(topicSelect).toHaveAttribute('aria-invalid', 'true');
@@ -298,7 +314,7 @@ test('room creation submits the selected rule, topic and automatic Agent fill', 
   await expect(page.getByRole('region', { name: '邀请加入' })).toBeVisible();
   await expect(page.getByText(/Agent 席位恢复/)).toHaveCount(0);
   await expect(page.getByLabel('邀请链接')).toHaveValue(/\/join\/JX8K2M$/);
-  await expect(page.getByRole('button', { name: '开始比赛' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: '进入候场' })).toBeDisabled();
   await expect(page.getByText('浏览器房间用户尚未完成设备检测与准备')).toBeVisible();
   await expect(page.getByRole('button', { name: '退出房间' })).toHaveCSS(
     'color',
@@ -352,7 +368,7 @@ test('room creation keeps the form and allows retry after a failed request', asy
   await page.getByLabel('比赛名称').fill('失败后重试测试');
   await page.getByLabel('选择辩题').selectOption(topicId);
   await page.getByRole('button', { name: '创建并进入房间' }).click();
-  await expect(page.getByRole('region', { name: '操作提示' }).getByRole('alert')).toContainText(
+  await expect(page.getByRole('region', { name: '连接错误' }).getByRole('alert')).toContainText(
     '房间创建服务暂时不可用',
   );
   await expect(page.getByLabel('比赛名称')).toHaveValue('失败后重试测试');
@@ -361,7 +377,9 @@ test('room creation keeps the form and allows retry after a failed request', asy
   expect(createRequests).toBe(2);
 });
 
-test('starting a room is single-flight across the lock and runtime requests', async ({ page }) => {
+test('entering staging is single-flight across the room lock and runtime requests', async ({
+  page,
+}) => {
   await installCommonRoutes(page);
   const matchId = '90000000-0000-4000-8000-000000000001';
   const waiting = roomSnapshot(true);
@@ -378,14 +396,14 @@ test('starting a room is single-flight across the lock and runtime requests', as
     currentSnapshot = starting;
     await route.fulfill({ json: starting });
   });
-  await page.route(`**/api/rooms/${roomId}/runtime-start`, async (route) => {
+  await page.route(`**/api/rooms/${roomId}/prepare-match`, async (route) => {
     runtimeRequests += 1;
     await new Promise((resolve) => setTimeout(resolve, 150));
     await route.fulfill({ json: { match_id: matchId } });
   });
 
   await page.goto(`/rooms/${roomId}`);
-  await page.getByRole('button', { name: '开始比赛' }).evaluate((button) => {
+  await page.getByRole('button', { name: '进入候场' }).evaluate((button) => {
     (button as HTMLButtonElement).click();
     (button as HTMLButtonElement).click();
   });
@@ -418,17 +436,17 @@ test('a failed room lock releases start and allows the complete flow to retry', 
     currentSnapshot = starting;
     await route.fulfill({ json: starting });
   });
-  await page.route(`**/api/rooms/${roomId}/runtime-start`, (route) =>
+  await page.route(`**/api/rooms/${roomId}/prepare-match`, (route) =>
     route.fulfill({ json: { match_id: matchId } }),
   );
 
   await page.goto(`/rooms/${roomId}`);
-  await page.getByRole('button', { name: '开始比赛' }).click();
-  await expect(page.getByRole('region', { name: '操作提示' }).getByRole('alert')).toContainText(
+  await page.getByRole('button', { name: '进入候场' }).click();
+  await expect(page.getByRole('region', { name: '连接错误' }).getByRole('alert')).toContainText(
     '暂时无法开始比赛',
   );
-  await expect(page.getByRole('button', { name: '开始比赛' })).toBeEnabled();
-  await page.getByRole('button', { name: '开始比赛' }).click();
+  await expect(page.getByRole('button', { name: '进入候场' })).toBeEnabled();
+  await page.getByRole('button', { name: '进入候场' }).click();
   await expect(page).toHaveURL(`/debate?match_id=${matchId}`);
   expect(startRequests).toBe(2);
 });
@@ -449,7 +467,7 @@ test('runtime start failure resumes without locking the room again', async ({ pa
     currentSnapshot = starting;
     return route.fulfill({ json: starting });
   });
-  await page.route(`**/api/rooms/${roomId}/runtime-start`, async (route) => {
+  await page.route(`**/api/rooms/${roomId}/prepare-match`, async (route) => {
     runtimeRequests += 1;
     if (runtimeRequests === 1) {
       await route.fulfill({
@@ -462,12 +480,13 @@ test('runtime start failure resumes without locking the room again', async ({ pa
   });
 
   await page.goto(`/rooms/${roomId}`);
-  await page.getByRole('button', { name: '开始比赛' }).click();
-  await expect(page.getByRole('region', { name: '操作提示' }).getByRole('alert')).toContainText(
+  await page.getByRole('button', { name: '进入候场' }).click();
+  await expect(page.getByRole('region', { name: '连接错误' }).getByRole('alert')).toContainText(
     '运行时启动失败',
   );
-  await expect(page.getByRole('button', { name: '继续启动比赛' })).toBeEnabled();
-  await page.getByRole('button', { name: '继续启动比赛' }).click();
+  await expect(page.getByText('候场中', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: '进入候场' })).toBeEnabled();
+  await page.getByRole('button', { name: '进入候场' }).click();
   await expect(page).toHaveURL(`/debate?match_id=${matchId}`);
   expect(startRequests).toBe(1);
   expect(runtimeRequests).toBe(2);
@@ -501,6 +520,7 @@ test('ready debater changes seat without another device check', async ({ page })
         agent_profile_id: null,
         occupant_name: user.real_name,
       },
+      ...initial.seats.slice(2),
     ],
   };
   let deviceCalls = 0;
@@ -617,7 +637,7 @@ test('device check save failure explains the next action and remains retryable',
   );
   await page.goto(`/rooms/${roomId}`);
   await page.getByRole('button', { name: /开始设备检测/ }).click();
-  await expect(page.getByRole('region', { name: '操作提示' }).getByRole('alert')).toContainText(
+  await expect(page.getByRole('region', { name: '连接错误' }).getByRole('alert')).toContainText(
     '检测结果保存失败，请重新检测后再试。',
   );
   await expect(page.getByRole('button', { name: /重新检测/ })).toBeEnabled();
@@ -661,7 +681,7 @@ test('ready failure keeps the saved check available for a short retry', async ({
   await page.goto(`/rooms/${roomId}`);
   await page.getByRole('button', { name: /开始设备检测/ }).click();
   await expect(page.getByText('上次检测仍有效')).toBeVisible();
-  await expect(page.getByRole('region', { name: '操作提示' }).getByRole('alert')).toContainText(
+  await expect(page.getByRole('region', { name: '连接错误' }).getByRole('alert')).toContainText(
     '检测已保存，但准备状态更新失败。请点击“直接使用检测并准备”重试。',
   );
   await expect(page.getByRole('button', { name: '直接使用检测并准备' })).toBeEnabled();

@@ -49,7 +49,7 @@ function scheduleMatches() {
   }));
 }
 
-test('admin completes the v2.1 experiment setup workflow', async ({ page }) => {
+test.skip('legacy UI retired: admin v2.1 experiment setup workflow', async ({ page }) => {
   let generated = false;
   let rosterSaved = false;
   let published = false;
@@ -344,7 +344,9 @@ test('admin completes the v2.1 experiment setup workflow', async ({ page }) => {
   expect(disabled).toBe(true);
 });
 
-test('admin creates edits and deletes an experiment draft', async ({ page }) => {
+test.skip('legacy UI retired: admin creates edits and deletes an experiment draft', async ({
+  page,
+}) => {
   await page.setViewportSize({ width: 390, height: 844 });
   let batches: ReturnType<typeof batch>[] = [];
   await page.route('**/api/auth/me', (route) =>
@@ -470,7 +472,7 @@ test('admin creates edits and deletes an experiment draft', async ({ page }) => 
   );
 });
 
-test('participant enters a fixed room without an online research consent step', async ({
+test.skip('legacy UI retired: participant enters a fixed room without an online research consent step', async ({
   page,
 }) => {
   const scheduledMatchId = '47000000-0000-4000-8000-000000000001';
@@ -555,4 +557,45 @@ test('participant enters a fixed room without an online research consent step', 
   await page.getByRole('button', { name: '进入固定房间' }).click();
   await expect(page).toHaveURL(`/rooms/${roomId}`);
   expect(enterPayload).toEqual({ human_participation_terms_version: 'human-participation-v1' });
+});
+
+test('legacy admin experiment entry redirects to current match management', async ({ page }) => {
+  await page.route('**/api/auth/me', (route) =>
+    route.fulfill({
+      json: {
+        user: {
+          id: '00000000-0000-4000-8000-000000000001',
+          username: 'legacy-entry-user',
+          real_name: '历史入口测试用户',
+          role: 'ADMIN',
+          status: 'ACTIVE',
+          must_change_password: false,
+          default_avatar_key: 'human-01',
+          avatar_version: 0,
+          has_custom_avatar: false,
+        },
+      },
+    }),
+  );
+  await page.route('**/api/admin/matches*', (route) =>
+    route.fulfill({ json: { items: [], page: 1, page_size: 25, total: 0, total_pages: 0 } }),
+  );
+  await page.goto('/admin/experiments');
+  await expect(page).toHaveURL(/\/admin\/matches$/);
+  await expect(page.getByRole('heading', { name: '比赛与数据' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '论文实验管理' })).toHaveCount(0);
+});
+
+test('legacy participant experiment entry redirects to the public lobby', async ({ page }) => {
+  await page.route('**/api/auth/me', (route) =>
+    route.fulfill({
+      status: 401,
+      json: { error: { code: 'not_authenticated', message: '请先登录' } },
+    }),
+  );
+  await page.route('**/api/lobby/rooms', (route) => route.fulfill({ json: [] }));
+  await page.goto('/experiments');
+  await expect(page).toHaveURL(/\/lobby$/);
+  await expect(page.getByRole('heading', { name: '继续你的辩论' })).toBeVisible();
+  await expect(page.getByRole('heading', { name: '我的实验安排' })).toHaveCount(0);
 });

@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import struct
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal, cast
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Request, Response
+from fastapi import APIRouter, Depends, Query, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -63,6 +66,23 @@ from .service import ExperimentService
 
 router = APIRouter(tags=["experiments"])
 service = ExperimentService()
+
+
+def _encode_task_cursor(value: tuple[datetime, UUID]) -> str:
+    payload = f"{value[0].isoformat()}|{value[1]}"
+    return base64.urlsafe_b64encode(payload.encode("utf-8")).decode("ascii").rstrip("=")
+
+
+def _decode_task_cursor(value: str) -> tuple[datetime, UUID]:
+    try:
+        padded = value + "=" * (-len(value) % 4)
+        timestamp, task_id = base64.urlsafe_b64decode(padded).decode("utf-8").rsplit("|", 1)
+        parsed = datetime.fromisoformat(timestamp)
+        if parsed.tzinfo is None:
+            raise ValueError
+        return parsed, UUID(task_id)
+    except (ValueError, UnicodeDecodeError, binascii.Error):
+        raise APIError("experiment_query_invalid") from None
 
 
 def _wav_header(data_size: int) -> bytes:
@@ -182,8 +202,14 @@ async def experiment_capabilities(request: Request) -> ExperimentCapabilitiesRes
 async def list_experiment_batches(
     _: Annotated[AuthContext, Depends(get_admin_auth)],
     session: Annotated[AsyncSession, Depends(get_database_session)],
+    response: Response,
+    limit: int = Query(default=ExperimentService.EXPERIMENT_PAGE_DEFAULT, ge=1, le=50),
+    cursor: str | None = Query(default=None, max_length=512),
 ) -> list[ExperimentBatch]:
-    return await service.list_batches(session)
+    rows, next_cursor = await service.list_batches_page(session, limit=limit, cursor=cursor)
+    if next_cursor:
+        response.headers["X-Next-Cursor"] = next_cursor
+    return rows
 
 
 @router.post(
@@ -627,8 +653,16 @@ async def download_experiment_export(
 async def list_my_experiment_appointments(
     auth: Annotated[AuthContext, Depends(get_changed_password_auth)],
     session: Annotated[AsyncSession, Depends(get_database_session)],
+    response: Response,
+    limit: int = Query(default=ExperimentService.EXPERIMENT_PAGE_DEFAULT, ge=1, le=50),
+    cursor: str | None = Query(default=None, max_length=512),
 ) -> list[ExperimentAppointmentResponse]:
-    return await service.list_appointments(session, user_id=auth.user_id)
+    rows, next_cursor = await service.list_appointments_page(
+        session, user_id=auth.user_id, limit=limit, cursor=cursor
+    )
+    if next_cursor:
+        response.headers["X-Next-Cursor"] = next_cursor
+    return rows
 
 
 @router.post(
@@ -661,8 +695,21 @@ async def enter_experiment_appointment(
 async def list_my_annotation_tasks(
     auth: Annotated[AuthContext, Depends(get_changed_password_auth)],
     session: Annotated[AsyncSession, Depends(get_database_session)],
+    response: Response,
+    limit: int = Query(
+        default=ExperimentService.ANNOTATION_PAGE_DEFAULT,
+        ge=1,
+        le=ExperimentService.ANNOTATION_PAGE_MAX,
+    ),
+    cursor: str = Query(default="", max_length=256),
 ) -> list[ParticipantAnnotationTaskResponse]:
-    return await service.list_participant_tasks(session, user_id=auth.user_id)
+    cursor_value = _decode_task_cursor(cursor) if cursor else None
+    tasks, next_cursor = await service.list_participant_tasks_page(
+        session, user_id=auth.user_id, limit=limit, cursor=cursor_value
+    )
+    if next_cursor is not None:
+        response.headers["X-Next-Cursor"] = _encode_task_cursor(next_cursor)
+    return tasks
 
 
 @router.get("/api/experiments/tasks/{task_id}/audio/{speech_id}")
@@ -744,8 +791,21 @@ async def submit_annotation_task(
 async def list_my_expert_tasks(
     auth: Annotated[AuthContext, Depends(get_changed_password_auth)],
     session: Annotated[AsyncSession, Depends(get_database_session)],
+    response: Response,
+    limit: int = Query(
+        default=ExperimentService.ANNOTATION_PAGE_DEFAULT,
+        ge=1,
+        le=ExperimentService.ANNOTATION_PAGE_MAX,
+    ),
+    cursor: str = Query(default="", max_length=256),
 ) -> list[ExpertAnnotationTaskResponse]:
-    return await service.list_expert_tasks(session, user_id=auth.user_id)
+    cursor_value = _decode_task_cursor(cursor) if cursor else None
+    tasks, next_cursor = await service.list_expert_tasks_page(
+        session, user_id=auth.user_id, limit=limit, cursor=cursor_value
+    )
+    if next_cursor is not None:
+        response.headers["X-Next-Cursor"] = _encode_task_cursor(next_cursor)
+    return tasks
 
 
 @router.get("/api/experiments/expert-tasks/{task_id}/audio/{speech_id}")

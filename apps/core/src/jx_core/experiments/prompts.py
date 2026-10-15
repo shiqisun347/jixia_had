@@ -47,6 +47,7 @@ def render_experiment_decision_prompt(
     side_remaining_ms: int,
     opponent_remaining_ms: int,
     history: Sequence[Mapping[str, Any]],
+    history_reference: str | None = None,
 ) -> str:
     position = _position(side)
     stance = affirmative_stance if side == "AFFIRMATIVE" else negative_stance
@@ -76,7 +77,7 @@ def render_experiment_decision_prompt(
 对方剩余时间：{opponent_remaining_ms}
 
 完整辩论记录（JSON 数组，按阶段分组）：
-{render_history(history)}
+{history_reference if history_reference is not None else render_history(history)}
 
 # 任务
 
@@ -99,6 +100,7 @@ def render_experiment_speech_prompt(
     opponent_remaining_ms: int,
     max_speech_seconds: int,
     history: Sequence[Mapping[str, Any]],
+    history_reference: str | None = None,
 ) -> str:
     position = _position(side)
     stance = affirmative_stance if side == "AFFIRMATIVE" else negative_stance
@@ -125,7 +127,7 @@ def render_experiment_speech_prompt(
 对方剩余时间：{opponent_remaining_ms}
 
 完整辩论记录（JSON 数组，按阶段分组）：
-{render_history(history)}
+{history_reference if history_reference is not None else render_history(history)}
 
 # 任务
 

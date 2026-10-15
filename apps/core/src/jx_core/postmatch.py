@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 from copy import deepcopy
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
@@ -15,8 +16,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from .agent.llm import LlmCapacityLimiter, LlmProviderError, OpenAIStreamingClient
 from .config import Settings
 from .data_capture.content import CAPTURE_VERSION, store_content_blob
-from .data_capture.provider import PROVIDER_CAPTURE_VERSION, ProviderCallCapture
-from .data_capture.provider_persistence import persist_provider_capture
+from .data_capture.provider import PROVIDER_CAPTURE_VERSION
+from .data_capture.provider_writer import (
+    CaptureSubmission,
+    ProviderCaptureWriter,
+    new_provider_capture,
+    prepare_capture,
+    submit_capture,
+)
 from .experiments.prompts import render_history
 from .models import (
     ExternalCall,
@@ -29,6 +36,114 @@ from .models import (
     Speech,
 )
 from .security.crypto import decrypt_secret
+
+JUDGE_HISTORY_CHAR_BUDGET = 24_000
+JUDGE_HISTORY_RECORD_LIMIT = 128
+JUDGE_TASK_CANCEL_TIMEOUT_SECONDS = 3.0
+JUDGE_CLIENT_CLOSE_TIMEOUT_SECONDS = 3.0
+JUDGE_TEAM_SCORE_LIMITS = {
+    "argument": 30,
+    "rebuttal": 25,
+    "evidence": 20,
+    "teamwork": 15,
+    "expression": 10,
+}
+JUDGE_PARTICIPANT_SCORE_MAX = 20
+logger = logging.getLogger("jx-core.postmatch")
+
+
+def _judge_response_format(participant_ids: set[str]) -> dict[str, Any]:
+    def object_schema(properties: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "type": "object",
+            "properties": properties,
+            "required": list(properties),
+            "additionalProperties": False,
+        }
+
+    team = object_schema(
+        {
+            name: {"type": "number", "minimum": 0, "maximum": maximum}
+            for name, maximum in JUDGE_TEAM_SCORE_LIMITS.items()
+        }
+    )
+    comment = {"type": "string", "maxLength": 40}
+    schema = object_schema(
+        {
+            "winner": {"type": "string", "enum": ["AFFIRMATIVE", "NEGATIVE", "DRAW"]},
+            "team_scores": object_schema({side: team for side in ("AFFIRMATIVE", "NEGATIVE")}),
+            "participants": {
+                "type": "array",
+                "minItems": len(participant_ids),
+                "maxItems": len(participant_ids),
+                "items": object_schema(
+                    {
+                        "participant_id": {"type": "string", "enum": sorted(participant_ids)},
+                        "score": {
+                            "type": "number",
+                            "minimum": 0,
+                            "maximum": JUDGE_PARTICIPANT_SCORE_MAX,
+                        },
+                        "comment": comment,
+                    }
+                ),
+            },
+            "team_comments": object_schema({side: comment for side in ("AFFIRMATIVE", "NEGATIVE")}),
+        }
+    )
+    return {
+        "type": "json_schema",
+        "json_schema": {"name": "jixia_judge_result", "strict": True, "schema": schema},
+    }
+
+
+def _judge_output_contract() -> str:
+    limits = "、".join(f"{key}上限{maximum}" for key, maximum in JUDGE_TEAM_SCORE_LIMITS.items())
+    return (
+        "\n评分输出契约：只返回winner、team_scores、participants、team_comments四个JSON字段。"
+        "双方side为AFFIRMATIVE/NEGATIVE，winner另允许DRAW。"
+        f"team_scores每方{limits}，所有分数下限0。"
+        "participants必须恰好包含输入的所有participant_id各一次，使用原稳定ID，"
+        f"score范围0到{JUDGE_PARTICIPANT_SCORE_MAX}。"
+        "每名辩手comment和每方team_comments各用一句话，不超过40字。"
+    )
+
+
+def _consume_judge_cleanup(task: asyncio.Task[None]) -> None:
+    try:
+        task.exception()
+    except BaseException:
+        pass
+
+
+async def _close_judge_client(client: OpenAIStreamingClient) -> None:
+    """Close without holding capacity or masking the provider's failure."""
+
+    task = asyncio.create_task(client.close(), name="judge-client-close")
+    try:
+        done, _ = await asyncio.wait({task}, timeout=JUDGE_CLIENT_CLOSE_TIMEOUT_SECONDS)
+    except asyncio.CancelledError:
+        task.cancel()
+        task.add_done_callback(_consume_judge_cleanup)
+        raise
+    if not done:
+        task.cancel()
+        task.add_done_callback(_consume_judge_cleanup)
+        logger.warning(
+            "post-match judge client cleanup timed out",
+            extra={"error_code": "judge_client_cleanup_timeout"},
+        )
+        return
+    try:
+        task.result()
+    except BaseException as error:
+        logger.warning(
+            "post-match judge client cleanup failed",
+            extra={
+                "error_code": "judge_client_cleanup_failed",
+                "exception_type": type(error).__name__,
+            },
+        )
 
 
 def _stage_name_for_action(action_key: str, snapshot: dict[str, Any] | None) -> str:
@@ -44,6 +159,30 @@ def _stage_name_for_action(action_key: str, snapshot: dict[str, Any] | None) -> 
             if int(typed_stage.get("position", 0)) == position:
                 return str(typed_stage.get("name") or f"第 {position} 阶段")
     return f"第 {position} 阶段"
+
+
+def _bound_judge_history(history: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    remaining = JUDGE_HISTORY_CHAR_BUDGET
+    selected: list[dict[str, Any]] = []
+    for item in reversed(history):
+        cost = len(str(item.get("content") or "")) + 256
+        if selected and cost > remaining:
+            break
+        selected.append(item)
+        remaining -= cost
+    selected.reverse()
+    if len(selected) < len(history):
+        selected.insert(
+            0,
+            {
+                "stage": "context",
+                "speaker": "SYSTEM",
+                "side": None,
+                "seat_no": None,
+                "content": "（更早的发言已省略，仅保留最近完整记录）",
+            },
+        )
+    return selected
 
 
 def _parse_result(
@@ -107,21 +246,20 @@ def _parse_result(
             "expression",
         }:
             raise LlmProviderError("judge_result_invalid")
-        limits = {
-            "argument": 30,
-            "rebuttal": 25,
-            "evidence": 20,
-            "teamwork": 15,
-            "expression": 10,
-        }
-        for key, maximum in limits.items():
+        for key, maximum in JUDGE_TEAM_SCORE_LIMITS.items():
             score = scores.get(key)
-            if not isinstance(score, (int, float)) or not 0 <= float(score) <= maximum:
+            if (
+                isinstance(score, bool)
+                or not isinstance(score, (int, float))
+                or not 0 <= float(score) <= maximum
+            ):
                 raise LlmProviderError("judge_result_invalid")
     participants_value = parsed.get("participants")
     if not isinstance(participants_value, list):
         raise LlmProviderError("judge_result_invalid")
     participants = cast(list[Any], participants_value)
+    if len(participants) != len(participant_ids):
+        raise LlmProviderError("judge_result_invalid")
     if participant_records is not None and len(participants) == len(participant_records):
         by_name = {
             str(item.get("name")): str(item["participant_id"]) for item in participant_records
@@ -150,7 +288,12 @@ def _parse_result(
         raise LlmProviderError("judge_result_invalid")
     for item_value in participants:
         item = cast(dict[str, Any], item_value)
-        if not isinstance(item.get("score"), (int, float)) or not 0 <= float(item["score"]) <= 20:
+        score = item.get("score")
+        if (
+            isinstance(score, bool)
+            or not isinstance(score, (int, float))
+            or not 0 <= float(score) <= JUDGE_PARTICIPANT_SCORE_MAX
+        ):
             raise LlmProviderError("judge_result_invalid")
     if not isinstance(parsed.get("team_comments"), dict):
         raise LlmProviderError("judge_result_invalid")
@@ -188,17 +331,35 @@ class PostmatchService:
         settings: Settings,
         session_factory: async_sessionmaker[AsyncSession],
         limiter: LlmCapacityLimiter | None = None,
+        capture_writer: ProviderCaptureWriter | None = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._limiter = limiter or LlmCapacityLimiter(settings.llm_global_concurrency)
+        self._capture_writer = capture_writer
         self._tasks: set[asyncio.Task[None]] = set()
 
     async def close(self) -> None:
-        for task in tuple(self._tasks):
+        tasks = tuple(self._tasks)
+        for task in tasks:
             task.cancel()
-        if self._tasks:
-            await asyncio.gather(*self._tasks, return_exceptions=True)
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=JUDGE_TASK_CANCEL_TIMEOUT_SECONDS)
+        for task in done:
+            if not task.cancelled():
+                try:
+                    task.exception()
+                except BaseException:
+                    pass
+        if pending:
+            logger.warning(
+                "post-match judge task cancellation timed out",
+                extra={
+                    "error_code": "judge_task_cancel_timeout",
+                    "task_count": len(pending),
+                },
+            )
 
     async def request_judge(self, match_id: UUID, *, force: bool = False) -> UUID | None:
         async with self._session_factory() as session:
@@ -272,10 +433,46 @@ class PostmatchService:
                     (
                         await session.scalars(
                             select(Speech)
-                            .where(Speech.match_id == match_id, Speech.status == "FINALIZED")
-                            .order_by(Speech.created_at)
+                            .where(
+                                Speech.match_id == match_id,
+                                Speech.status == "FINALIZED",
+                                Speech.origin != "ADMIN_PLACEHOLDER",
+                            )
+                            .order_by(Speech.created_at.desc())
+                            .limit(JUDGE_HISTORY_RECORD_LIMIT)
                         )
                     ).all()
+                )
+                speeches.reverse()
+                incidents = list(
+                    (
+                        await session.scalars(
+                            select(Speech)
+                            .where(
+                                Speech.match_id == match_id,
+                                Speech.status == "FINALIZED",
+                                Speech.origin == "ADMIN_PLACEHOLDER",
+                            )
+                            .order_by(Speech.created_at.desc())
+                            .limit(JUDGE_HISTORY_RECORD_LIMIT + 1)
+                        )
+                    ).all()
+                )
+                if len(incidents) > JUDGE_HISTORY_RECORD_LIMIT:
+                    raise LlmProviderError("judge_context_too_large")
+                history = _bound_judge_history(
+                    [
+                        {
+                            "stage": _stage_name_for_action(
+                                speech.action_key, room.rule_snapshot if room else None
+                            ),
+                            "speaker": f"{speech.side}-{speech.seat_no}",
+                            "side": speech.side,
+                            "seat_no": speech.seat_no,
+                            "content": speech.display_text or "",
+                        }
+                        for speech in speeches
+                    ]
                 )
                 snapshot = {
                     "topic": (room.topic_snapshot if room else {}).get("title", ""),
@@ -289,23 +486,21 @@ class PostmatchService:
                         }
                         for item in participants
                     ],
-                    "history": json.loads(
-                        render_history(
-                            [
-                                {
-                                    "stage": _stage_name_for_action(
-                                        speech.action_key, room.rule_snapshot if room else None
-                                    ),
-                                    "speaker": f"{speech.side}-{speech.seat_no}",
-                                    "side": speech.side,
-                                    "seat_no": speech.seat_no,
-                                    "content": speech.display_text or "",
-                                }
-                                for speech in speeches
-                            ]
-                        )
-                    ),
+                    "history": json.loads(render_history(history)),
                 }
+                if incidents:
+                    snapshot["administrative_incidents"] = [
+                        {
+                            "speech_id": str(item.id),
+                            "action_key": item.action_key,
+                            "side": item.side,
+                            "seat_no": item.seat_no,
+                            "origin": "ADMIN_PLACEHOLDER",
+                            "spoken": False,
+                            "notice": "管理员AI辅助占位，非辩手实绩，不纳入评分",
+                        }
+                        for item in reversed(incidents)
+                    ]
                 if frozen_judge is not None:
                     snapshot["_judge_runtime"] = deepcopy(frozen_judge)
                 result = JudgeResult(
@@ -319,13 +514,33 @@ class PostmatchService:
                 result_id = result.id
         task = asyncio.create_task(self._execute(result_id), name=f"judge-{result_id}")
         self._tasks.add(task)
-        task.add_done_callback(self._tasks.discard)
+
+        def finished(completed: asyncio.Task[None]) -> None:
+            self._tasks.discard(completed)
+            if completed.cancelled():
+                return
+            try:
+                error = completed.exception()
+            except BaseException:
+                return
+            if error is not None:
+                logger.error(
+                    "post-match judge task failed",
+                    extra={
+                        "error_code": getattr(error, "code", "judge_task_failed"),
+                        "task_name": completed.get_name(),
+                        "exception_type": type(error).__name__,
+                    },
+                )
+
+        task.add_done_callback(finished)
         return result_id
 
     async def _execute(self, result_id: UUID) -> None:
         for attempt in (1, 2):
             external_call_id: UUID | None = None
-            provider_capture = ProviderCallCapture()
+            provider_capture = new_provider_capture(self._capture_writer)
+            submission: CaptureSubmission | None = None
             try:
                 async with self._session_factory() as session:
                     async with session.begin():
@@ -414,7 +629,10 @@ class PostmatchService:
                         messages = [
                             {
                                 "role": "system",
-                                "content": system_prompt or "你是客观的中文辩论裁判。",
+                                "content": (system_prompt or "你是客观的中文辩论裁判。")
+                                + _judge_output_contract()
+                                + "\n管理员AI辅助占位不属于辩手实际发言，已从评分正文排除；"
+                                "不得为缺失发言虚构表现。",
                             },
                             {"role": "user", "content": prompt},
                         ]
@@ -434,6 +652,7 @@ class PostmatchService:
                         participant_ids = {
                             str(item["participant_id"]) for item in participant_records
                         }
+                        config["response_format"] = _judge_response_format(participant_ids)
                         request_payload = {
                             "model": provider_model_id,
                             "messages": messages,
@@ -467,6 +686,7 @@ class PostmatchService:
                                 judge_result_id=row.id,
                                 context_version=row.context_version,
                                 capture_version=PROVIDER_CAPTURE_VERSION,
+                                capture_storage_mode="ASYNC_V1",
                                 captured_at=datetime.now(UTC),
                                 source_kind="MATCH",
                                 logical_call_id=result_id,
@@ -474,14 +694,15 @@ class PostmatchService:
                             )
                         )
                 leases = await self._limiter.acquire(
-                    str(frozen_model.get("name") or model.name),
+                    str(frozen_model.get("id") or model.id),
                     int(frozen_model.get("max_concurrency") or model.max_concurrency),
                     timeout_seconds=3,
                 )
-                client = OpenAIStreamingClient(
-                    base_url=base_url, api_key=key, model=provider_model_id
-                )
+                client: OpenAIStreamingClient | None = None
                 try:
+                    client = OpenAIStreamingClient(
+                        base_url=base_url, api_key=key, model=provider_model_id
+                    )
                     result = await client.stream_chat(
                         messages=messages,
                         max_tokens=1600,
@@ -490,8 +711,9 @@ class PostmatchService:
                         capture=provider_capture,
                     )
                 finally:
-                    await client.close()
                     self._limiter.release(leases)
+                    if client is not None:
+                        await _close_judge_client(client)
                 parsed = _parse_result(result.text, participant_ids, participant_records)
                 async with self._session_factory() as session:
                     async with session.begin():
@@ -510,8 +732,8 @@ class PostmatchService:
                                 ExternalCall, external_call_id, with_for_update=True
                             )
                             if call is not None:
-                                await persist_provider_capture(session, call, provider_capture)
                                 call.status = "SUCCEEDED"
+                                call.capture_storage_mode = "ASYNC_V1"
                                 call.first_result_latency_ms = result.first_token_latency_ms
                                 call.completed_latency_ms = result.completed_latency_ms
                                 call.completion_tokens = result.completion_tokens
@@ -519,8 +741,16 @@ class PostmatchService:
                                     milliseconds=max(0, result.first_token_latency_ms)
                                 )
                                 call.completed_at = datetime.now(UTC)
+                                await session.flush()
+                                submission = prepare_capture(
+                                    self._capture_writer, call, provider_capture
+                                )
+                submit_capture(self._capture_writer, submission)
                 return
             except Exception as error:
+                if submission is not None:
+                    submission.close()
+                    submission = None
                 async with self._session_factory() as session:
                     async with session.begin():
                         call = (
@@ -529,10 +759,15 @@ class PostmatchService:
                             else None
                         )
                         if call is not None and call.status == "STARTED":
-                            await persist_provider_capture(session, call, provider_capture)
                             call.status = "FAILED"
+                            call.capture_storage_mode = "ASYNC_V1"
                             call.error_code = getattr(error, "code", "judge_failed")
                             call.completed_at = datetime.now(UTC)
+                            await session.flush()
+                            submission = prepare_capture(
+                                self._capture_writer, call, provider_capture
+                            )
+                submit_capture(self._capture_writer, submission)
                 if attempt == 2:
                     async with self._session_factory() as session:
                         async with session.begin():
@@ -541,6 +776,10 @@ class PostmatchService:
                                 row.status = "FAILED"
                                 row.error_code = getattr(error, "code", "judge_failed")
                                 row.completed_at = datetime.now(UTC)
+            finally:
+                if submission is not None:
+                    submission.close()
+                provider_capture.close()
 
 
 async def _async_noop() -> None:

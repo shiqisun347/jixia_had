@@ -408,6 +408,34 @@ export function PostmatchContent({
                 ? '管理员可修正已完成的正式文字'
                 : '你只能修改本人已经完成的发言'}
             </p>
+            <nav className="mt-4 flex flex-wrap gap-2 text-xs font-bold" aria-label="赛后展示">
+              <Link
+                className="rounded-full border border-blue-100 bg-blue-50 px-3 py-1.5 text-blue-800"
+                href={`/matches/${matchId}/showcase/judges`}
+              >
+                评委点评
+              </Link>
+              <Link
+                className="rounded-full border border-blue-100 bg-blue-50 px-3 py-1.5 text-blue-800"
+                href={`/matches/${matchId}/showcase/vote`}
+              >
+                观众投票
+              </Link>
+              <Link
+                className="rounded-full border border-blue-100 bg-blue-50 px-3 py-1.5 text-blue-800"
+                href={`/matches/${matchId}/showcase/awards`}
+              >
+                颁奖展示
+              </Link>
+              {viewerRole === 'ADMIN' ? (
+                <Link
+                  className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1.5 text-amber-800"
+                  href={`/matches/${matchId}/showcase/admin`}
+                >
+                  后台控制
+                </Link>
+              ) : null}
+            </nav>
           </div>
           {canSubmit && (
             <button

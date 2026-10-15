@@ -128,6 +128,7 @@ class SpeechTranscriptResponse(BaseModel):
     action_key: str
     user_id: UUID | None
     speaker_kind: str
+    origin: Literal["ORIGINAL", "ADMIN_PLACEHOLDER"] = "ORIGINAL"
     agent_profile_id: UUID | None
     generation_id: UUID | None
     side: str

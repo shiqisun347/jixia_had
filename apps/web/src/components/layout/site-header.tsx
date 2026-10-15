@@ -54,7 +54,10 @@ export function SiteHeader({ authNavigation }: Readonly<{ authNavigation?: React
             );
           })}
         </nav>
-        <div className="site-header__account"><LocaleSwitcher />{authNavigation ?? <AuthNavigation />}</div>
+        <div className="site-header__account">
+          <LocaleSwitcher />
+          {authNavigation ?? <AuthNavigation />}
+        </div>
       </div>
     </header>
   );

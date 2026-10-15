@@ -999,6 +999,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/matches/{match_id}/control-target": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Match Control Target */
+        get: operations["match_control_target_api_admin_matches__match_id__control_target_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/matches/{match_id}/files/permanent": {
         parameters: {
             query?: never;
@@ -1326,6 +1343,125 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/rules/{rule_id}/agents/{agent_id}/status": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        /** Set Rule Agent Status */
+        patch: operations["set_rule_agent_status_api_admin_rules__rule_id__agents__agent_id__status_patch"];
+        trace?: never;
+    };
+    "/api/admin/rules/{rule_id}/audio": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Rule Audio */
+        get: operations["get_rule_audio_api_admin_rules__rule_id__audio_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/rules/{rule_id}/audio/approve": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Approve Rule Audio */
+        post: operations["approve_rule_audio_api_admin_rules__rule_id__audio_approve_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/rules/{rule_id}/audio/assets/{asset_id}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Preview Rule Audio */
+        get: operations["preview_rule_audio_api_admin_rules__rule_id__audio_assets__asset_id__get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/rules/{rule_id}/audio/generate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Generate Rule Audio */
+        post: operations["generate_rule_audio_api_admin_rules__rule_id__audio_generate_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/rules/{rule_id}/audio/reconcile": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Reconcile Rule Audio */
+        post: operations["reconcile_rule_audio_api_admin_rules__rule_id__audio_reconcile_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/rules/{rule_id}/audio/retry": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Retry Rule Audio */
+        post: operations["retry_rule_audio_api_admin_rules__rule_id__audio_retry_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/rules/{rule_id}/disable": {
         parameters: {
             query?: never;
@@ -1411,6 +1547,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/admin/rules/{rule_id}/stages": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Create Rule Stage */
+        post: operations["create_rule_stage_api_admin_rules__rule_id__stages_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/admin/rules/{rule_id}/stages/reorder": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        /** Reorder Rule Stages */
+        put: operations["reorder_rule_stages_api_admin_rules__rule_id__stages_reorder_put"];
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/admin/rules/{rule_id}/stages/{stage_id}": {
         parameters: {
             query?: never;
@@ -1421,7 +1591,8 @@ export interface paths {
         get?: never;
         put?: never;
         post?: never;
-        delete?: never;
+        /** Delete Rule Stage */
+        delete: operations["delete_rule_stage_api_admin_rules__rule_id__stages__stage_id__delete"];
         options?: never;
         head?: never;
         /** Update Rule Stage */
@@ -2231,6 +2402,74 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/matches/{match_id}/showcase": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Get Showcase */
+        get: operations["get_showcase_api_matches__match_id__showcase_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/matches/{match_id}/showcase/judge": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Save Judge Entry */
+        post: operations["save_judge_entry_api_matches__match_id__showcase_judge_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/matches/{match_id}/showcase/phase": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Update Showcase Phase */
+        post: operations["update_showcase_phase_api_matches__match_id__showcase_phase_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/matches/{match_id}/showcase/vote": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Submit Audience Vote */
+        post: operations["submit_audience_vote_api_matches__match_id__showcase_vote_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/matches/{match_id}/snapshot": {
         parameters: {
             query?: never;
@@ -2482,6 +2721,23 @@ export interface paths {
         put?: never;
         /** Leave Room */
         post: operations["leave_room_api_rooms__room_id__leave_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/rooms/{room_id}/prepare-match": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Prepare Match */
+        post: operations["prepare_match_api_rooms__room_id__prepare_match_post"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2987,6 +3243,8 @@ export interface components {
         };
         /** AgentProfileResponse */
         AgentProfileResponse: {
+            /** Available */
+            available: boolean;
             /** Avatar Key */
             avatar_key: string;
             /** Debater Prompt */
@@ -3007,6 +3265,8 @@ export interface components {
              * Format: uuid
              */
             model_profile_id: string;
+            /** Model Status */
+            model_status: string;
             /** Name */
             name: string;
             /**
@@ -3020,11 +3280,15 @@ export interface components {
             status: string;
             /** System Prompt */
             system_prompt: string;
+            /** Unavailable Reason */
+            unavailable_reason: ("RULE_DISABLED" | "VOICE_DISABLED" | "MODEL_DISABLED") | null;
             /**
              * Voice Profile Id
              * Format: uuid
              */
             voice_profile_id: string;
+            /** Voice Status */
+            voice_status: string;
         };
         /** AgentProfileUpdate */
         AgentProfileUpdate: {
@@ -3054,6 +3318,16 @@ export interface components {
              * Format: uuid
              */
             voice_profile_id: string;
+        };
+        /** AudienceVoteRequest */
+        AudienceVoteRequest: {
+            /** Ranking */
+            ranking: string[];
+            /**
+             * Winner Side
+             * @enum {string}
+             */
+            winner_side: "AFFIRMATIVE" | "NEGATIVE" | "DRAW";
         };
         /** AuthResponse */
         AuthResponse: {
@@ -3965,6 +4239,29 @@ export interface components {
             /** Minimum */
             minimum: number;
         };
+        /** JudgeEntryRequest */
+        JudgeEntryRequest: {
+            /**
+             * Best Participant Id
+             * Format: uuid
+             */
+            best_participant_id: string;
+            /**
+             * Comments
+             * @default
+             */
+            comments: string;
+            /**
+             * Published
+             * @default false
+             */
+            published: boolean;
+            /**
+             * Winner Side
+             * @enum {string}
+             */
+            winner_side: "AFFIRMATIVE" | "NEGATIVE" | "DRAW";
+        };
         /** JudgeProfileCreate */
         JudgeProfileCreate: {
             /** Generation Params */
@@ -4140,7 +4437,53 @@ export interface components {
              * Action
              * @enum {string}
              */
-            action: "terminate" | "resume" | "recover" | "reset_speech";
+            action: "pause" | "terminate" | "resume" | "recover" | "reset_speech" | "reset_stage" | "skip_speech" | "cancel_skip";
+            /** Expected Action Key */
+            expected_action_key?: string | null;
+            /** Expected Context Version */
+            expected_context_version?: number | null;
+            /** Expected Sequence */
+            expected_sequence?: number | null;
+            /** Expected Speech Id */
+            expected_speech_id?: string | null;
+            /** Expected Stage Generation */
+            expected_stage_generation?: number | null;
+            /** Operation Id */
+            operation_id?: string | null;
+        };
+        /** MatchControlTargetResponse */
+        MatchControlTargetResponse: {
+            /** Action Key */
+            action_key: string | null;
+            /** Action State */
+            action_state: string;
+            /** Can Reset Speech */
+            can_reset_speech: boolean;
+            /** Can Reset Stage */
+            can_reset_stage: boolean;
+            /** Can Skip Speech */
+            can_skip_speech: boolean;
+            /** Context Version */
+            context_version: number;
+            /**
+             * Match Id
+             * Format: uuid
+             */
+            match_id: string;
+            /** Operation */
+            operation: {
+                [key: string]: unknown;
+            } | null;
+            /** Sequence */
+            sequence: number;
+            /** Speech Id */
+            speech_id: string | null;
+            /** Stage Generation */
+            stage_generation: number;
+            /** Stage Name */
+            stage_name: string;
+            /** Status */
+            status: string;
         };
         /** MatchLiveKitTokenRequest */
         MatchLiveKitTokenRequest: {
@@ -4691,6 +5034,11 @@ export interface components {
         RoomCreateRequest: {
             /** Affirmative Text */
             affirmative_text?: string | null;
+            /**
+             * Auto Fill Agents
+             * @default true
+             */
+            auto_fill_agents: boolean;
             /** Custom Topic Title */
             custom_topic_title?: string | null;
             /** Human Participation Terms Version */
@@ -4804,6 +5152,91 @@ export interface components {
              */
             status: "ENABLED" | "DISABLED";
         };
+        /** RuleAudioApprove */
+        RuleAudioApprove: {
+            /**
+             * Generation Id
+             * Format: uuid
+             */
+            generation_id: string;
+            /** Manifest Hash */
+            manifest_hash: string;
+        };
+        /** RuleAudioAssetResponse */
+        RuleAudioAssetResponse: {
+            /** Byte Count */
+            byte_count: number | null;
+            /** Checksum */
+            checksum: string | null;
+            /** Duration Ms */
+            duration_ms: number | null;
+            /** Error Code */
+            error_code: string | null;
+            /** Generation Id */
+            generation_id: string | null;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Preview Url */
+            preview_url?: string | null;
+            /** Segment Key */
+            segment_key: string;
+            /** Status */
+            status: string;
+            /** Text */
+            text: string;
+            /**
+             * Voice Profile Id
+             * Format: uuid
+             */
+            voice_profile_id: string;
+        };
+        /** RuleAudioGenerationResponse */
+        RuleAudioGenerationResponse: {
+            /** Approved At */
+            approved_at: string | null;
+            /** Assets */
+            assets?: components["schemas"]["RuleAudioAssetResponse"][];
+            /** Completed At */
+            completed_at: string | null;
+            /** Config Revision */
+            config_revision: number;
+            /** Failed Count */
+            failed_count: number;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Is Current */
+            is_current: boolean;
+            /** Last Error Code */
+            last_error_code: string | null;
+            /** Manifest Hash */
+            manifest_hash: string;
+            /** Ready Count */
+            ready_count: number;
+            /**
+             * Requested At
+             * Format: date-time
+             */
+            requested_at: string;
+            /** Review Status */
+            review_status: string;
+            /**
+             * Rule Id
+             * Format: uuid
+             */
+            rule_id: string;
+            /** Started At */
+            started_at: string | null;
+            /** Status */
+            status: string;
+            /** Total Count */
+            total_count: number;
+        };
         /** RuleBasicUpdate */
         RuleBasicUpdate: {
             /**
@@ -4834,6 +5267,17 @@ export interface components {
              * @enum {string}
              */
             topic_policy: "PRESET_ONLY" | "CUSTOM_ONLY" | "BOTH";
+        };
+        /** RuleBlockerResponse */
+        RuleBlockerResponse: {
+            /** Action */
+            action: string;
+            /** Code */
+            code: string;
+            /** Message */
+            message: string;
+            /** Target */
+            target: string;
         };
         /** RuleCreate */
         RuleCreate: {
@@ -4892,10 +5336,26 @@ export interface components {
         };
         /** RuleResponse */
         RuleResponse: {
+            audio?: components["schemas"]["RuleAudioGenerationResponse"] | null;
             /** Audio Reviewed At */
             audio_reviewed_at: string | null;
+            /**
+             * Availability
+             * @default BLOCKED
+             * @enum {string}
+             */
+            availability: "AVAILABLE" | "BLOCKED" | "ARCHIVED";
+            /**
+             * Available Agent Count
+             * @default 0
+             */
+            available_agent_count: number;
+            /** Blockers */
+            blockers?: components["schemas"]["RuleBlockerResponse"][];
             /** Config Revision */
             config_revision: number;
+            /** Current Audio Generation Id */
+            current_audio_generation_id?: string | null;
             /** Default Agent Model Profile Id */
             default_agent_model_profile_id: string | null;
             /** Description */
@@ -4911,20 +5371,84 @@ export interface components {
              * Format: uuid
              */
             id: string;
+            /**
+             * Lifecycle Status
+             * @default DISABLED
+             */
+            lifecycle_status: string;
+            /**
+             * Mixed Available
+             * @default false
+             */
+            mixed_available: boolean;
             /** Name */
             name: string;
             /** Postmatch Questionnaire Enabled */
             postmatch_questionnaire_enabled: boolean;
+            /**
+             * Pure Agent Available
+             * @default false
+             */
+            pure_agent_available: boolean;
+            /**
+             * Pure Human Available
+             * @default false
+             */
+            pure_human_available: boolean;
+            /**
+             * Readiness
+             * @default BLOCKED
+             * @enum {string}
+             */
+            readiness: "READY" | "BLOCKED";
             /** Rule Key */
             rule_key: string;
             /** Side Size */
             side_size: number;
+            /**
+             * Stage Count
+             * @default 0
+             */
+            stage_count: number;
             /** Status */
             status: string;
             /** Topic Policy */
             topic_policy: string;
             /** Version */
             version: number;
+        };
+        /** RuleStageCreate */
+        RuleStageCreate: {
+            /** Actions */
+            actions?: components["schemas"]["StageActionDraft"][];
+            /**
+             * Duration Seconds
+             * @default 0
+             */
+            duration_seconds: number;
+            /**
+             * End Host Text
+             * @default
+             */
+            end_host_text: string;
+            /** Name */
+            name: string;
+            /** Parameters */
+            parameters?: {
+                [key: string]: unknown;
+            };
+            /** Position */
+            position?: number | null;
+            /**
+             * Stage Kind
+             * @enum {string}
+             */
+            stage_kind: "FIXED_SPEECH" | "FREE_DEBATE" | "PREPARATION" | "END";
+            /**
+             * Start Host Text
+             * @default
+             */
+            start_host_text: string;
         };
         /** RuleStageDraft */
         RuleStageDraft: {
@@ -4960,6 +5484,11 @@ export interface components {
              * @default
              */
             start_host_text: string;
+        };
+        /** RuleStageReorder */
+        RuleStageReorder: {
+            /** Stage Ids */
+            stage_ids: string[];
         };
         /** RuleStageUpdate */
         RuleStageUpdate: {
@@ -5091,6 +5620,69 @@ export interface components {
              */
             target_user_id: string;
         };
+        /** ShowcaseParticipant */
+        ShowcaseParticipant: {
+            /** Display Name */
+            display_name: string;
+            /**
+             * Id
+             * Format: uuid
+             */
+            id: string;
+            /** Kind */
+            kind: string;
+            /** Seat No */
+            seat_no: number;
+            /** Side */
+            side: string;
+        };
+        /** ShowcasePhaseRequest */
+        ShowcasePhaseRequest: {
+            /** Display Payload */
+            display_payload?: {
+                [key: string]: unknown;
+            };
+            /**
+             * Phase
+             * @enum {string}
+             */
+            phase: "JUDGE_REVIEW" | "AUDIENCE_VOTE" | "AUDIENCE_RESULTS" | "AWARDS" | "CLOSED";
+            /**
+             * Published
+             * @default true
+             */
+            published: boolean;
+        };
+        /** ShowcaseResponse */
+        ShowcaseResponse: {
+            /** Audience */
+            audience: {
+                [key: string]: unknown;
+            };
+            /** Can Manage */
+            can_manage: boolean;
+            /** Display Payload */
+            display_payload: {
+                [key: string]: unknown;
+            };
+            /** Has Voted */
+            has_voted: boolean;
+            /** Judge */
+            judge: {
+                [key: string]: unknown;
+            } | null;
+            /**
+             * Match Id
+             * Format: uuid
+             */
+            match_id: string;
+            /** Participants */
+            participants: components["schemas"]["ShowcaseParticipant"][];
+            /** Phase */
+            phase: string;
+            /** Published */
+            published: boolean;
+        };
         /** SpeechTextUpdateRequest */
         SpeechTextUpdateRequest: {
             /** Display Text */
@@ -5124,6 +5716,12 @@ export interface components {
              * Format: uuid
              */
             match_id: string;
+            /**
+             * Origin
+             * @default ORIGINAL
+             * @enum {string}
+             */
+            origin: "ORIGINAL" | "ADMIN_PLACEHOLDER";
             /** Seat No */
             seat_no: number;
             /** Side */
@@ -6086,7 +6684,10 @@ export interface operations {
     };
     list_experiment_batches_api_admin_experiments_batches_get: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                cursor?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -6100,6 +6701,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ExperimentBatchResponse"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -7466,6 +8076,37 @@ export interface operations {
             };
         };
     };
+    match_control_target_api_admin_matches__match_id__control_target_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                match_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MatchControlTargetResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     update_match_file_retention_api_admin_matches__match_id__files_permanent_patch: {
         parameters: {
             query?: never;
@@ -8233,6 +8874,233 @@ export interface operations {
             };
         };
     };
+    set_rule_agent_status_api_admin_rules__rule_id__agents__agent_id__status_patch: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                rule_id: string;
+                agent_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CatalogStatusUpdate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AgentProfileResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    get_rule_audio_api_admin_rules__rule_id__audio_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                rule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuleAudioGenerationResponse"] | null;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    approve_rule_audio_api_admin_rules__rule_id__audio_approve_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                rule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RuleAudioApprove"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuleResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    preview_rule_audio_api_admin_rules__rule_id__audio_assets__asset_id__get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                rule_id: string;
+                asset_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    generate_rule_audio_api_admin_rules__rule_id__audio_generate_post: {
+        parameters: {
+            query?: {
+                force?: boolean;
+            };
+            header?: never;
+            path: {
+                rule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuleAudioGenerationResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reconcile_rule_audio_api_admin_rules__rule_id__audio_reconcile_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                rule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuleAudioGenerationResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    retry_rule_audio_api_admin_rules__rule_id__audio_retry_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                rule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuleAudioGenerationResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     disable_rule_api_admin_rules__rule_id__disable_post: {
         parameters: {
             query?: never;
@@ -8371,6 +9239,110 @@ export interface operations {
             header?: never;
             path: {
                 rule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuleResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    create_rule_stage_api_admin_rules__rule_id__stages_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                rule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RuleStageCreate"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: string;
+                    };
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    reorder_rule_stages_api_admin_rules__rule_id__stages_reorder_put: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                rule_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RuleStageReorder"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RuleResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    delete_rule_stage_api_admin_rules__rule_id__stages__stage_id__delete: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                rule_id: string;
+                stage_id: string;
             };
             cookie?: never;
         };
@@ -9229,7 +10201,10 @@ export interface operations {
     };
     list_my_annotation_tasks_api_experiments_annotation_tasks_get: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                cursor?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -9243,6 +10218,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ParticipantAnnotationTaskResponse"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -9351,7 +10335,10 @@ export interface operations {
     };
     list_my_experiment_appointments_api_experiments_appointments_get: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                cursor?: string | null;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -9365,6 +10352,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ExperimentAppointmentResponse"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -9426,7 +10422,10 @@ export interface operations {
     };
     list_my_expert_tasks_api_experiments_expert_tasks_get: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                cursor?: string;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -9440,6 +10439,15 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ExpertAnnotationTaskResponse"][];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -9920,6 +10928,142 @@ export interface operations {
             };
         };
     };
+    get_showcase_api_matches__match_id__showcase_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                match_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShowcaseResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    save_judge_entry_api_matches__match_id__showcase_judge_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                match_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["JudgeEntryRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShowcaseResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    update_showcase_phase_api_matches__match_id__showcase_phase_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                match_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ShowcasePhaseRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShowcaseResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    submit_audience_vote_api_matches__match_id__showcase_vote_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                match_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["AudienceVoteRequest"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ShowcaseResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     get_match_snapshot_api_matches__match_id__snapshot_get: {
         parameters: {
             query?: never;
@@ -10110,7 +11254,11 @@ export interface operations {
     };
     get_postmatch_surveys_api_me_postmatch_surveys_get: {
         parameters: {
-            query?: never;
+            query?: {
+                limit?: number;
+                cursor?: string;
+                include_items?: boolean;
+            };
             header?: never;
             path?: never;
             cookie?: never;
@@ -10126,6 +11274,15 @@ export interface operations {
                     "application/json": {
                         [key: string]: unknown;
                     }[];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
                 };
             };
         };
@@ -10449,6 +11606,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["RoomSnapshotResponse"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    prepare_match_api_rooms__room_id__prepare_match_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                room_id: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["MatchSnapshotResponse"];
                 };
             };
             /** @description Validation Error */

@@ -51,7 +51,9 @@ export const Guide: Story = {
   render: () => <GuidePage />,
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
-    await expect(canvas.getByRole('heading', { name: '一页掌握一场 4v4 辩论' })).toBeVisible();
+    await expect(
+      canvas.getByRole('heading', { name: '从入场到赛后，一次看懂稷下辩论' }),
+    ).toBeVisible();
     await expect(canvas.getByRole('link', { name: /进入比赛大厅/ })).toBeVisible();
   },
 };

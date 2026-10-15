@@ -11,6 +11,9 @@ from time import monotonic, time
 from typing import Any, Literal, cast
 from uuid import UUID, uuid4
 
+from ..host_audio_timing import host_audio_guard_seconds
+from ..runtime_identity import CallbackEnvelope
+
 MatchStatus = Literal[
     "START_PENDING_RUNTIME",
     "START_COUNTDOWN",
@@ -92,6 +95,11 @@ class MatchDomainError(Exception):
         self.code = code
 
 
+# A server-side playback completion is the normal transition.  This bounded
+# guard only prevents a permanently stuck match if LiveKit or the decoder dies;
+# it is deliberately longer than the declared asset duration.
+
+
 @dataclass(frozen=True, slots=True)
 class MatchAction:
     stage_position: int
@@ -131,12 +139,19 @@ class MatchRuntimeState:
     speech_deadline_mono: float | None = None
     human_start_deadline_mono: float | None = None
     speech_remaining_ms: int | None = None
+    speech_budget_start_ms: int | None = None
+    speech_consumed_ms: int = 0
+    speech_budget_settled: bool = False
+    stage_generation: int = 0
+    stage_checkpoint: Mapping[str, Any] | None = None
+    emergency_operation: Mapping[str, Any] | None = None
     host_audio_remaining_ms: int | None = None
     host_audio_deadline_mono: float | None = None
     host_audio_deadline_ms: int | None = None
     current_speaker_side: str | None = None
     current_speaker_seat_no: int | None = None
     free_holder_side: str | None = None
+    free_source_speech_id: UUID | None = None
     free_affirmative_remaining_ms: int | None = None
     free_negative_remaining_ms: int | None = None
     hand_queue: tuple[UUID, ...] = ()
@@ -186,6 +201,8 @@ class MatchRuntimeView:
     countdown_remaining_ms: int | None
     free_affirmative_remaining_ms: int | None
     free_negative_remaining_ms: int | None
+    selection_remaining_ms: int | None = None
+    human_wait_remaining_ms: int | None = None
     host_audio_remaining_ms: int | None = None
 
 
@@ -195,6 +212,10 @@ class MatchCommand:
     message_id: str
     actor_user_id: UUID | None = None
     payload: Mapping[str, Any] = field(default_factory=lambda: dict[str, Any]())
+    host_callback_envelope: CallbackEnvelope | None = field(default=None, repr=False)
+    host_guard_id: UUID | None = field(default=None, repr=False)
+    agent_callback_envelope: CallbackEnvelope | None = field(default=None, repr=False)
+    agent_logical_call_id: UUID | None = field(default=None, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -449,6 +470,7 @@ class MatchActor:
         self._timer: asyncio.Task[None] | None = None
         self._timer_deadline_mono: float | None = None
         self._timer_command_type: str | None = None
+        self._host_guard_id: UUID | None = None
         self._offline_timers: dict[UUID, asyncio.Task[None]] = {}
         self._offline_users: set[UUID] = {user_id for user_id, _ in state.offline_since_ms} or (
             {state.offline_user_id} if state.offline_user_id is not None else set()
@@ -485,6 +507,19 @@ class MatchActor:
             except asyncio.CancelledError:
                 pass
             self._runner = None
+        # A runner can be cancelled while commands are still waiting in the
+        # bounded queue.  Reject those envelopes explicitly so callers never
+        # await a Future whose actor has already been torn down.
+        while True:
+            try:
+                envelope = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            try:
+                if not envelope.future.done():
+                    envelope.future.cancel()
+            finally:
+                self._queue.task_done()
 
     async def submit(self, command: MatchCommand) -> MatchCommandResult:
         if self._runner is None:
@@ -546,6 +581,18 @@ class MatchActor:
             countdown_remaining_ms=countdown_remaining_ms,
             free_affirmative_remaining_ms=affirmative_remaining_ms,
             free_negative_remaining_ms=negative_remaining_ms,
+            selection_remaining_ms=(
+                None
+                if self.state.selection_phase == "HUMAN_ONLY_WAIT"
+                else max(0, round((self.state.selection_deadline_mono - self._clock()) * 1000))
+                if self.state.selection_deadline_mono is not None
+                else self.state.selection_remaining_ms
+            ),
+            human_wait_remaining_ms=(
+                max(0, round((self.state.human_wait_deadline_mono - self._clock()) * 1000))
+                if self.state.human_wait_deadline_mono is not None
+                else self.state.human_wait_remaining_ms
+            ),
         )
 
     async def set_interim_text(self, text: str, *, speech_id: UUID) -> bool:
@@ -577,6 +624,10 @@ class MatchActor:
                 result = await self._process(envelope.command)
                 if not envelope.future.done():
                     envelope.future.set_result(result)
+            except asyncio.CancelledError:
+                if not envelope.future.done():
+                    envelope.future.cancel()
+                raise
             except Exception as error:
                 if not envelope.future.done():
                     envelope.future.set_exception(error)
@@ -586,19 +637,67 @@ class MatchActor:
     async def _process(self, command: MatchCommand) -> MatchCommandResult:
         cached = self._idempotency.get(command.message_id)
         if cached is not None:
+            if command.payload.get("operation_id") and command.type in {
+                "stage.reset",
+                "speech.reset",
+                "speech.skip.begin",
+            }:
+                kind = "speech.skip" if command.type == "speech.skip.begin" else command.type
+                _, duplicate = self._emergency_target(command, kind)
+                if not duplicate:
+                    raise MatchDomainError("stale_callback")
+                return replace(cached, state=self.state, duplicate=True)
             return replace(cached, duplicate=True)
         if self.state.status in ("FINISHED", "TERMINATED"):
             raise MatchDomainError("match_not_running")
-        if self.state.status in ("SYSTEM_RECOVERY", "ERROR") and command.type not in (
-            "match.terminate",
-            "match.resume",
+        emergency_commands = {
+            "stage.reset",
+            "speech.skip.begin",
+            "speech.skip.complete",
+            "speech.skip.fail",
+            "speech.skip.cancel",
+        }
+        operator_reset = command.type == "speech.reset" and bool(
+            command.payload.get("operation_id")
+        )
+        if (
+            self.state.emergency_operation
+            and self.state.emergency_operation.get("status") == "PENDING"
+            and command.type
+            not in {
+                "speech.skip.complete",
+                "speech.skip.fail",
+                "speech.skip.cancel",
+                "match.terminate",
+            }
+            and not (
+                command.type == "speech.skip.begin"
+                and command.payload.get("operation_id") == self.state.emergency_operation.get("id")
+            )
+        ):
+            raise MatchDomainError("match_state_conflict")
+        if (
+            self.state.status in ("SYSTEM_RECOVERY", "ERROR")
+            and command.type
+            not in (
+                "match.terminate",
+                "match.resume",
+            )
+            and command.type not in emergency_commands
+            and not operator_reset
         ):
             raise MatchDomainError("match_not_running")
-        if self.state.status == "PAUSED" and command.type not in (
-            "match.resume",
-            "resume.elapsed",
-            "match.terminate",
-            "member.online",
+        if (
+            self.state.status == "PAUSED"
+            and command.type
+            not in (
+                "match.resume",
+                "resume.elapsed",
+                "match.terminate",
+                "member.online",
+            )
+            and command.type not in emergency_commands
+            and not operator_reset
         ):
             raise MatchDomainError("match_not_running")
         handlers = {
@@ -630,6 +729,11 @@ class MatchActor:
             "member.online": self._member_online,
             "offline.expired": self._offline_expired,
             "speech.reset": self._speech_reset,
+            "stage.reset": self._stage_reset,
+            "speech.skip.begin": self._speech_skip_begin,
+            "speech.skip.complete": self._speech_skip_complete,
+            "speech.skip.fail": self._speech_skip_fail,
+            "speech.skip.cancel": self._speech_skip_fail,
             "match.terminate": self._match_terminate,
         }
         handler: Callable[[MatchCommand], tuple[MatchEvent, ...]] | None = handlers.get(
@@ -724,8 +828,42 @@ class MatchActor:
                 interim_text="",
             )
             return (self._event("match.finished", {}),)
+        checkpoint = self.state.stage_checkpoint
+        first_index = next(
+            index
+            for index, item in enumerate(self.state.actions)
+            if item.stage_position == action.stage_position
+        )
+        if self.state.current_action_index == first_index and (
+            checkpoint is None or checkpoint.get("stage_position") != action.stage_position
+        ):
+            generation = self.state.stage_generation + 1
+            self.state = replace(
+                self.state,
+                stage_generation=generation,
+                free_source_speech_id=None,
+                stage_checkpoint={
+                    "version": 1,
+                    "match_id": str(self.state.match_id),
+                    "stage_position": action.stage_position,
+                    "action_index": first_index,
+                    "action_key": action.action_key,
+                    "entry_sequence": self.state.sequence + 1,
+                    "generation": generation,
+                    "affirmative_budget_ms": (
+                        action.duration_seconds * 1000
+                        if action.action_kind == "FREE_DEBATE"
+                        else self.state.free_affirmative_remaining_ms
+                    ),
+                    "negative_budget_ms": (
+                        action.duration_seconds * 1000
+                        if action.action_kind == "FREE_DEBATE"
+                        else self.state.free_negative_remaining_ms
+                    ),
+                },
+            )
         if action.host_audio_path:
-            duration_ms = action.host_audio_duration_ms
+            duration_ms = max(0, action.host_audio_duration_ms or 0)
             self.state = replace(
                 self.state,
                 action_state="HOST_ANNOUNCING",
@@ -750,12 +888,16 @@ class MatchActor:
                 agent_selection_mode=None,
                 agent_decision_round_id=None,
                 agent_decisions=(),
+                opportunity_id=None,
+                allocated_opportunity_id=None,
                 hand_window_open=False,
             )
-            if duration_ms:
-                self._schedule_internal(
-                    duration_ms / 1000, "host.elapsed", f"internal:host:{action.action_key}"
-                )
+            self._schedule_internal(
+                host_audio_guard_seconds(duration_ms),
+                "host.elapsed",
+                f"internal:host:{action.action_key}",
+                payload={"guard": True},
+            )
             host_event = self._event(
                 "host.play",
                 {
@@ -783,6 +925,10 @@ class MatchActor:
                         "negative_remaining_ms": total_ms,
                     },
                 )
+                opened = self._event(
+                    "hand.window_opened",
+                    {"side": action.free_starting_side, "duration_ms": None},
+                )
                 decision = self._start_free_agent_decisions(
                     action.free_starting_side,
                     trigger_kind="INITIAL_HOST",
@@ -791,10 +937,7 @@ class MatchActor:
                 return (
                     host_event,
                     started,
-                    self._event(
-                        "hand.window_opened",
-                        {"side": action.free_starting_side, "duration_ms": None},
-                    ),
+                    opened,
                     decision,
                 )
             return (host_event,)
@@ -808,19 +951,34 @@ class MatchActor:
         action = self.state.current_action
         if action is None:
             raise MatchDomainError("match_state_conflict")
+        if (
+            command.payload.get("action_key") is not None
+            and str(command.payload.get("action_key")) != action.action_key
+        ):
+            raise MatchDomainError("stale_callback")
         if action.action_kind == "HOST_AUDIO":
             return self._advance_action("host.finished", {})
         return self._activate_action(action)
 
-    def _host_elapsed(self, _: MatchCommand) -> tuple[MatchEvent, ...]:
+    def _host_elapsed(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
         if self.state.action_state != "HOST_ANNOUNCING":
             return ()
         action = self.state.current_action
         if action is None:
             return ()
-        if action.action_kind == "HOST_AUDIO":
-            return self._advance_action("host.finished", {})
-        return (self._event("host.finished", {}), *self._activate_action(action))
+        if not command.payload.get("guard"):
+            if action.action_kind == "HOST_AUDIO":
+                return self._advance_action("host.finished", {})
+            return (self._event("host.finished", {}), *self._activate_action(action))
+        if not self.host_guard_is_current(command.host_guard_id):
+            return ()
+        return self._system_error(
+            MatchCommand(
+                type="system.error",
+                message_id=f"host-timeout:{action.action_key}:{self.state.sequence}",
+                payload={"error_code": "host_audio_timeout"},
+            )
+        )
 
     def _activate_action(self, action: MatchAction) -> tuple[MatchEvent, ...]:
         self.state = replace(
@@ -893,14 +1051,18 @@ class MatchActor:
                 ),
                 selection_remaining_ms=3_000 if reuse_initial_opportunity else None,
             )
-            started = self._event(
-                "free_debate.started",
-                {
-                    "stage_position": action.stage_position,
-                    "holder": action.free_starting_side,
-                    "affirmative_remaining_ms": total_ms,
-                    "negative_remaining_ms": total_ms,
-                },
+            started = (
+                None
+                if reuse_initial_opportunity
+                else self._event(
+                    "free_debate.started",
+                    {
+                        "stage_position": action.stage_position,
+                        "holder": action.free_starting_side,
+                        "affirmative_remaining_ms": total_ms,
+                        "negative_remaining_ms": total_ms,
+                    },
+                )
             )
             opened = self._event(
                 "hand.window_opened",
@@ -909,6 +1071,7 @@ class MatchActor:
             if reuse_initial_opportunity:
                 self._schedule_internal(3.0, "hand.window_closed", "internal:free-initial")
                 return (opened,)
+            assert started is not None
             decision_started = self._start_free_agent_decisions(
                 action.free_starting_side,
                 trigger_kind="INITIAL_HOST",
@@ -988,6 +1151,40 @@ class MatchActor:
             else self.state.free_negative_remaining_ms
         )
         return int(value or 0)
+
+    def _freeze_speech_budget(self, *, terminal: bool = False, time_limit: bool = False) -> None:
+        """Settle only the active segment; an ASR result never changes this clock."""
+        start = self.state.speech_budget_start_ms
+        side = self.state.current_speaker_side
+        if start is None or side is None or self.state.speech_budget_settled:
+            return
+        remaining = self.state.speech_remaining_ms or 0
+        if self.state.speech_deadline_mono is not None:
+            effective = (
+                0
+                if time_limit
+                else min(
+                    remaining,
+                    max(0, round((self.state.speech_deadline_mono - self._clock()) * 1000)),
+                )
+            )
+            consumed = self.state.speech_consumed_ms + remaining - effective
+        else:
+            effective, consumed = remaining, self.state.speech_consumed_ms
+        budget = max(0, start - consumed)
+        self.state = replace(
+            self.state,
+            speech_remaining_ms=effective,
+            speech_deadline_mono=None,
+            speech_consumed_ms=consumed,
+            speech_budget_settled=terminal,
+            free_affirmative_remaining_ms=(
+                budget if side == "AFFIRMATIVE" else self.state.free_affirmative_remaining_ms
+            ),
+            free_negative_remaining_ms=(
+                budget if side == "NEGATIVE" else self.state.free_negative_remaining_ms
+            ),
+        )
 
     def _free_turn_duration_ms(self, action: MatchAction, side: str) -> int:
         return min(action.free_max_speech_seconds * 1000, self._free_remaining_ms(side))
@@ -1106,6 +1303,7 @@ class MatchActor:
         opportunity_id = uuid4()
         self.state = replace(
             self.state,
+            free_source_speech_id=source_speech_id,
             free_holder_side=side,
             opportunity_id=opportunity_id,
             opportunity_generation=self.state.opportunity_generation + 1,
@@ -1219,6 +1417,12 @@ class MatchActor:
     def _hand_raise(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
         if not self.state.hand_window_open or command.actor_user_id is None:
             raise MatchDomainError("hand_window_closed")
+        if (
+            self.state.selection_phase != "HUMAN_ONLY_WAIT"
+            and self.state.selection_deadline_mono is not None
+            and self._clock() >= self.state.selection_deadline_mono
+        ):
+            raise MatchDomainError("hand_window_closed")
         side = (
             self.state.free_holder_side
             if self.state.action_state == "FREE_SELECTING"
@@ -1284,6 +1488,27 @@ class MatchActor:
             self.state.action_state != "FREE_SELECTING" and not valid_experiment_finalizing
         ) or not self.state.hand_window_open:
             return ()
+        released: tuple[MatchEvent, ...] = ()
+        if valid_experiment_finalizing:
+            if all(
+                self._free_remaining_ms(side) < FREE_MINIMUM_SPEECH_MS
+                for side in ("AFFIRMATIVE", "NEGATIVE")
+            ):
+                self.state = replace(
+                    self.state,
+                    hand_window_open=False,
+                    hand_queue=(),
+                    agent_hand_queue=(),
+                    selection_deadline_mono=None,
+                    selection_remaining_ms=0,
+                )
+                return (self._event("hand.window_closed", {"side": self.state.free_holder_side}),)
+            released = self._finish_free_turn(
+                "free.turn_released",
+                {"speech_id": str(self.state.current_speech_id), "reason": "HANDOFF"},
+            )
+            if self.state.action_state != "FREE_SELECTING":
+                return released
         if self.state.free_competition_enabled:
             timed_out = any(item.status == "DECIDING" for item in self.state.agent_decisions) or (
                 not self.state.agent_decisions and self.state.agent_effective_status == "WAITING"
@@ -1306,7 +1531,7 @@ class MatchActor:
         else:
             self.state = replace(self.state, hand_window_open=False)
         closed = self._event("hand.window_closed", {"side": self.state.free_holder_side})
-        return (closed, *self._lock_free_selection_if_ready())
+        return (*released, closed, *self._lock_free_selection_if_ready())
 
     def _free_agent_decision_result(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
         if self.state.action_state != "FREE_SELECTING" and not (
@@ -1549,6 +1774,12 @@ class MatchActor:
         self.state = replace(
             self.state,
             action_state="HUMAN_READY_TO_START",
+            current_speech_id=None,
+            speech_start_sequence=None,
+            interim_text="",
+            speech_budget_start_ms=None,
+            speech_consumed_ms=0,
+            speech_budget_settled=False,
             current_speaker_user_id=selected_user_id,
             current_agent_profile_id=None,
             current_speaker_side=side,
@@ -1783,6 +2014,17 @@ class MatchActor:
         self.state = replace(
             self.state,
             action_state="HUMAN_SPEAKING",
+            speech_budget_start_ms=(
+                self.state.speech_budget_start_ms
+                if self.state.current_speech_id is not None
+                else self._free_remaining_ms(str(self.state.current_speaker_side))
+                if self.state.formal_4v4 and action.action_kind == "FREE_DEBATE"
+                else None
+            ),
+            speech_consumed_ms=(
+                self.state.speech_consumed_ms if self.state.current_speech_id is not None else 0
+            ),
+            speech_budget_settled=False,
             current_speech_id=speech_id,
             interim_text="",
             current_speaker_side=action.side or self.state.current_speaker_side,
@@ -1924,6 +2166,13 @@ class MatchActor:
         self.state = replace(
             self.state,
             action_state="AGENT_SPEAKING",
+            speech_budget_start_ms=(
+                self._free_remaining_ms(str(self.state.current_speaker_side))
+                if self.state.formal_4v4 and action.action_kind == "FREE_DEBATE"
+                else None
+            ),
+            speech_consumed_ms=0,
+            speech_budget_settled=False,
             current_speech_id=speech_id,
             interim_text="",
             current_speaker_side=action.side or self.state.current_speaker_side,
@@ -2041,6 +2290,7 @@ class MatchActor:
         return self._finish_agent_speech("COMPLETED")
 
     def _finish_agent_speech(self, reason: str) -> tuple[MatchEvent, ...]:
+        self._freeze_speech_budget(terminal=True, time_limit=reason == "TIME_LIMIT")
         self._cancel_timer()
         self.state = replace(
             self.state,
@@ -2092,6 +2342,7 @@ class MatchActor:
         return self._advance_action("agent.finalized", dict(command.payload))
 
     def _finish_speech(self, reason: str) -> tuple[MatchEvent, ...]:
+        self._freeze_speech_budget(terminal=True, time_limit=reason == "TIME_LIMIT")
         self._cancel_timer()
         speech_id = self.state.current_speech_id
         self.state = replace(
@@ -2157,8 +2408,10 @@ class MatchActor:
         existing_selection_deadline = self.state.selection_deadline_mono
         if action is None or action.action_kind != "FREE_DEBATE" or side is None:
             raise MatchDomainError("match_state_conflict")
-        consumed_ms = int(payload.get("audio_duration_ms", 0))
-        if consumed_ms <= 0:
+        consumed_ms = (
+            0 if self.state.speech_budget_settled else int(payload.get("audio_duration_ms", 0))
+        )
+        if consumed_ms <= 0 and not self.state.speech_budget_settled:
             consumed_ms = self.state.speech_remaining_ms or 0
         consumed_ms = min(consumed_ms, self._free_remaining_ms(side))
         remaining = max(0, self._free_remaining_ms(side) - consumed_ms)
@@ -2170,17 +2423,12 @@ class MatchActor:
             next_remaining = 0
         if next_remaining <= 0 and remaining <= 0:
             self._cancel_timer()
-            finished = self._event(
-                event_type,
-                {
-                    **dict(payload),
-                    "opportunity_id": str(completed_opportunity_id),
-                },
-            )
             self.state = replace(
                 self.state,
-                status="FINISHED",
-                action_state="MATCH_FINISHED",
+                action_state="ACTION_FINISHED",
+                speech_budget_start_ms=None,
+                speech_consumed_ms=0,
+                speech_budget_settled=False,
                 current_speech_id=None,
                 interim_text="",
                 current_speaker_user_id=None,
@@ -2194,16 +2442,34 @@ class MatchActor:
                 ),
                 free_negative_remaining_ms=(remaining if side == "NEGATIVE" else next_remaining),
                 hand_window_open=False,
+                hand_queue=(),
                 agent_hand_queue=(),
                 agent_selection_mode=None,
                 agent_decision_round_id=None,
                 agent_decisions=(),
+                opportunity_id=None,
+                allocated_opportunity_id=None,
+                selection_phase=None,
+                agent_effective_status=None,
+                selection_deadline_mono=None,
+                selection_remaining_ms=None,
+                human_wait_deadline_mono=None,
+                human_wait_remaining_ms=None,
             )
-            return finished, self._event("match.finished", {})
+            return self._advance_action(
+                event_type,
+                {
+                    **dict(payload),
+                    "opportunity_id": str(completed_opportunity_id),
+                },
+            )
         self._cancel_timer()
         self.state = replace(
             self.state,
             action_state="FREE_SELECTING",
+            speech_budget_start_ms=None,
+            speech_consumed_ms=0,
+            speech_budget_settled=False,
             current_speech_id=None,
             interim_text="",
             current_speaker_user_id=None,
@@ -2285,14 +2551,279 @@ class MatchActor:
         self._schedule_internal(3.0, "hand.window_closed", f"internal:free:{self.state.sequence}")
         return completed, opened, decision_started
 
+    def _emergency_target(self, command: MatchCommand, kind: str) -> tuple[dict[str, Any], bool]:
+        if not command.payload.get("privileged"):
+            raise MatchDomainError("forbidden")
+        operation_id = str(_payload_uuid(command.payload.get("operation_id"), required=True))
+        previous = self.state.emergency_operation
+        if previous and previous.get("id") == operation_id:
+            if previous.get("kind") != kind or any(
+                command.payload.get(request) != previous.get(saved)
+                for request, saved in (
+                    ("expected_sequence", "target_sequence"),
+                    ("expected_action_key", "action_key"),
+                    ("expected_stage_generation", "stage_generation"),
+                    ("expected_speech_id", "speech_id"),
+                    ("expected_context_version", "target_context_version"),
+                )
+            ):
+                raise MatchDomainError("match_state_conflict")
+            return dict(previous), True
+        action = self.state.current_action
+        if action is None or (
+            command.payload.get("expected_sequence") != self.state.sequence
+            or command.payload.get("expected_action_key") != action.action_key
+            or command.payload.get("expected_stage_generation") != self.state.stage_generation
+            or command.payload.get("expected_speech_id")
+            != (str(self.state.current_speech_id) if self.state.current_speech_id else None)
+            or not isinstance(command.payload.get("expected_context_version"), int)
+        ):
+            raise MatchDomainError("match_state_conflict")
+        operation = {
+            "id": operation_id,
+            "kind": kind,
+            "status": "PENDING",
+            "generation": int(previous.get("generation", 0) if previous else 0) + 1,
+            "action_key": action.action_key,
+            "stage_generation": self.state.stage_generation,
+            "stage_position": action.stage_position,
+            "speech_id": command.payload.get("expected_speech_id"),
+            "context_version": int(command.payload["expected_context_version"]) + 1,
+            "target_context_version": command.payload["expected_context_version"],
+            "target_sequence": command.payload["expected_sequence"],
+            "speaker_kind": "AGENT" if self.state.current_agent_profile_id else "HUMAN",
+            "user_id": str(self.state.current_speaker_user_id)
+            if self.state.current_speaker_user_id
+            else None,
+            "agent_profile_id": str(self.state.current_agent_profile_id)
+            if self.state.current_agent_profile_id
+            else None,
+            "side": self.state.current_speaker_side,
+            "seat_no": self.state.current_speaker_seat_no,
+            "opportunity_id": str(self.state.allocated_opportunity_id or self.state.opportunity_id)
+            if (self.state.allocated_opportunity_id or self.state.opportunity_id)
+            else None,
+        }
+        return operation, False
+
+    def _paused_recovery(self, restored: str) -> None:
+        self._cancel_timer()
+        self.state = replace(
+            self.state,
+            status="PAUSED",
+            action_state="RECOVERY_REQUIRED",
+            paused_from_status="RUNNING",
+            paused_from_action_state=cast(ActionState, restored),
+            speech_deadline_mono=None,
+            human_start_deadline_mono=None,
+            host_audio_deadline_mono=None,
+            host_audio_deadline_ms=None,
+            selection_deadline_mono=None,
+            human_wait_deadline_mono=None,
+            current_speech_id=None,
+            speech_start_sequence=None,
+            interim_text="",
+            hand_window_open=False,
+            hand_queue=(),
+            agent_hand_queue=(),
+            agent_decision_round_id=None,
+            agent_decisions=(),
+        )
+
+    def _stage_reset(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
+        operation, duplicate = self._emergency_target(command, "stage.reset")
+        if duplicate:
+            return ()
+        checkpoint = self.state.stage_checkpoint
+        action = self.state.current_action
+        if (
+            checkpoint is None
+            or action is None
+            or checkpoint.get("version") != 1
+            or checkpoint.get("match_id") != str(self.state.match_id)
+            or checkpoint.get("stage_position") != action.stage_position
+            or checkpoint.get("generation") != self.state.stage_generation
+        ):
+            raise MatchDomainError("match_state_conflict")
+        index = int(checkpoint["action_index"])
+        if (
+            not 0 <= index < len(self.state.actions)
+            or self.state.actions[index].action_key != checkpoint["action_key"]
+        ):
+            raise MatchDomainError("match_state_conflict")
+        action_keys = [
+            item.action_key
+            for item in self.state.actions
+            if item.stage_position == action.stage_position
+        ]
+        generation = self.state.stage_generation + 1
+        operation.update(status="SUCCEEDED")
+        self.state = replace(
+            self.state,
+            current_action_index=index,
+            stage_generation=generation,
+            stage_checkpoint={**checkpoint, "generation": generation},
+            emergency_operation=operation,
+            free_source_speech_id=None,
+            free_affirmative_remaining_ms=checkpoint.get("affirmative_budget_ms"),
+            free_negative_remaining_ms=checkpoint.get("negative_budget_ms"),
+            current_speaker_user_id=None,
+            current_agent_profile_id=None,
+            current_speaker_side=None,
+            current_speaker_seat_no=None,
+            speech_remaining_ms=None,
+            speech_budget_start_ms=None,
+            speech_consumed_ms=0,
+            speech_budget_settled=False,
+            opportunity_id=None,
+            allocated_opportunity_id=None,
+            selection_phase=None,
+            agent_effective_status=None,
+            opportunity_generation=self.state.opportunity_generation + 1,
+        )
+        self._paused_recovery("NOT_STARTED")
+        return (self._event("stage.reset", {**operation, "action_keys": action_keys}),)
+
+    def _speech_skip_begin(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
+        operation, duplicate = self._emergency_target(command, "speech.skip")
+        if duplicate:
+            return ()
+        current = (
+            self.state.paused_from_action_state
+            if self.state.status != "RUNNING"
+            else self.state.action_state
+        )
+        if (
+            current
+            not in {
+                "HUMAN_READY_TO_START",
+                "HUMAN_SPEAKING",
+                "SPEECH_FINALIZING",
+                "AGENT_PREPARING",
+                "AGENT_SPEAKING",
+                "AGENT_FINALIZING",
+            }
+            or operation["side"] is None
+            or operation["seat_no"] is None
+        ):
+            raise MatchDomainError("match_state_conflict")
+        if not operation["user_id"] and not operation["agent_profile_id"]:
+            raise MatchDomainError("match_state_conflict")
+        self._freeze_speech_budget(terminal=True)
+        operation["used_budget_ms"] = self.state.speech_consumed_ms
+        self.state = replace(self.state, emergency_operation=operation)
+        self._paused_recovery(
+            "AGENT_PREPARING" if operation["agent_profile_id"] else "HUMAN_READY_TO_START"
+        )
+        return (self._event("speech.skip.started", operation),)
+
+    def _skip_operation(self, command: MatchCommand) -> dict[str, Any]:
+        operation = self.state.emergency_operation
+        if not command.payload.get("privileged"):
+            raise MatchDomainError("forbidden")
+        if (
+            not operation
+            or operation.get("kind") != "speech.skip"
+            or operation.get("id") != command.payload.get("operation_id")
+            or operation.get("generation") != command.payload.get("operation_generation")
+            or operation.get("context_version") != command.payload.get("context_version")
+            or self.state.status != "PAUSED"
+        ):
+            raise MatchDomainError("stale_callback")
+        return dict(operation)
+
+    def _speech_skip_complete(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
+        operation = self._skip_operation(command)
+        if operation["status"] != "PENDING":
+            return ()
+        text = command.payload.get("text")
+        if not isinstance(text, str) or not text.strip() or len(text) > 1000:
+            raise MatchDomainError("match_state_conflict")
+        action = self.state.current_action
+        if action is None or action.action_key != operation["action_key"]:
+            raise MatchDomainError("stale_callback")
+        payload = {
+            **operation,
+            "speech_id": str(uuid4()),
+            "source_speech_id": operation["speech_id"],
+            "final_text": text.strip(),
+            "origin": "ADMIN_PLACEHOLDER",
+        }
+        operation.update(status="SUCCEEDED")
+        index = self.state.current_action_index
+        restored = "NOT_STARTED"
+        holder = self.state.free_holder_side
+        if action.action_kind == "FREE_DEBATE":
+            opposite = self._opposite_side(str(operation["side"]))
+            holder = (
+                opposite
+                if self._free_remaining_ms(opposite) >= FREE_MINIMUM_SPEECH_MS
+                else str(operation["side"])
+            )
+            if self._free_remaining_ms(holder) >= FREE_MINIMUM_SPEECH_MS:
+                restored = "FREE_SELECTING"
+            else:
+                index += 1
+        else:
+            index += 1
+        self.state = replace(
+            self.state,
+            current_action_index=index,
+            emergency_operation=operation,
+            free_holder_side=holder,
+            opportunity_id=None,
+            allocated_opportunity_id=None,
+            selection_phase=None,
+            agent_effective_status=None,
+            opportunity_generation=self.state.opportunity_generation + 1,
+            current_speaker_user_id=None,
+            current_agent_profile_id=None,
+            current_speaker_side=None,
+            current_speaker_seat_no=None,
+            speech_remaining_ms=None,
+            speech_budget_start_ms=None,
+            speech_consumed_ms=0,
+            speech_budget_settled=False,
+        )
+        self._paused_recovery(restored)
+        return (self._event("speech.skipped", payload),)
+
+    def _speech_skip_fail(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
+        operation = self._skip_operation(command)
+        if operation["status"] != "PENDING":
+            return ()
+        operation.update(status="CANCELLED" if command.type.endswith("cancel") else "FAILED")
+        code = command.payload.get("error_code")
+        if (
+            isinstance(code, str)
+            and code.isascii()
+            and code.replace("_", "").isalnum()
+            and len(code) <= 100
+        ):
+            operation["error_code"] = code
+        self.state = replace(self.state, emergency_operation=operation)
+        return (self._event("speech.skip.failed", operation),)
+
     def _speech_reset(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
+        operation = None
+        previous_status = self.state.status
+        if command.payload.get("operation_id"):
+            operation, duplicate = self._emergency_target(command, "speech.reset")
+            if duplicate:
+                return ()
+            if previous_status != "RUNNING":
+                self.state = replace(
+                    self.state,
+                    status="RUNNING",
+                    action_state=self.state.paused_from_action_state or self.state.action_state,
+                )
         if self.state.action_state not in (
             "HUMAN_SPEAKING",
             "SPEECH_FINALIZING",
             "AGENT_PREPARING",
             "AGENT_SPEAKING",
             "AGENT_FINALIZING",
-        ):
+        ) and not (operation is not None and self.state.action_state == "HUMAN_READY_TO_START"):
             raise MatchDomainError("match_state_conflict")
         if command.actor_user_id != self.state.current_speaker_user_id and not bool(
             command.payload.get("privileged")
@@ -2329,7 +2860,12 @@ class MatchActor:
                 raise MatchDomainError("match_state_conflict")
             if not agent_action and speaker_user_id is None:
                 raise MatchDomainError("match_state_conflict")
-            duration_ms = self._free_turn_duration_ms(action, side)
+            duration_ms = min(
+                action.free_max_speech_seconds * 1000,
+                self.state.speech_budget_start_ms
+                if self.state.speech_budget_start_ms is not None
+                else self._free_remaining_ms(side),
+            )
         else:
             duration_ms = action.duration_seconds * 1000
         invalidated_opportunity_id = (
@@ -2341,6 +2877,21 @@ class MatchActor:
             self.state,
             action_state="AGENT_PREPARING" if agent_action else "HUMAN_READY_TO_START",
             current_speech_id=None,
+            interim_text="",
+            free_affirmative_remaining_ms=(
+                self.state.speech_budget_start_ms
+                if side == "AFFIRMATIVE" and self.state.speech_budget_start_ms is not None
+                else self.state.free_affirmative_remaining_ms
+            ),
+            free_negative_remaining_ms=(
+                self.state.speech_budget_start_ms
+                if side == "NEGATIVE" and self.state.speech_budget_start_ms is not None
+                else self.state.free_negative_remaining_ms
+            ),
+            speech_budget_start_ms=None,
+            speech_consumed_ms=0,
+            speech_budget_settled=False,
+            opportunity_generation=self.state.opportunity_generation + 1,
             speech_start_sequence=None,
             current_speaker_user_id=speaker_user_id,
             current_agent_profile_id=agent_profile_id,
@@ -2394,21 +2945,27 @@ class MatchActor:
             payload["side"] = side
         if seat_no is not None:
             payload["seat_no"] = seat_no
+        invalidated = (
+            self._event(
+                "free.opportunity_invalidated",
+                {"opportunity_id": str(invalidated_opportunity_id), "reason": "SPEECH_RESET"},
+            )
+            if invalidated_opportunity_id is not None
+            else None
+        )
+        if operation is not None:
+            payload["operation_id"] = operation["id"]
         ready = self._event(
             "agent.preparing" if agent_action else "speech.ready",
             payload,
         )
-        if invalidated_opportunity_id is not None:
-            return (
-                self._event(
-                    "free.opportunity_invalidated",
-                    {
-                        "opportunity_id": str(invalidated_opportunity_id),
-                        "reason": "SPEECH_RESET",
-                    },
-                ),
-                ready,
-            )
+        if operation is not None:
+            operation.update(status="SUCCEEDED")
+            self.state = replace(self.state, emergency_operation=operation)
+            self._paused_recovery("AGENT_PREPARING" if agent_action else "HUMAN_READY_TO_START")
+            ready = replace(ready, type="speech.reset")
+        if invalidated is not None:
+            return invalidated, ready
         return (ready,)
 
     def _advance_action(
@@ -2436,9 +2993,13 @@ class MatchActor:
         if not bool(command.payload.get("privileged")):
             raise MatchDomainError("forbidden")
         self._cancel_timer()
+        operation = self.state.emergency_operation
+        if operation and operation.get("status") == "PENDING":
+            operation = {**operation, "status": "CANCELLED", "error_code": "match_terminated"}
         self.state = replace(
             self.state,
             status="TERMINATED",
+            emergency_operation=operation,
             action_state="MATCH_FINISHED",
             current_speech_id=None,
             interim_text="",
@@ -2449,6 +3010,7 @@ class MatchActor:
     def _match_pause(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
         if self.state.status != "RUNNING" or not bool(command.payload.get("authorized")):
             raise MatchDomainError("forbidden")
+        self._freeze_speech_budget()
         remaining_ms = self.state.speech_remaining_ms
         if self.state.speech_deadline_mono is not None:
             remaining_ms = max(0, int((self.state.speech_deadline_mono - self._clock()) * 1000))
@@ -2469,10 +3031,15 @@ class MatchActor:
             )
         self._cancel_timer()
         previous_action_state = self.state.action_state
+        # When pausing during an in-progress speaking turn in free debate, the
+        # opportunity must be invalidated regardless of selection_deadline_mono.
+        # selection_deadline_mono may retain a leftover value from the previous
+        # selection window; it is irrelevant while a speaker is active. Failing to
+        # invalidate leaves a stale opportunity (and its hand_queue/agent_decisions)
+        # active after resume.
         invalidate_speech_opportunity = (
             self.state.free_competition_enabled
             and self.state.opportunity_id is not None
-            and self.state.selection_deadline_mono is None
             and previous_action_state in {"HUMAN_SPEAKING", "AGENT_SPEAKING"}
         )
         invalidated_opportunity_id = (
@@ -2579,7 +3146,27 @@ class MatchActor:
             restored = "HUMAN_READY_TO_START"
         elif restored in ("AGENT_SPEAKING", "AGENT_FINALIZING"):
             restored = "AGENT_PREPARING"
-            self.state = replace(self.state, current_speech_id=None, interim_text="")
+            # An interrupted Agent turn must be rebuilt from authoritative
+            # state.  Carrying the old decision round or hand queue into the
+            # new preparation phase lets a late callback select against a
+            # speech that was already invalidated during pause.
+            self.state = replace(
+                self.state,
+                current_speech_id=None,
+                interim_text="",
+                hand_queue=(),
+                agent_hand_queue=(),
+                agent_selection_mode=None,
+                agent_decision_round_id=None,
+                agent_decisions=(),
+                opportunity_id=None,
+                allocated_opportunity_id=None,
+                hand_window_open=False,
+                selection_phase=None,
+                agent_effective_status=None,
+                selection_deadline_mono=None,
+                human_wait_deadline_mono=None,
+            )
         self.state = replace(
             self.state,
             status="RUNNING",
@@ -2602,15 +3189,21 @@ class MatchActor:
         if restored == "HUMAN_READY_TO_START":
             self._schedule_human_start_timeout()
             return (resumed,)
-        if restored == "HOST_ANNOUNCING" and self.state.host_audio_remaining_ms is not None:
-            remaining = self.state.host_audio_remaining_ms
+        if restored == "HOST_ANNOUNCING":
+            # Host media restarts from the first frame; its display and guard
+            # therefore use the complete frozen asset, not a pre-pause offset.
+            remaining = max(0, action.host_audio_duration_ms or 0) if action is not None else 0
             self.state = replace(
                 self.state,
+                host_audio_remaining_ms=remaining,
                 host_audio_deadline_mono=self._clock() + remaining / 1000,
                 host_audio_deadline_ms=int(self._wall_clock() * 1000) + remaining,
             )
             self._schedule_internal(
-                remaining / 1000, "host.elapsed", f"internal:host-resume:{self.state.sequence}"
+                host_audio_guard_seconds(remaining),
+                "host.elapsed",
+                f"internal:host-resume:{self.state.sequence}",
+                payload={"guard": True},
             )
             return (resumed,)
         if restored == "PREPARING" and self.state.speech_remaining_ms is not None:
@@ -2766,6 +3359,7 @@ class MatchActor:
             self.state.action_state == "HUMAN_SPEAKING"
             and self.state.current_speaker_user_id == command.actor_user_id
         ):
+            self._freeze_speech_budget()
             current_view = self.view()
             self._cancel_timer()
             self.state = replace(
@@ -2954,6 +3548,29 @@ class MatchActor:
         return (self._event("match.system_recovery", {}),)
 
     def _system_error(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
+        source_wait_owner = command.payload.get("source_wait_owner")
+        if source_wait_owner is not None and (
+            self.state.status != "RUNNING"
+            or self.state.action_state != "AGENT_PREPARING"
+            or source_wait_owner
+            != {
+                "action_key": self.state.current_action.action_key
+                if self.state.current_action
+                else None,
+                "agent_profile_id": str(self.state.current_agent_profile_id),
+                "stage_generation": self.state.stage_generation,
+                "opportunity_generation": self.state.opportunity_generation,
+                "opportunity_id": _uuid_text(
+                    self.state.allocated_opportunity_id or self.state.opportunity_id
+                ),
+                "source_speech_id": _uuid_text(self.state.free_source_speech_id),
+            }
+        ):
+            return ()
+        if command.host_guard_id is not None and not self.host_guard_is_current(
+            command.host_guard_id
+        ):
+            return ()
         current_view = self.view()
         self._cancel_timer()
         asr_failure = bool(command.payload.get("asr_failure"))
@@ -2975,12 +3592,17 @@ class MatchActor:
             restart_action_state = "HUMAN_READY_TO_START"
         retry_duration_ms = current_view.speech_remaining_ms
         if asr_failure and action is not None:
-            retry_duration_ms = (
-                self._free_turn_duration_ms(action, str(self.state.current_speaker_side))
-                if action.action_kind == "FREE_DEBATE"
-                and self.state.current_speaker_side is not None
-                else action.duration_seconds * 1000
-            )
+            if action.action_kind == "FREE_DEBATE":
+                # In FREE_SELECTING the current_speaker_side is None. Use the
+                # per-turn max (free_max_speech_seconds), not the entire
+                # free-debate duration, so the human gets a bounded retry.
+                retry_duration_ms = (
+                    self._free_turn_duration_ms(action, str(self.state.current_speaker_side))
+                    if self.state.current_speaker_side is not None
+                    else action.free_max_speech_seconds * 1000
+                )
+            else:
+                retry_duration_ms = action.duration_seconds * 1000
         self.state = replace(
             self.state,
             status="ERROR",
@@ -3084,6 +3706,13 @@ class MatchActor:
 
         self._timer_deadline_mono = self._clock() + delay_seconds
         self._timer_command_type = command_type
+        timer_payload = dict(payload or {})
+        host_guard_id = None
+        if command_type == "host.elapsed" and timer_payload.get("guard"):
+            # Installed only after a successful authoritative commit. A timer
+            # already in the queue retains its old identity across recovery.
+            self._host_guard_id = uuid4()
+            host_guard_id = self._host_guard_id
 
         async def submit_after_delay() -> None:
             try:
@@ -3096,7 +3725,8 @@ class MatchActor:
                     MatchCommand(
                         type=command_type,
                         message_id=message_id,
-                        payload=payload or {},
+                        payload=timer_payload,
+                        host_guard_id=host_guard_id,
                     )
                 )
             except asyncio.CancelledError:
@@ -3130,6 +3760,7 @@ class MatchActor:
                             type="system.error",
                             message_id=f"internal-error:{command_type}:{message_id}",
                             payload={"error_code": "internal_timer_failed"},
+                            host_guard_id=host_guard_id,
                         )
                     )
                 except Exception as recovery_error:
@@ -3144,6 +3775,15 @@ class MatchActor:
 
         self._timer = asyncio.create_task(submit_after_delay())
 
+    def host_guard_is_current(self, guard_id: UUID | None) -> bool:
+        """A host deadline and its failure fallback belong to one committed cycle."""
+        return (
+            guard_id is not None
+            and guard_id == self._host_guard_id
+            and self.state.status == "RUNNING"
+            and self.state.action_state == "HOST_ANNOUNCING"
+        )
+
     def _cancel_timer(self) -> None:
         if self._processing:
             self._pending_cancel_timer = True
@@ -3152,6 +3792,7 @@ class MatchActor:
         self._cancel_timer_now()
 
     def _cancel_timer_now(self) -> None:
+        self._host_guard_id = None
         if self._timer is not None and self._timer is not asyncio.current_task():
             self._timer.cancel()
         self._timer = None

@@ -8,6 +8,7 @@ import {
   ListChecks,
   Settings2,
   ShieldCheck,
+  Volume2,
 } from 'lucide-react';
 import Link from 'next/link';
 import { useParams } from 'next/navigation';
@@ -40,6 +41,30 @@ type Stage = {
   }>;
   prompts: Prompt[];
 };
+type AudioAsset = {
+  id: string;
+  generation_id: string | null;
+  segment_key: string;
+  text: string;
+  status: string;
+  error_code: string | null;
+  duration_ms: number | null;
+  preview_url: string | null;
+};
+type AudioGeneration = {
+  id: string;
+  manifest_hash: string;
+  status: string;
+  review_status: string;
+  requested_at: string;
+  completed_at: string | null;
+  total_count: number;
+  ready_count: number;
+  failed_count: number;
+  last_error_code: string | null;
+  assets: AudioAsset[];
+} | null;
+
 type Workspace = {
   rule: RuleRow;
   agent_count: number;
@@ -51,13 +76,14 @@ type Workspace = {
     include_in_leaderboard: boolean;
   } | null;
 };
-type Tab = 'basic' | 'stages' | 'prompts' | 'judge' | 'validation';
+type Tab = 'basic' | 'stages' | 'prompts' | 'judge' | 'audio' | 'validation';
 
 const tabs: Array<{ id: Tab; label: string; icon: typeof Settings2 }> = [
   { id: 'basic', label: '基本信息', icon: Settings2 },
   { id: 'stages', label: '阶段流程', icon: ListChecks },
   { id: 'prompts', label: 'Agent Prompt', icon: FileText },
   { id: 'judge', label: 'AI 裁判', icon: Gavel },
+  { id: 'audio', label: '主持音频', icon: Volume2 },
   { id: 'validation', label: '校验与启停', icon: ShieldCheck },
 ];
 
@@ -66,6 +92,7 @@ export default function RuleWorkspacePage() {
   const toast = useOptionalToast();
   const [workspace, setWorkspace] = useState<Workspace | null>(null);
   const [catalog, setCatalog] = useState<Catalog | null>(null);
+  const [audio, setAudio] = useState<AudioGeneration>(null);
   const [tab, setTab] = useState<Tab>('stages');
   const [selectedStage, setSelectedStage] = useState<Stage | null>(null);
   const [error, setError] = useState('');
@@ -79,6 +106,9 @@ export default function RuleWorkspacePage() {
       ]);
       setWorkspace(nextWorkspace);
       setCatalog(nextCatalog);
+      void requestJson<AudioGeneration>(`/api/admin/rules/${ruleId}/audio`)
+        .then(setAudio)
+        .catch(() => undefined);
       setError('');
     } catch (requestError: unknown) {
       setError(readableAdminError(requestError));
@@ -97,6 +127,9 @@ export default function RuleWorkspacePage() {
         if (!active) return;
         setWorkspace(nextWorkspace);
         setCatalog(nextCatalog);
+        void requestJson<AudioGeneration>(`/api/admin/rules/${ruleId}/audio`)
+          .then(setAudio)
+          .catch(() => undefined);
         setError('');
       })
       .catch((requestError: unknown) => {
@@ -172,14 +205,23 @@ export default function RuleWorkspacePage() {
           showMessage={(message, tone) => toast?.showToast({ message, tone })}
         />
       ) : null}
+      {tab === 'audio' ? (
+        <AudioTab
+          audio={audio}
+          onSaved={async () => {
+            await load();
+          }}
+          rule={rule}
+          ruleId={ruleId}
+          showMessage={(message, tone) => toast?.showToast({ message, tone })}
+        />
+      ) : null}
       {tab === 'validation' ? (
         <ValidationTab
           onSaved={load}
           rule={rule}
           ruleId={ruleId}
           showMessage={(message, tone) => toast?.showToast({ message, tone })}
-          stages={workspace.stages}
-          agentCount={workspace.agent_count}
         />
       ) : null}
 
@@ -691,42 +733,125 @@ function JudgeTab({
   );
 }
 
+function AudioTab({
+  audio,
+  rule,
+  ruleId,
+  onSaved,
+  showMessage,
+}: {
+  audio: AudioGeneration;
+  rule: RuleRow;
+  ruleId: string;
+  onSaved: () => Promise<void>;
+  showMessage: (message: string, tone: 'success' | 'error') => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  async function action(path: string, body?: object) {
+    setBusy(true);
+    try {
+      await requestJson(`/api/admin/rules/${ruleId}/audio${path}`, {
+        method: 'POST',
+        body: body ? JSON.stringify(body) : '{}',
+      });
+      showMessage('主持音频状态已更新', 'success');
+      await onSaved();
+    } catch (requestError: unknown) {
+      showMessage(readableAdminError(requestError), 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+  const canApprove = audio?.status === 'SUCCEEDED' && audio.review_status === 'PENDING';
+  return (
+    <AdminPanel
+      description="主持词按当前配置生成独立批次。只有全部试听通过后，规则才可启用。"
+      title="主持音频工作台"
+    >
+      <div className="space-y-4">
+        <div className="flex flex-wrap items-center gap-3 rounded-lg border border-slate-200 bg-slate-50 p-4">
+          <span className="text-sm font-bold text-slate-700">当前批次</span>
+          <StatusBadge status={audio?.status ?? 'NOT_CREATED'} />
+          {audio ? (
+            <span className="text-xs text-slate-500">
+              {audio.ready_count}/{audio.total_count} 条就绪 ·{' '}
+              {audio.review_status === 'APPROVED' ? '已批准' : '待审核'}
+            </span>
+          ) : (
+            <span className="text-xs text-slate-500">尚未创建生成批次</span>
+          )}
+          <span className="flex-1" />
+          <AdminButton
+            disabled={busy || rule.historical_read_only}
+            onClick={() => void action('/generate')}
+          >
+            {audio ? '重新生成' : '生成主持音频'}
+          </AdminButton>
+          {audio?.status === 'FAILED' ? (
+            <AdminButton disabled={busy} onClick={() => void action('/retry')}>
+              重试失败项
+            </AdminButton>
+          ) : null}
+          {canApprove ? (
+            <AdminButton
+              disabled={busy}
+              onClick={() =>
+                void action('/approve', {
+                  generation_id: audio.id,
+                  manifest_hash: audio.manifest_hash,
+                })
+              }
+              tone="primary"
+            >
+              批准当前批次
+            </AdminButton>
+          ) : null}
+        </div>
+        {audio?.last_error_code ? (
+          <AdminFeedback message={`最近错误：${audio.last_error_code}`} tone="error" />
+        ) : null}
+        {audio?.assets.length ? (
+          <div className="divide-y divide-slate-200 rounded-lg border border-slate-200">
+            {audio.assets.map((asset) => (
+              <div className="flex flex-wrap items-center gap-3 p-3" key={asset.id}>
+                <span className="w-36 text-xs font-bold text-slate-700">{asset.segment_key}</span>
+                <span className="min-w-52 flex-1 text-sm text-slate-800">{asset.text}</span>
+                <StatusBadge status={asset.status} />
+                {asset.error_code ? (
+                  <span className="text-xs text-red-700">{asset.error_code}</span>
+                ) : null}
+                {asset.preview_url ? (
+                  <audio controls preload="none" src={asset.preview_url} />
+                ) : null}
+              </div>
+            ))}
+          </div>
+        ) : (
+          <AdminFeedback message="生成批次尚未产生音频条目。" tone="info" />
+        )}
+      </div>
+    </AdminPanel>
+  );
+}
+
 function ValidationTab({
   rule,
   ruleId,
-  stages,
-  agentCount,
   onSaved,
   showMessage,
 }: {
   rule: RuleRow;
   ruleId: string;
-  stages: Stage[];
-  agentCount: number;
   onSaved: () => Promise<void>;
   showMessage: (message: string, tone: 'success' | 'error') => void;
 }) {
   const checks = [
-    { label: '正式 4v4', ok: rule.side_size === 4 && !rule.historical_read_only },
-    { label: 'Agent 候选不少于 8 个', ok: agentCount >= 8 },
-    {
-      label: '每个发言阶段已配置 Prompt',
-      ok: stages.every((stage) =>
-        stage.stage_kind === 'FIXED_SPEECH'
-          ? stage.prompts.some((item) => item.purpose === 'SPEECH')
-          : stage.stage_kind === 'FREE_DEBATE'
-            ? stage.prompts.length === 2
-            : true,
-      ),
-    },
+    { label: 'Core 赛制基础校验（纯真人无需 Agent 依赖）', ok: rule.readiness === 'READY' },
   ];
-  async function action(name: 'enable' | 'disable' | 'review-audio') {
+  async function action(name: 'enable' | 'disable') {
     try {
       await requestJson(`/api/admin/rules/${ruleId}/${name}`, { method: 'POST', body: '{}' });
-      showMessage(
-        name === 'enable' ? '规则已启用' : name === 'disable' ? '规则已停用' : '主持音频已审核',
-        'success',
-      );
+      showMessage(name === 'enable' ? '规则已启用' : '规则已停用', 'success');
       await onSaved();
     } catch (requestError: unknown) {
       showMessage(readableAdminError(requestError), 'error');
@@ -735,6 +860,13 @@ function ValidationTab({
   return (
     <AdminPanel description="全部校验通过后才能用于新建房间。" title="校验与启停">
       <div className="space-y-3">
+        <p className="text-sm">
+          可用 Agent：{rule.available_agent_count ?? 0}；纯 Agent{' '}
+          {rule.pure_agent_available ? '可用' : '需八个合格候选'}。
+        </p>
+        {rule.blockers?.map((item) => (
+          <AdminFeedback key={item.code} message={`${item.message}：${item.action}`} tone="error" />
+        ))}
         {checks.map((check) => (
           <div
             className="flex items-center justify-between border-b border-slate-100 py-3"
@@ -751,9 +883,6 @@ function ValidationTab({
           </div>
         ))}
         <div className="flex flex-wrap gap-2 pt-3">
-          {rule.status === 'GENERATING_AUDIO' ? (
-            <AdminButton onClick={() => void action('review-audio')}>审核主持音频</AdminButton>
-          ) : null}
           {rule.status === 'ENABLED' ? (
             <AdminButton onClick={() => void action('disable')}>停用规则</AdminButton>
           ) : (

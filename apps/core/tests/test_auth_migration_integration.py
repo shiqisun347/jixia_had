@@ -35,6 +35,7 @@ from jx_core.models import (
     MatchEvent,
     ModelProfile,
     Room,
+    RoomConnectionLease,
     RoomMember,
     Rule,
     RuleStage,
@@ -220,19 +221,23 @@ async def test_agent_catalog_duplicate_and_edit(auth_database_url: str) -> None:
 async def auth_database_url() -> AsyncGenerator[str, None]:
     database_url = _test_database_url()
     _run_alembic(database_url, "upgrade", "head")
+    truncate = text(
+        "TRUNCATE match_events, speeches, matches, background_tasks, device_checks, "
+        "seats, room_members, rooms, host_audio_assets, stage_actions, rule_stages, rules, "
+        "topics, agent_profiles, model_profiles, voice_profiles, audit_logs, "
+        "room_connections, user_consents, sessions, users CASCADE"
+    )
+    engine = create_async_engine(database_url)
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(truncate)
+    finally:
+        await engine.dispose()
     yield database_url
     engine = create_async_engine(database_url)
     try:
         async with engine.begin() as connection:
-            await connection.execute(
-                text(
-                    "TRUNCATE match_events, speeches, matches, background_tasks, device_checks, "
-                    "seats, room_members, rooms, "
-                    "host_audio_assets, stage_actions, rule_stages, rules, topics, "
-                    "agent_profiles, model_profiles, voice_profiles, audit_logs, "
-                    "room_connections, user_consents, sessions, users CASCADE"
-                )
-            )
+            await connection.execute(truncate)
     finally:
         await engine.dispose()
 
@@ -471,6 +476,15 @@ async def test_enabling_new_rule_version_disables_only_older_enabled_version(
                 )
                 session.add_all([old_version, new_version, unrelated])
                 await session.flush()
+                session.add(
+                    RuleStage(
+                        rule_id=new_version.id,
+                        position=1,
+                        name="结束",
+                        stage_kind="END",
+                    )
+                )
+                await session.flush()
                 for index in range(8):
                     voice = VoiceProfile(
                         name=f"版本规则音色 {index + 1}",
@@ -646,6 +660,7 @@ async def test_rule_stage_update_replaces_actions_and_uses_a_new_audio_asset(
             replacement = await session.scalar(
                 select(HostAudioAsset).where(
                     HostAudioAsset.rule_id == rule.id,
+                    HostAudioAsset.generation_id == rule.current_audio_generation_id,
                     HostAudioAsset.segment_key == "stage-1-start",
                 )
             )
@@ -727,7 +742,7 @@ async def test_referenced_rule_is_archived_instead_of_deleted(
 
 
 @pytest.mark.asyncio
-async def test_voice_delete_removes_unreferenced_and_disables_referenced_agents(
+async def test_voice_delete_preserves_referenced_rule_preferences_and_blocks_availability(
     auth_database_url: str,
 ) -> None:
     engine = create_async_engine(auth_database_url)
@@ -736,12 +751,15 @@ async def test_voice_delete_removes_unreferenced_and_disables_referenced_agents(
     rules = RuleService()
     try:
         async with factory() as session:
-            admin = await AuthService().create_admin(
-                session,
-                username="voice-lifecycle-admin",
-                real_name="音色生命周期管理员",
-                password="voice-lifecycle-admin-password-123",
-            )
+            admin = await session.scalar(select(User).where(User.role == "ADMIN"))
+            await session.commit()
+            if admin is None:
+                admin = await AuthService().create_admin(
+                    session,
+                    username="voice-lifecycle-admin",
+                    real_name="音色生命周期管理员",
+                    password="voice-lifecycle-admin-password-123",
+                )
             host = await catalog.create_voice(
                 session,
                 payload=VoiceProfileCreate(
@@ -839,7 +857,10 @@ async def test_voice_delete_removes_unreferenced_and_disables_referenced_agents(
             await session.refresh(referenced_voice)
             await session.refresh(referenced_agent)
             assert referenced_voice.status == "DISABLED"
-            assert referenced_agent.status == "DISABLED"
+            assert referenced_agent.status == "ENABLED"
+            assert referenced_agent.id not in await RoomService().available_agent_ids(
+                session, rule_id=rule.id
+            )
     finally:
         await engine.dispose()
 
@@ -1015,9 +1036,17 @@ async def test_match_runtime_commits_events_and_speech_before_actor_updates(
                 },
             )
         )
+        await actor.submit(
+            MatchCommand(
+                type="match.terminate",
+                message_id="db-match-terminate",
+                payload={"privileged": True},
+            )
+        )
 
         async with factory() as session:
             match = await session.get(Match, state.match_id)
+            room = await session.get(Room, room_id)
             events = list(
                 (
                     await session.scalars(
@@ -1034,6 +1063,11 @@ async def test_match_runtime_commits_events_and_speech_before_actor_updates(
         assert speech is not None
         assert speech.status == "FINALIZED"
         assert speech.finish_reason == "EARLY"
+        assert match.status == "TERMINATED"
+        assert match.ended_at is not None
+        assert room is not None
+        assert room.status == "TERMINATED"
+        assert room.ended_at == match.ended_at
     finally:
         await manager.close()
         await engine.dispose()
@@ -2511,6 +2545,14 @@ async def test_room_connection_replacement_and_stale_release(
             assert first.connection_epoch == 1
             assert second.connection_epoch == 2
             assert second.replaced_connection_id == first_id
+            assert (
+                await database_session.scalar(
+                    select(func.count())
+                    .select_from(RoomConnectionLease)
+                    .where(RoomConnectionLease.user_id == user_id)
+                )
+                == 1
+            )
             assert (
                 await service.release(
                     database_session,

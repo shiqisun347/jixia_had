@@ -45,6 +45,7 @@ from ..models import (
     UserConsent,
     VoiceProfile,
 )
+from ..rules.readiness import eligible_agent_ids, inspect_rule
 from .schemas import (
     DeviceCheckRequest,
     RoleChangeRequest,
@@ -111,6 +112,26 @@ def ensure_supported_side_size(side_size: int) -> None:
         raise AuthError("rule_unavailable")
 
 
+def ensure_formal_human_agent_mix(seats: list[Seat]) -> None:
+    """Validate a complete 4v4 layout without imposing a human/Agent ratio."""
+
+    expected = {(side, number) for side in ("AFFIRMATIVE", "NEGATIVE") for number in range(1, 5)}
+    if len(seats) != 8 or {(seat.side, seat.seat_no) for seat in seats} != expected:
+        raise AuthError("room_seats_incomplete")
+    humans: list[UUID] = []
+    agents: list[UUID] = []
+    for seat in seats:
+        if seat.occupant_type == "HUMAN" and seat.user_id and not seat.agent_profile_id:
+            humans.append(seat.user_id)
+        elif seat.occupant_type == "AGENT" and seat.agent_profile_id and not seat.user_id:
+            agents.append(seat.agent_profile_id)
+        else:
+            raise AuthError("room_seats_incomplete")
+    if len(humans) != len(set(humans)):
+        raise AuthError("room_seats_incomplete")
+    ensure_unique_agent_ids(agents)
+
+
 class RoomService:
     @staticmethod
     def _device_token_hash(token: str) -> str:
@@ -157,20 +178,24 @@ class RoomService:
         async with database_session.begin():
             room = await database_session.get(Room, room_id, with_for_update=True)
             member = await database_session.scalar(
-                select(RoomMember).where(
+                select(RoomMember)
+                .where(
                     RoomMember.room_id == room_id,
                     RoomMember.user_id == user_id,
                     RoomMember.left_at.is_(None),
                     RoomMember.member_role == "DEBATER",
-                ).with_for_update()
+                )
+                .with_for_update()
             )
             browser_check = await database_session.scalar(
-                select(BrowserDeviceCheck).where(
+                select(BrowserDeviceCheck)
+                .where(
                     BrowserDeviceCheck.user_id == user_id,
                     BrowserDeviceCheck.token_hash == self._device_token_hash(token),
                     BrowserDeviceCheck.status.in_(("PASS", "WARN")),
                     BrowserDeviceCheck.valid_until > current,
-                ).with_for_update()
+                )
+                .with_for_update()
             )
             if room is None or room.status in ("FINISHED", "TERMINATED"):
                 raise AuthError("room_unavailable")
@@ -198,6 +223,7 @@ class RoomService:
             room.sequence += 1
             await database_session.flush()
         return check
+
     async def available_agent_ids(
         self,
         database_session: AsyncSession,
@@ -208,6 +234,12 @@ class RoomService:
     ) -> list[UUID]:
         if rule_id is None and format_version_id is None:
             return []
+        if rule_id is not None:
+            return [
+                item
+                for item in await eligible_agent_ids(database_session, rule_id)
+                if item not in (excluded_ids or set())
+            ]
         filters = [
             AgentProfile.status == "ENABLED",
             ModelProfile.status == "ENABLED",
@@ -450,7 +482,7 @@ class RoomService:
         room: Room,
         seat: Seat,
     ) -> None:
-        agent_id = seat.configured_agent_profile_id
+        agent_id = seat.configured_agent_profile_id if room.auto_fill_agents else None
         used_agent_ids = set(
             (
                 await database_session.scalars(
@@ -463,7 +495,9 @@ class RoomService:
                 )
             ).all()
         )
-        if agent_id in used_agent_ids:
+        frozen_ids = {UUID(item["id"]) for item in (room.format_snapshot or {}).get("agents", [])}
+        eligible_ids = set(await self.available_agent_ids(database_session, rule_id=room.rule_id))
+        if agent_id not in frozen_ids or agent_id not in eligible_ids or agent_id in used_agent_ids:
             agent_id = None
         if agent_id is None and room.auto_fill_agents:
             candidates = await self.available_agent_ids(
@@ -471,6 +505,7 @@ class RoomService:
                 rule_id=room.rule_id,
                 excluded_ids={item for item in used_agent_ids if item is not None},
             )
+            candidates = [item for item in candidates if item in frozen_ids]
             agent_id = secrets.choice(candidates) if candidates else None
             seat.configured_agent_profile_id = agent_id
         seat.user_id = None
@@ -544,8 +579,10 @@ class RoomService:
     async def load_rule_snapshot(
         self, database_session: AsyncSession, *, rule_id: UUID
     ) -> tuple[Rule, dict[str, Any]]:
-        rule = await database_session.get(Rule, rule_id)
-        if rule is None or rule.status != "ENABLED" or rule.audio_reviewed_at is None:
+        rule = await database_session.get(Rule, rule_id, with_for_update=True)
+        if rule is None or rule.lifecycle_status != "ENABLED":
+            raise AuthError("rule_unavailable")
+        if not (await inspect_rule(database_session, rule)).ready:
             raise AuthError("rule_unavailable")
         stages = list(
             (
@@ -560,7 +597,10 @@ class RoomService:
             (
                 await database_session.scalars(
                     select(HostAudioAsset)
-                    .where(HostAudioAsset.rule_id == rule.id)
+                    .where(
+                        HostAudioAsset.rule_id == rule.id,
+                        HostAudioAsset.generation_id == rule.current_audio_generation_id,
+                    )
                     .order_by(HostAudioAsset.segment_key)
                 )
             ).all()
@@ -600,6 +640,12 @@ class RoomService:
                     ],
                 }
             )
+        host = (
+            await database_session.get(VoiceProfile, rule.host_voice_profile_id)
+            if rule.host_voice_profile_id
+            else None
+        )
+        host_input = (audio_assets[0].input_snapshot or {}) if audio_assets else {}
         return rule, {
             "id": str(rule.id),
             "rule_key": rule.rule_key,
@@ -608,12 +654,30 @@ class RoomService:
             "side_size": rule.side_size,
             "estimated_seconds": rule.estimated_seconds,
             "stages": stage_snapshot,
+            "host_identity": {
+                "voice_profile_id": str(rule.host_voice_profile_id)
+                if rule.host_voice_profile_id
+                else None,
+                "name": host.name if host else None,
+                "provider_voice": host_input.get("provider_voice"),
+                "rate": host_input.get("rate"),
+                "model": host_input.get("model"),
+                "generation_id": str(rule.current_audio_generation_id)
+                if rule.current_audio_generation_id
+                else None,
+            },
             "host_audio": [
                 {
                     "segment_key": asset.segment_key,
                     "storage_path": asset.storage_path,
                     "text_hash": asset.text_hash,
                     "duration_ms": asset.duration_ms,
+                    "voice_profile_id": str(asset.voice_profile_id),
+                    "generation_id": str(asset.generation_id),
+                    "provider_voice": (asset.input_snapshot or {}).get("provider_voice"),
+                    "rate": (asset.input_snapshot or {}).get("rate"),
+                    "model": (asset.input_snapshot or {}).get("model"),
+                    "input_hash": asset.input_hash,
                 }
                 for asset in audio_assets
             ],
@@ -635,6 +699,8 @@ class RoomService:
             ).all()
         )
         model_ids = {agent.model_profile_id for agent in agents}
+        if rule.default_agent_model_profile_id is not None:
+            model_ids.add(rule.default_agent_model_profile_id)
         voice_ids = {agent.voice_profile_id for agent in agents}
         judge = await database_session.get(RuleJudgeConfig, rule.id)
         if judge is not None and judge.model_profile_id is not None:
@@ -708,12 +774,27 @@ class RoomService:
                 "output_contract": prompt.output_contract,
             }
 
+        emergency_model = (
+            model_by_id.get(rule.default_agent_model_profile_id)
+            if rule.default_agent_model_profile_id
+            else None
+        )
+
         return {
             "schema": "rule-config-v1",
             "rule_id": str(rule.id),
             "rule_key": rule.rule_key,
             "config_revision": rule.config_revision,
             "postmatch_questionnaire_enabled": rule.postmatch_questionnaire_enabled,
+            "emergency_model": {
+                "id": str(emergency_model.id),
+                "base_url": emergency_model.base_url,
+                "model_id": emergency_model.model_id,
+                "max_concurrency": emergency_model.max_concurrency,
+                "generation_params": dict(emergency_model.generation_params),
+            }
+            if emergency_model is not None
+            else None,
             "agents": [
                 {
                     "id": str(agent.id),
@@ -807,6 +888,8 @@ class RoomService:
                 raise AuthError("not_authenticated")
             if payload.is_all_agent and organizer_role != "ADMIN":
                 raise AuthError("forbidden")
+            if payload.is_all_agent and not payload.auto_fill_agents:
+                raise AuthError("room_seats_incomplete")
             if not payload.is_all_agent:
                 await self._assert_no_owned_room(database_session, user_id=organizer_user_id)
                 await self._assert_no_active_participation(
@@ -829,11 +912,14 @@ class RoomService:
                 rule_id=rule.id,
             )
             required_agent_count = 2 * rule.side_size
-            if len(available_agent_ids) < required_agent_count:
+            if payload.is_all_agent and len(available_agent_ids) < required_agent_count:
                 raise AuthError("agent_capacity_insufficient")
-            available_agent_ids = secrets.SystemRandom().sample(
-                available_agent_ids, required_agent_count
-            )
+            if not payload.auto_fill_agents:
+                available_agent_ids = []
+            else:
+                available_agent_ids = secrets.SystemRandom().sample(
+                    available_agent_ids, min(len(available_agent_ids), required_agent_count)
+                )
             assignments: dict[tuple[str, int], UUID] = {}
             next_agent = 0
             for side in ("AFFIRMATIVE", "NEGATIVE"):
@@ -841,8 +927,9 @@ class RoomService:
                     key = (side, seat_no)
                     if key in assignments:
                         continue
-                    assignments[key] = available_agent_ids[next_agent]
-                    next_agent += 1
+                    if next_agent < len(available_agent_ids):
+                        assignments[key] = available_agent_ids[next_agent]
+                        next_agent += 1
             code = _room_code()
             for _ in range(5):
                 if await database_session.scalar(select(Room.id).where(Room.code == code)) is None:
@@ -862,7 +949,7 @@ class RoomService:
                 format_snapshot=format_snapshot,
                 organizer_user_id=organizer_user_id,
                 is_all_agent=payload.is_all_agent,
-                auto_fill_agents=True,
+                auto_fill_agents=payload.auto_fill_agents,
             )
             database_session.add(room)
             await database_session.flush()
@@ -883,7 +970,7 @@ class RoomService:
                             room_id=room.id,
                             side=side,
                             seat_no=seat_no,
-                            occupant_type="AGENT",
+                            occupant_type="AGENT" if assignment is not None else "EMPTY",
                             agent_profile_id=assignment,
                             configured_agent_profile_id=assignment,
                             user_id=None,
@@ -1341,6 +1428,11 @@ class RoomService:
             )
             if unseated_debater is not None:
                 raise AuthError("room_debater_unseated")
+            ensure_formal_human_agent_mix(seats)
+            frozen_agents = {item["id"] for item in (room.format_snapshot or {}).get("agents", [])}
+            eligible_ids = set(
+                await self.available_agent_ids(database_session, rule_id=room.rule_id)
+            )
             for seat in seats:
                 if seat.occupant_type == "HUMAN":
                     assert seat.user_id is not None
@@ -1362,12 +1454,27 @@ class RoomService:
                         .order_by(DeviceCheck.check_version.desc())
                         .limit(1)
                     )
+                    consent = await database_session.scalar(
+                        select(UserConsent.id).where(
+                            UserConsent.user_id == seat.user_id,
+                            UserConsent.consent_type == "human_participation",
+                            UserConsent.version == get_current_human_participation_terms().version,
+                        )
+                    )
+                    if consent is None:
+                        raise AuthError("human_participation_terms_outdated")
                     if member is None or not member.online or not member.ready or check is None:
                         raise AuthError("device_check_required")
                 else:
                     assert seat.agent_profile_id is not None
                     agent = await database_session.get(AgentProfile, seat.agent_profile_id)
-                    if agent is None or agent.status != "ENABLED":
+                    if (
+                        agent is None
+                        or agent.status != "ENABLED"
+                        or agent.rule_id != room.rule_id
+                        or agent.id not in eligible_ids
+                        or str(agent.id) not in frozen_agents
+                    ):
                         raise AuthError("agent_unavailable")
                     model = await database_session.get(ModelProfile, agent.model_profile_id)
                     voice = await database_session.get(VoiceProfile, agent.voice_profile_id)

@@ -56,7 +56,9 @@ function Choice({
   const selected = Array.isArray(value) ? value : value ? [value] : [];
   return (
     <fieldset disabled={disabled}>
-      <legend className="text-sm font-black leading-6 text-slate-950">{localize(question.text)}</legend>
+      <legend className="text-sm font-black leading-6 text-slate-950">
+        {localize(question.text)}
+      </legend>
       <div className="mt-3 grid gap-2">
         {question.options.map((option, index) => {
           const checked = selected.includes(option);
@@ -71,22 +73,26 @@ function Choice({
                 type={question.type === 'single_choice' ? 'radio' : 'checkbox'}
                 name={name}
                 checked={checked}
-                    onChange={() =>
-                      question.type === 'single_choice'
-                        ? onChange(option)
-                        : !checked && question.max_selections != null && selected.length >= question.max_selections
-                          ? undefined
-                        : onChange(
-                        checked
-                          ? selected.filter((item) => item !== option)
-                          : [...selected, option],
-                      )
+                onChange={() =>
+                  question.type === 'single_choice'
+                    ? onChange(option)
+                    : !checked &&
+                        question.max_selections != null &&
+                        selected.length >= question.max_selections
+                      ? undefined
+                      : onChange(
+                          checked
+                            ? selected.filter((item) => item !== option)
+                            : [...selected, option],
+                        )
                 }
               />
               <span>
                 {String.fromCharCode(65 + index)}. {localize(option)}
               </span>
-              {description ? <span className="text-slate-500">: {localize(description)}</span> : null}
+              {description ? (
+                <span className="text-slate-500">: {localize(description)}</span>
+              ) : null}
             </label>
           );
         })}
@@ -147,7 +153,9 @@ function SpeechBubble({
             <span className="text-slate-500">{localize('完成右侧判断后显示本段发言')}</span>
           )}
           {editable ? (
-            <span className="mt-2 block text-xs font-bold text-blue-700">{localize('点击气泡可修改标注')}</span>
+            <span className="mt-2 block text-xs font-bold text-blue-700">
+              {localize('点击气泡可修改标注')}
+            </span>
           ) : null}
         </span>
       </button>
@@ -215,7 +223,8 @@ export function Workspace({ initial }: { initial: PostmatchSurveyTask }) {
     onError: (error, request) => {
       setRetryRequest(request);
       showToast({
-        message: error instanceof ApiClientError ? error.message : localize('自动保存失败，请重试。'),
+        message:
+          error instanceof ApiClientError ? error.message : localize('自动保存失败，请重试。'),
         tone: 'error',
       });
     },
@@ -238,7 +247,8 @@ export function Workspace({ initial }: { initial: PostmatchSurveyTask }) {
       showToast({ message: localize('已加载最新问卷进度。'), tone: 'success' });
     } catch (error) {
       showToast({
-        message: error instanceof ApiClientError ? error.message : localize('重新加载失败，请稍后重试。'),
+        message:
+          error instanceof ApiClientError ? error.message : localize('重新加载失败，请稍后重试。'),
         tone: 'error',
       });
     }
@@ -251,11 +261,11 @@ export function Workspace({ initial }: { initial: PostmatchSurveyTask }) {
     },
     onError: (error) =>
       showToast({
-        message: error instanceof ApiClientError ? error.message : localize('提交失败，请稍后重试。'),
+        message:
+          error instanceof ApiClientError ? error.message : localize('提交失败，请稍后重试。'),
         tone: 'error',
       }),
   });
-
 
   const persistAnswer = (key: 'q1' | 'q2', value: string | string[]) => {
     if (!active) return;
@@ -299,7 +309,9 @@ export function Workspace({ initial }: { initial: PostmatchSurveyTask }) {
       return allComplete ? (
         <div>
           <p className="font-black text-slate-950">{localize('自由辩论标注已完成')}</p>
-          <p className="mt-2 text-sm leading-6 text-slate-500">{localize('确认无误后提交本场问卷。')}</p>
+          <p className="mt-2 text-sm leading-6 text-slate-500">
+            {localize('确认无误后提交本场问卷。')}
+          </p>
           <Button
             className="mt-5 w-full"
             disabled={submit.isPending}
@@ -314,7 +326,9 @@ export function Workspace({ initial }: { initial: PostmatchSurveyTask }) {
           </Button>
         </div>
       ) : (
-        <p className="text-sm leading-6 text-slate-500">{localize('本场没有需要标注的自由辩论发言。')}</p>
+        <p className="text-sm leading-6 text-slate-500">
+          {localize('本场没有需要标注的自由辩论发言。')}
+        </p>
       );
     const editing = Boolean(editingItem);
     const showQ1 = editing || answer.q1 == null;
@@ -370,7 +384,11 @@ export function Workspace({ initial }: { initial: PostmatchSurveyTask }) {
               <RotateCcw className="size-4" />
               {localize('重试保存')}
             </Button>
-            <Button variant="secondary" disabled={save.isPending} onClick={() => void reloadLatest()}>
+            <Button
+              variant="secondary"
+              disabled={save.isPending}
+              onClick={() => void reloadLatest()}
+            >
               {localize('加载最新进度')}
             </Button>
           </div>
@@ -404,117 +422,121 @@ export function Workspace({ initial }: { initial: PostmatchSurveyTask }) {
   };
 
   return (
-    <LocalizedTextBoundary><main className="min-h-screen bg-[#f5f8fc] px-3 py-5 text-slate-950 md:px-8">
-      <div className="mx-auto max-w-7xl">
-        <Link
-          ref={backLinkRef}
-          href="/me/postmatch-surveys"
-          onClick={(event) => {
-            if (hasUnsavedSelection && !leaveConfirmedRef.current) {
-              event.preventDefault();
-              setLeaveConfirmationOpen(true);
-            }
-          }}
-          className="inline-flex items-center gap-2 text-sm font-bold text-blue-700"
-        >
-          <ArrowLeft className="size-4" />
-          返回问卷列表
-        </Link>
-        <header className="mt-4 border-b border-slate-200 pb-4">
-          <div className="flex flex-wrap items-start justify-between gap-3">
-            <div>
-              <p className="text-xs font-black text-blue-700">单场赛后发言问卷</p>
-              <h1 className="mt-1 text-2xl font-black">
-                {task.room_title || `比赛 ${task.match_id.slice(0, 8)}`}
-              </h1>
-              {task.topic ? (
-                <p className="mt-2 text-sm text-slate-600">辩题：{task.topic}</p>
-              ) : null}
-            </div>
-            <span
-              className={`rounded-md px-3 py-1.5 text-xs font-black ${task.status === 'SUBMITTED' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}
-            >
-              {task.status === 'SUBMITTED' ? '已完成' : '填写中'}
-            </span>
-          </div>
-          <div className="mt-4 flex items-center gap-3">
-            <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-200">
-              <div
-                className="h-full rounded-full bg-blue-600 transition-[width]"
-                style={{ width: `${targetTotal ? (completed / targetTotal) * 100 : 100}%` }}
-              />
-            </div>
-            <span className="text-xs font-bold text-slate-600">
-              {completed}/{targetTotal} 条已标注
-            </span>
-          </div>
-        </header>
-        <div className="mt-5 grid items-start gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(340px,420px)]">
-          <section
-            className="h-[calc(100dvh-17rem)] min-h-[430px] overflow-y-auto rounded-lg border border-slate-200 bg-white px-3 py-5 shadow-sm md:px-6 lg:h-[calc(100vh-15rem)]"
-            aria-label="完整辩论记录"
-            tabIndex={0}
+    <LocalizedTextBoundary>
+      <main className="min-h-screen bg-[#f5f8fc] px-3 py-5 text-slate-950 md:px-8">
+        <div className="mx-auto max-w-7xl">
+          <Link
+            ref={backLinkRef}
+            href="/me/postmatch-surveys"
+            onClick={(event) => {
+              if (hasUnsavedSelection && !leaveConfirmedRef.current) {
+                event.preventDefault();
+                setLeaveConfirmationOpen(true);
+              }
+            }}
+            className="inline-flex items-center gap-2 text-sm font-bold text-blue-700"
           >
-            <div className="space-y-6 pb-[48vh] lg:pb-4">
-              {stageGroups.map((group) => (
-                <div key={group.key} className="space-y-5">
-                  <div className="flex items-center gap-3" role="separator">
-                    <span className="h-px flex-1 bg-slate-200" />
-                    <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-black text-slate-600">
-                      {group.label}
-                    </span>
-                    <span className="h-px flex-1 bg-slate-200" />
-                  </div>
-                  {group.items.map((item) => (
-                    <SpeechBubble
-                      key={item.speech_id}
-                      item={item}
-                      active={item.speech_id === active?.speech_id}
-                      onEdit={() => setEditingId(item.speech_id)}
-                      bubbleRef={
-                        item.speech_id === current?.speech_id
-                          ? (node) => {
-                              currentRef.current = node;
-                            }
-                          : undefined
-                      }
-                    />
-                  ))}
-                </div>
-              ))}
+            <ArrowLeft className="size-4" />
+            返回问卷列表
+          </Link>
+          <header className="mt-4 border-b border-slate-200 pb-4">
+            <div className="flex flex-wrap items-start justify-between gap-3">
+              <div>
+                <p className="text-xs font-black text-blue-700">单场赛后发言问卷</p>
+                <h1 className="mt-1 text-2xl font-black">
+                  {task.room_title || `比赛 ${task.match_id.slice(0, 8)}`}
+                </h1>
+                {task.topic ? (
+                  <p className="mt-2 text-sm text-slate-600">辩题：{task.topic}</p>
+                ) : null}
+              </div>
+              <span
+                className={`rounded-md px-3 py-1.5 text-xs font-black ${task.status === 'SUBMITTED' ? 'bg-emerald-100 text-emerald-800' : 'bg-amber-100 text-amber-800'}`}
+              >
+                {task.status === 'SUBMITTED' ? '已完成' : '填写中'}
+              </span>
             </div>
-          </section>
-          <aside className="fixed inset-x-3 bottom-3 z-30 max-h-[56dvh] overflow-y-auto rounded-lg border border-blue-200 bg-white p-4 shadow-xl lg:sticky lg:inset-auto lg:top-5 lg:max-h-[calc(100vh-2.5rem)] lg:p-5">
-            <button
-              type="button"
-              className="mb-3 flex w-full items-center justify-between text-left lg:hidden"
-              onClick={() => setMobilePanelOpen((open) => !open)}
-              aria-expanded={mobilePanelOpen}
+            <div className="mt-4 flex items-center gap-3">
+              <div className="h-2 flex-1 overflow-hidden rounded-full bg-slate-200">
+                <div
+                  className="h-full rounded-full bg-blue-600 transition-[width]"
+                  style={{ width: `${targetTotal ? (completed / targetTotal) * 100 : 100}%` }}
+                />
+              </div>
+              <span className="text-xs font-bold text-slate-600">
+                {completed}/{targetTotal} 条已标注
+              </span>
+            </div>
+          </header>
+          <div className="mt-5 grid items-start gap-5 lg:grid-cols-[minmax(0,1fr)_minmax(340px,420px)]">
+            <section
+              className="h-[calc(100dvh-17rem)] min-h-[430px] overflow-y-auto rounded-lg border border-slate-200 bg-white px-3 py-5 shadow-sm md:px-6 lg:h-[calc(100vh-15rem)]"
+              aria-label="完整辩论记录"
+              tabIndex={0}
             >
-              <span className="text-sm font-black">当前标注</span>
-              {mobilePanelOpen ? (
-                <ChevronDown className="size-5" />
-              ) : (
-                <ChevronUp className="size-5" />
-              )}
-            </button>
-            <div className={mobilePanelOpen ? 'block' : 'hidden lg:block'}>{renderQuestions()}</div>
-          </aside>
+              <div className="space-y-6 pb-[48vh] lg:pb-4">
+                {stageGroups.map((group) => (
+                  <div key={group.key} className="space-y-5">
+                    <div className="flex items-center gap-3" role="separator">
+                      <span className="h-px flex-1 bg-slate-200" />
+                      <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-black text-slate-600">
+                        {group.label}
+                      </span>
+                      <span className="h-px flex-1 bg-slate-200" />
+                    </div>
+                    {group.items.map((item) => (
+                      <SpeechBubble
+                        key={item.speech_id}
+                        item={item}
+                        active={item.speech_id === active?.speech_id}
+                        onEdit={() => setEditingId(item.speech_id)}
+                        bubbleRef={
+                          item.speech_id === current?.speech_id
+                            ? (node) => {
+                                currentRef.current = node;
+                              }
+                            : undefined
+                        }
+                      />
+                    ))}
+                  </div>
+                ))}
+              </div>
+            </section>
+            <aside className="fixed inset-x-3 bottom-3 z-30 max-h-[56dvh] overflow-y-auto rounded-lg border border-blue-200 bg-white p-4 shadow-xl lg:sticky lg:inset-auto lg:top-5 lg:max-h-[calc(100vh-2.5rem)] lg:p-5">
+              <button
+                type="button"
+                className="mb-3 flex w-full items-center justify-between text-left lg:hidden"
+                onClick={() => setMobilePanelOpen((open) => !open)}
+                aria-expanded={mobilePanelOpen}
+              >
+                <span className="text-sm font-black">当前标注</span>
+                {mobilePanelOpen ? (
+                  <ChevronDown className="size-5" />
+                ) : (
+                  <ChevronUp className="size-5" />
+                )}
+              </button>
+              <div className={mobilePanelOpen ? 'block' : 'hidden lg:block'}>
+                {renderQuestions()}
+              </div>
+            </aside>
+          </div>
         </div>
-      </div>
-      <ConfirmDialog
-        open={leaveConfirmationOpen}
-        onOpenChange={setLeaveConfirmationOpen}
-        title="离开当前问卷？"
-        description="当前选择尚未保存，离开后可能需要重新填写。"
-        confirmLabel="确认离开"
-        onConfirm={() => {
-          leaveConfirmedRef.current = true;
-          setLeaveConfirmationOpen(false);
-          queueMicrotask(() => backLinkRef.current?.click());
-        }}
-      />
-    </main></LocalizedTextBoundary>
+        <ConfirmDialog
+          open={leaveConfirmationOpen}
+          onOpenChange={setLeaveConfirmationOpen}
+          title="离开当前问卷？"
+          description="当前选择尚未保存，离开后可能需要重新填写。"
+          confirmLabel="确认离开"
+          onConfirm={() => {
+            leaveConfirmedRef.current = true;
+            setLeaveConfirmationOpen(false);
+            queueMicrotask(() => backLinkRef.current?.click());
+          }}
+        />
+      </main>
+    </LocalizedTextBoundary>
   );
 }
 

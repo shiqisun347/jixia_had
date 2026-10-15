@@ -33,9 +33,7 @@ export default function AdminLayout({ children }: Readonly<{ children: ReactNode
         <section className="jx-glass max-w-md rounded-3xl p-8 text-center">
           <p className="jx-kicker">CONNECTION ERROR</p>
           <h1 className="mt-3 text-2xl font-black text-slate-950">{t('permissionTitle')}</h1>
-          <p className="mt-3 text-sm leading-6 text-slate-600">
-            {t('permissionDetail')}
-          </p>
+          <p className="mt-3 text-sm leading-6 text-slate-600">{t('permissionDetail')}</p>
           <AdminRefreshButton
             className="mt-6"
             label={t('checkAgain')}
@@ -57,9 +55,7 @@ export default function AdminLayout({ children }: Readonly<{ children: ReactNode
         <section className="jx-glass max-w-md rounded-3xl p-8 text-center">
           <p className="jx-kicker">ACCESS DENIED</p>
           <h1 className="mt-3 text-2xl font-black text-slate-950">{t('accessTitle')}</h1>
-          <p className="mt-3 text-sm leading-6 text-slate-600">
-            {t('accessDetail')}
-          </p>
+          <p className="mt-3 text-sm leading-6 text-slate-600">{t('accessDetail')}</p>
           <Link
             className="mt-6 inline-flex min-h-11 items-center rounded-xl bg-blue-600 px-5 text-sm font-bold text-white"
             href="/"

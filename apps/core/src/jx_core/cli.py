@@ -35,6 +35,7 @@ def main() -> None:
         host=settings.core_host,
         port=settings.core_port,
         workers=1,
+        ws_max_size=256 * 1024,
         timeout_graceful_shutdown=2,
         log_config=None,
     )

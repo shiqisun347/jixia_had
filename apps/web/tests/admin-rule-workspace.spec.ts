@@ -13,6 +13,7 @@ const rule = {
   estimated_seconds: 900,
   status: 'DISABLED',
   config_revision: 2,
+  default_agent_model_profile_id: 'model-1',
   historical_read_only: false,
   topic_policy: 'BOTH',
 };
@@ -224,4 +225,80 @@ test('legacy format bookmarks redirect to the current rule workspace', async ({ 
 
   await page.goto('/admin/formats/legacy-version');
   await expect(page).toHaveURL('/admin/rules');
+});
+
+test('Agent switches belong to the selected rule and survive navigation', async ({ page }) => {
+  await mockAdmin(page);
+  const otherId = '66000000-0000-4000-8000-000000000002';
+  const statuses: Record<string, string> = { [ruleId]: 'ENABLED', [otherId]: 'ENABLED' };
+  await page.route('**/api/admin/rules', (route) =>
+    route.fulfill({ json: [rule, { ...rule, id: otherId, name: '第二套赛制' }] }),
+  );
+  for (const id of [ruleId, otherId]) {
+    await page.route(`**/api/admin/rules/${id}/agents`, (route) =>
+      route.fulfill({ json: [{ ...agent, rule_id: id, status: statuses[id] }] }),
+    );
+    await page.route(`**/api/admin/rules/${id}/workspace`, (route) =>
+      route.fulfill({ json: workspace }),
+    );
+    await page.route(`**/api/admin/rules/${id}/agents/${agentId}/status`, (route) => {
+      const payload = route.request().postDataJSON() as { status: string };
+      expect(Object.keys(payload)).toEqual(['status']);
+      statuses[id] = payload.status;
+      return route.fulfill({ json: { ...agent, rule_id: id, status: payload.status } });
+    });
+  }
+  await page.goto('/admin/agents');
+  await page.getByLabel('赛制规则').selectOption(ruleId);
+  const toggle = page.getByRole('switch', { name: '龙安灵希 本赛制启用' });
+  await expect(toggle).toBeChecked();
+  await toggle.click();
+  await expect(toggle).not.toBeChecked();
+  await page.getByLabel('赛制规则').selectOption(otherId);
+  await expect(toggle).toBeChecked();
+  await page.getByLabel('赛制规则').selectOption(ruleId);
+  await expect(toggle).not.toBeChecked();
+  await expect(page.getByText('本赛制已停用')).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
+});
+
+test('disabled global voice is explained while the rule switch remains enabled', async ({
+  page,
+}) => {
+  await mockAdmin(page);
+  await page.route(`**/api/admin/rules/${ruleId}/agents`, (route) =>
+    route.fulfill({
+      json: [
+        {
+          ...agent,
+          voice_status: 'DISABLED',
+          available: false,
+          unavailable_reason: 'VOICE_DISABLED',
+        },
+      ],
+    }),
+  );
+  await page.goto('/admin/agents');
+  await page.getByLabel('赛制规则').selectOption(ruleId);
+  await expect(page.getByRole('switch', { name: '龙安灵希 本赛制启用' })).toBeChecked();
+  await expect(page.getByText('音色已停用')).toBeVisible();
+});
+
+test('voice management describes its global scope and automatic rule synchronization', async ({
+  page,
+}) => {
+  await mockAdmin(page);
+  await page.route('**/api/admin/catalog', (route) =>
+    route.fulfill({ json: { ...catalog, rules: [rule] } }),
+  );
+  await page.goto('/admin/voices');
+  await expect(
+    page.getByText('2 个音色配置 · Agent 音色同步至 1 套已配置默认模型的赛制'),
+  ).toBeVisible();
+  await expect(page.getByRole('columnheader', { name: '全局状态' })).toBeVisible();
+  expect(await page.evaluate(() => document.documentElement.scrollWidth <= window.innerWidth)).toBe(
+    true,
+  );
 });

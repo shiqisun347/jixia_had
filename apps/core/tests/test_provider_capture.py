@@ -98,8 +98,14 @@ async def test_provider_capture_persistence_failure_does_not_escape(monkeypatch)
             return None
 
     class Session:
+        async def flush(self) -> None:
+            return None
+
         def begin_nested(self) -> Savepoint:
             return Savepoint()
+
+        async def refresh(self, _call: object) -> None:
+            return None
 
     async def fail_store(*_args: object, **_kwargs: object) -> None:
         raise RuntimeError("storage unavailable")

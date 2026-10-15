@@ -437,9 +437,7 @@ async def test_agent_playback_flushes_speech_before_next_opportunity() -> None:
         assert next_opportunity_id != allocated_opportunity.id
         async with factory() as session:
             speech = await session.get(Speech, speech_id)
-            next_opportunity = await session.get(
-                FreeDebateOpportunity, next_opportunity_id
-            )
+            next_opportunity = await session.get(FreeDebateOpportunity, next_opportunity_id)
             assert speech is not None
             assert speech.opportunity_id == allocated_opportunity.id
             assert next_opportunity is not None
@@ -606,9 +604,7 @@ async def test_human_asr_retries_are_scoped_to_the_allocated_opportunity() -> No
             action_position=0,
             action_kind="FREE_DEBATE",
             duration_seconds=360,
-            participants=(
-                DebateParticipant(side="AFFIRMATIVE", seat_no=1, user_id=human.id),
-            ),
+            participants=(DebateParticipant(side="AFFIRMATIVE", seat_no=1, user_id=human.id),),
             free_max_speech_seconds=30,
         )
         state = MatchRuntimeState(
@@ -762,6 +758,18 @@ async def test_human_asr_retries_are_scoped_to_the_allocated_opportunity() -> No
                 ),
                 code="asr_task_failed",
             )
+            # Reset has advanced the authoritative context; the old context
+            # cannot fail the new attempt even when its other identity matches.
+            assert actor.state.status == "RUNNING"
+            assert actor.state.current_speech_id == retry_speech_id
+            retry_envelope = await manager._speech_callback_envelope(  # pyright: ignore[reportPrivateUsage]
+                match_id=match.id, speech_id=retry_speech_id, user_id=human.id
+            )
+            assert retry_envelope.attempt_no == 2
+            assert retry_envelope.context_version == 1
+            assert retry_envelope.opportunity_id == allocated.id
+            assert retry_envelope.opportunity_generation == 2
+            await manager.handle_asr_failure(envelope=retry_envelope, code="asr_task_failed")
             assert actor.state.status == "ERROR"
             assert actor.state.current_speech_id is None
             assert actor.state.speech_remaining_ms == 30_000
@@ -805,9 +813,7 @@ async def test_human_asr_retries_are_scoped_to_the_allocated_opportunity() -> No
             assert attempts[1].asr_error_code == "asr_task_failed"
             assert attempts[2].asr_error_code is None
             invalidated_first = await session.get(FreeDebateOpportunity, speculative.id)
-            invalidated_retry = await session.get(
-                FreeDebateOpportunity, retry_speculative_id
-            )
+            invalidated_retry = await session.get(FreeDebateOpportunity, retry_speculative_id)
             assert invalidated_first is not None
             assert invalidated_first.status == "INVALIDATED"
             assert invalidated_retry is not None
@@ -924,15 +930,11 @@ async def test_participant_survey_writes_are_audited_atomically() -> None:
                 )
         async with factory() as session:
             after_locked = await session.scalar(
-                select(func.count())
-                .select_from(AuditLog)
-                .where(AuditLog.actor_user_id == user.id)
+                select(func.count()).select_from(AuditLog).where(AuditLog.actor_user_id == user.id)
             )
             assert after_locked == before_locked
             response = await session.scalar(
-                select(PersonalAiSurveyResponse).where(
-                    PersonalAiSurveyResponse.user_id == user.id
-                )
+                select(PersonalAiSurveyResponse).where(PersonalAiSurveyResponse.user_id == user.id)
             )
             assert response is not None and response.status == "SUBMITTED"
     finally:

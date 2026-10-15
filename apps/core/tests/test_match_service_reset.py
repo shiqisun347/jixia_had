@@ -1,26 +1,47 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock
 from uuid import uuid4
 
 import pytest
+from sqlalchemy.dialects.postgresql import dialect as postgresql_dialect
 
 from jx_core.matches.domain import (
     MatchAction,
     MatchActor,
     MatchCommand,
     MatchDomainError,
+    MatchEvent,
     MatchRuntimeState,
 )
-from jx_core.matches.service import MatchRuntimeManager
+from jx_core.matches.service import MatchRuntimeManager, _active_opportunity_for_source_query
 from jx_core.runtime_identity import CallbackEnvelope
 
 # This test deliberately wires the manager's internal actor registry and hook without a database.
 # The production typecheck excludes test-only implementation details.
 # pyright: reportPrivateUsage=false, reportMissingTypeStubs=false
+
+
+def test_late_opportunity_lookup_is_source_bounded() -> None:
+    statement = _active_opportunity_for_source_query(
+        match_id=uuid4(), source_speech_id=uuid4()
+    )
+    sql = str(
+        statement.compile(
+            dialect=postgresql_dialect(), compile_kwargs={"literal_binds": True}
+        )
+    )
+
+    assert "LIMIT 1" in sql
+    assert "FOR UPDATE" in sql
+    assert "source_speech_id" in sql
+    # Keep the compatibility predicate for rows created before the source
+    # column was populated, while still avoiding a Python-side full scan.
+    assert "frozen_context" in sql
 
 
 class ResetRecorder:
@@ -339,6 +360,214 @@ async def test_manager_does_not_publish_interim_text_after_match_finished(publis
 
 
 @pytest.mark.asyncio
+async def test_manager_drops_pending_agent_text_when_match_terminates() -> None:
+    match_id = uuid4()
+    manager = MatchRuntimeManager(cast(Any, None))
+    generation_id = uuid4()
+    manager._pending_agent_full_text[(match_id, generation_id)] = (
+        CallbackEnvelope(
+            match_id=match_id,
+            speech_id=None,
+            attempt_no=1,
+            generation_id=generation_id,
+            connection_epoch=None,
+            context_version=0,
+            opportunity_id=None,
+            opportunity_generation=None,
+        ),
+        "迟到的完整 Agent 文本",
+    )
+    await manager._publish(
+        MatchRuntimeState(
+            match_id=match_id,
+            status="TERMINATED",
+            action_state="MATCH_FINISHED",
+            actions=(),
+        ),
+        (
+            MatchEvent(
+                type="match.terminated",
+                match_id=match_id,
+                sequence=1,
+                server_time_ms=1,
+                payload={},
+            ),
+        ),
+    )
+    assert (match_id, generation_id) not in manager._pending_agent_full_text
+
+
+@pytest.mark.asyncio
+async def test_manager_close_releases_subscriber_and_callback_state() -> None:
+    manager = MatchRuntimeManager(cast(Any, None))
+    match_id = uuid4()
+    queue = await manager.subscribe(match_id)
+    manager._prepared_speech_starts.add((match_id, "message"))
+    manager._late_experiment_rounds.add(uuid4())
+    manager._pending_agent_full_text[(match_id, uuid4())] = (
+        CallbackEnvelope(
+            match_id=match_id,
+            speech_id=None,
+            attempt_no=1,
+            generation_id=None,
+            connection_epoch=None,
+            context_version=0,
+            opportunity_id=None,
+            opportunity_generation=None,
+        ),
+        "text",
+    )
+
+    await manager.close()
+
+    assert queue is not None
+    assert manager._subscribers == {}
+    assert manager._prepared_speech_starts == set()
+    assert manager._late_experiment_rounds == set()
+    assert manager._pending_agent_full_text == {}
+
+
+def test_pending_agent_text_fence_is_bounded() -> None:
+    from jx_core.matches.service import PENDING_AGENT_FULL_TEXT_LIMIT
+
+    manager = MatchRuntimeManager(cast(Any, None))
+    match_id = uuid4()
+    for _ in range(PENDING_AGENT_FULL_TEXT_LIMIT + 1):
+        generation_id = uuid4()
+        manager._remember_pending_agent_full_text(
+            match_id=match_id,
+            generation_id=generation_id,
+            envelope=CallbackEnvelope(
+                match_id=match_id,
+                speech_id=None,
+                attempt_no=1,
+                generation_id=generation_id,
+                connection_epoch=None,
+                context_version=0,
+                opportunity_id=None,
+                opportunity_generation=None,
+            ),
+            text="x",
+        )
+
+    assert len(manager._pending_agent_full_text) == PENDING_AGENT_FULL_TEXT_LIMIT
+
+
+def test_terminal_room_end_time_uses_match_boundary_and_is_idempotent() -> None:
+    from datetime import UTC, datetime
+
+    from jx_core.matches.service import _terminal_room_end_at
+
+    match_end = datetime(2026, 10, 13, 1, 2, 3, tzinfo=UTC)
+    fallback = datetime(2026, 10, 13, 1, 2, 4, tzinfo=UTC)
+
+    assert _terminal_room_end_at(
+        match_status="FINISHED",
+        current_room_end=None,
+        match_end=match_end,
+        now=fallback,
+    ) == match_end
+    assert _terminal_room_end_at(
+        match_status="TERMINATED",
+        current_room_end=match_end,
+        match_end=fallback,
+        now=fallback,
+    ) == match_end
+    assert _terminal_room_end_at(
+        match_status="RUNNING",
+        current_room_end=None,
+        match_end=match_end,
+        now=fallback,
+    ) is None
+
+
+def test_late_experiment_round_fence_is_bounded_and_match_scoped() -> None:
+    from jx_core.matches.service import LATE_EXPERIMENT_ROUND_LIMIT
+
+    manager = MatchRuntimeManager(cast(Any, None))
+    match_id = uuid4()
+    round_ids = [uuid4() for _ in range(LATE_EXPERIMENT_ROUND_LIMIT + 1)]
+    for round_id in round_ids:
+        manager._remember_late_experiment_round(match_id=match_id, round_id=round_id)
+
+    assert len(manager._late_experiment_rounds) == LATE_EXPERIMENT_ROUND_LIMIT
+    assert len(manager._late_experiment_round_matches) == LATE_EXPERIMENT_ROUND_LIMIT
+    manager._forget_late_experiment_rounds_for_match(match_id)
+    assert manager._late_experiment_rounds == set()
+    assert manager._late_experiment_round_matches == {}
+
+
+@pytest.mark.asyncio
+async def test_terminal_match_drops_late_experiment_round_fence() -> None:
+    match_id = uuid4()
+    round_id = uuid4()
+    manager = MatchRuntimeManager(cast(Any, None))
+    manager._remember_late_experiment_round(match_id=match_id, round_id=round_id)
+
+    try:
+        await manager._publish(
+            MatchRuntimeState(
+                match_id=match_id,
+                status="TERMINATED",
+                action_state="MATCH_FINISHED",
+                actions=(),
+            ),
+            (
+                MatchEvent(
+                    type="match.terminated",
+                    match_id=match_id,
+                    sequence=1,
+                    server_time_ms=1,
+                    payload={},
+                ),
+            ),
+        )
+        assert round_id not in manager._late_experiment_rounds
+        assert round_id not in manager._late_experiment_round_matches
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_manager_evicts_terminal_actor_after_retention_window(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    manager = MatchRuntimeManager(cast(Any, None))
+    match_id = uuid4()
+    actor = MatchActor(
+        MatchRuntimeState(
+            match_id=match_id,
+            status="TERMINATED",
+            action_state="MATCH_FINISHED",
+            actions=(),
+            sequence=3,
+        ),
+        sleep=lambda _: asyncio.sleep(60),
+    )
+    await actor.start()
+    manager._actors[match_id] = actor
+    monkeypatch.setattr("jx_core.matches.service.TERMINAL_ACTOR_RETENTION_SECONDS", 0)
+    try:
+        await manager._publish(
+            actor.state,
+            (
+                MatchEvent(
+                    type="match.terminated",
+                    match_id=match_id,
+                    sequence=3,
+                    server_time_ms=1,
+                    payload={},
+                ),
+            ),
+        )
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+        assert match_id not in manager._actors
+    finally:
+        await manager.close()
+
+
+@pytest.mark.asyncio
 async def test_manager_serializes_current_speaker_asr_pause_before_rapid_resume() -> None:
     match_id = uuid4()
     speaker_id = uuid4()
@@ -587,6 +816,95 @@ async def test_manager_does_not_reset_finished_free_turn_on_late_asr_failure() -
         assert actor.state.current_speech_id == speech_id
     finally:
         await manager.close()
+
+
+@pytest.mark.asyncio
+async def test_asr_callback_identity_rejects_agent_generation_and_stale_attempt() -> None:
+    match_id = uuid4()
+    speech_id = uuid4()
+    user_id = uuid4()
+    opportunity_id = uuid4()
+    speech = SimpleNamespace(
+        match_id=match_id,
+        user_id=user_id,
+        attempt_no=2,
+        opportunity_id=opportunity_id,
+    )
+    match = SimpleNamespace(context_version=7)
+    opportunity = SimpleNamespace(opportunity_generation=3)
+    session = MagicMock()
+
+    async def get(model: object, identifier: object) -> object:
+        if identifier == speech_id:
+            return speech
+        if identifier == match_id:
+            return match
+        if identifier == opportunity_id:
+            return opportunity
+        return None
+
+    session.get = AsyncMock(side_effect=get)
+    factory = MagicMock()
+    factory.return_value.__aenter__ = AsyncMock(return_value=session)
+    factory.return_value.__aexit__ = AsyncMock(return_value=None)
+    manager = MatchRuntimeManager(cast(Any, factory))
+    actor = MatchActor(
+        MatchRuntimeState(
+            match_id=match_id,
+            status="RUNNING",
+            action_state="WAITING",
+            actions=(),
+            connection_epochs=((user_id, 4),),
+        ),
+        sleep=lambda _: asyncio.sleep(60),
+    )
+    await actor.start()
+    try:
+        current = CallbackEnvelope(
+            match_id=match_id,
+            speech_id=speech_id,
+            attempt_no=2,
+            generation_id=None,
+            connection_epoch=4,
+            context_version=7,
+            opportunity_id=opportunity_id,
+            opportunity_generation=3,
+        )
+        assert await manager._asr_callback_is_current(actor=actor, envelope=current)
+        assert not await manager._asr_callback_is_current(
+            actor=actor, envelope=replace(current, generation_id=uuid4())
+        )
+        assert not await manager._asr_callback_is_current(
+            actor=actor, envelope=replace(current, attempt_no=1)
+        )
+    finally:
+        await manager.close()
+
+
+def test_asr_external_call_identity_includes_context_and_epoch() -> None:
+    manager = MatchRuntimeManager(cast(Any, None))
+    match_id = uuid4()
+    speech_id = uuid4()
+    envelope = CallbackEnvelope(
+        match_id=match_id,
+        speech_id=speech_id,
+        attempt_no=1,
+        generation_id=None,
+        connection_epoch=2,
+        context_version=4,
+        opportunity_id=None,
+        opportunity_generation=None,
+    )
+    call = SimpleNamespace(
+        match_id=match_id,
+        speech_id=speech_id,
+        connection_epoch=2,
+        context_version=4,
+        opportunity_id=None,
+    )
+    assert manager._asr_call_matches_envelope(call, envelope)
+    call.context_version = 5
+    assert not manager._asr_call_matches_envelope(call, envelope)
 
 
 @pytest.mark.asyncio

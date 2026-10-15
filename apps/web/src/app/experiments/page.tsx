@@ -1,9 +1,8 @@
 import type { Metadata } from 'next';
+import { redirect } from 'next/navigation';
 
-import { ExperimentHub } from '@/features/experiments/experiment-hub';
-
-export const metadata: Metadata = { title: '实验安排' };
+export const metadata: Metadata = { title: '比赛大厅' };
 
 export default function ExperimentsPage() {
-  return <ExperimentHub />;
+  redirect('/lobby');
 }

@@ -107,7 +107,7 @@ export function assertHomeBundleBoundary(webRoot) {
   }
 }
 
-export function assertQuestionnaireSurface(webRoot) {
+export function assertPublicResearchSurface(webRoot) {
   const manifestPath = join(webRoot, '.next', 'app-path-routes-manifest.json');
   const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
   const requiredRoutes = ['/me/ai-experience/page', '/me/postmatch-surveys/page'];
@@ -125,11 +125,10 @@ export function assertQuestionnaireSurface(webRoot) {
     .filter((file) => file.endsWith('.js'))
     .map((file) => readFileSync(join(serverChunks, file), 'utf8'))
     .filter((source) => source.includes('apps_web_src_features_auth_me-page'));
-  if (!mePageSources.some((source) => source.includes('AI 辩论感受'))) {
-    throw new Error('Production Web build is missing the AI experience link on /me.');
-  }
-  if (!mePageSources.some((source) => source.includes('赛后问卷'))) {
-    throw new Error('Production Web build is missing the post-match survey link on /me.');
+  if (
+    mePageSources.some((source) => source.includes('AI 辩论感受') || source.includes('赛后问卷'))
+  ) {
+    throw new Error('Production Web build still exposes paper questionnaire links on /me.');
   }
 }
 
@@ -191,7 +190,7 @@ export function buildWeb({ webRoot = defaultWebRoot, spawnBuild = spawnSync } = 
     }),
   );
   assertHomeBundleBoundary(webRoot);
-  assertQuestionnaireSurface(webRoot);
+  assertPublicResearchSurface(webRoot);
   assertStaticArtifactIntegrity(webRoot);
 
   // Next standalone intentionally omits the public directory. The deployed

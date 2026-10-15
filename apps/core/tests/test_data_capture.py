@@ -4,7 +4,9 @@ import asyncio
 import json
 import logging
 import os
+import zlib
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from uuid import UUID
 
 import pytest
@@ -13,6 +15,9 @@ from sqlalchemy import delete, func, select
 
 from jx_core.config import Settings
 from jx_core.data_capture.content import (
+    MAX_CONTENT_BLOB_COMPRESSED_BYTES,
+    MAX_CONTENT_BLOB_UNCOMPRESSED_BYTES,
+    _decompress_bounded,
     canonical_payload_bytes,
     load_content_blob,
     store_content_blob,
@@ -102,6 +107,30 @@ def test_canonical_payload_is_stable_and_only_redacts_structured_secret_values()
     assert payload["nested"]["Authorization"] == "[REDACTED]"
     assert "api_key=这不是结构化密钥" in payload["messages"][0]["content"]
     assert b"secret-value" not in first_bytes
+
+
+def test_content_blob_decompression_rejects_expansion_over_memory_budget() -> None:
+    compressed = zlib.compress(b"x" * (MAX_CONTENT_BLOB_UNCOMPRESSED_BYTES + 1))
+
+    with pytest.raises(ValueError, match="call_content_blob_too_large"):
+        _decompress_bounded(
+            compressed,
+            max_bytes=MAX_CONTENT_BLOB_UNCOMPRESSED_BYTES,
+        )
+
+
+@pytest.mark.asyncio
+async def test_content_blob_load_rejects_oversized_metadata_before_chunk_fetch() -> None:
+    class Session:
+        async def get(self, *_args: object, **_kwargs: object) -> object:
+            return SimpleNamespace(
+                compressed_bytes=MAX_CONTENT_BLOB_COMPRESSED_BYTES + 1,
+                uncompressed_bytes=1,
+                chunk_count=1,
+            )
+
+    with pytest.raises(ValueError, match="call_content_blob_too_large"):
+        await load_content_blob(Session(), UUID(int=0))  # type: ignore[arg-type]
 
 
 def _integration_database() -> Database:

@@ -7,7 +7,10 @@ import asyncio
 import getpass
 import sys
 from collections.abc import Sequence
+from pathlib import Path
 
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import text
 
 from .auth.errors import AuthError
@@ -15,11 +18,26 @@ from .auth.service import AuthService
 from .config import Settings, load_settings
 from .database import Database
 
-REQUIRED_MIGRATION_REVISION = "0038_experiment_rule_snapshot"
-
 
 class AdminCLIError(RuntimeError):
     pass
+
+
+def _current_migration_head() -> str:
+    """Resolve the checked-out Alembic head instead of freezing a stale revision."""
+    package_root = Path(__file__).resolve().parents[4]
+    candidates = (package_root, Path.cwd())
+    for root in candidates:
+        config_path = root / "alembic.ini"
+        if not config_path.is_file():
+            continue
+        config = Config(str(config_path))
+        config.set_main_option("path_separator", "os")
+        head = ScriptDirectory.from_config(config).get_current_head()
+        if head is None:
+            break
+        return head
+    raise AdminCLIError("migration head is unavailable")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -39,8 +57,10 @@ async def create_admin(
     database = Database(settings.database_url_value)
     try:
         async with database.engine.connect() as connection:
-            revision = await connection.scalar(text("SELECT version_num FROM alembic_version"))
-        if revision != REQUIRED_MIGRATION_REVISION:
+            revisions = list(
+                (await connection.scalars(text("SELECT version_num FROM alembic_version"))).all()
+            )
+        if revisions != [_current_migration_head()]:
             raise AdminCLIError("database migration is not current")
         async with database.session_factory() as database_session:
             try:

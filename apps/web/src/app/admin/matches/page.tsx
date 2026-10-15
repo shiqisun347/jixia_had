@@ -211,7 +211,9 @@ export default function AdminMatchesPage() {
         },
         cell: ({ row }) => (
           <input
-            aria-label={t('common.selectItem', { label: row.original.label || t('matchesPage.match') })}
+            aria-label={t('common.selectItem', {
+              label: row.original.label || t('matchesPage.match'),
+            })}
             checked={selectedIds.includes(row.original.id)}
             onChange={() =>
               setSelectedIds((current) =>
@@ -310,7 +312,9 @@ export default function AdminMatchesPage() {
                 {terminal && match.file_count > 0 ? (
                   <AdminActionItem onSelect={() => setTarget({ match, action: 'retention' })}>
                     <Archive className="mr-2 size-3.5" aria-hidden="true" />
-                    {match.files_permanent ? t('matchesPage.restoreRetention') : t('matchesPage.retainAudio')}
+                    {match.files_permanent
+                      ? t('matchesPage.restoreRetention')
+                      : t('matchesPage.retainAudio')}
                   </AdminActionItem>
                 ) : null}
                 {terminal ? (
@@ -328,7 +332,7 @@ export default function AdminMatchesPage() {
         },
       },
     ],
-    [matches, selectedIds],
+    [matches, selectedIds, t],
   );
   // eslint-disable-next-line react-hooks/incompatible-library
   const table = useReactTable({ data: matches, columns, getCoreRowModel: getCoreRowModel() });

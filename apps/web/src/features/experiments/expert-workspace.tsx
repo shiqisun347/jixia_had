@@ -66,48 +66,50 @@ function FrozenState({
     ['反方剩余', remainingText(context.negative_remaining_ms)],
   ];
   return (
-    <LocalizedTextBoundary><div className="mt-5 space-y-5 text-sm leading-7 text-slate-700">
-      <div className="grid gap-3 border-b border-slate-100 pb-5 sm:grid-cols-2">
-        {metadata.map(([key, value]) => (
-          <div key={key}>
-            <p className="text-xs font-black text-slate-500">{key}</p>
-            <p className="mt-1 whitespace-pre-wrap break-words">
-              {typeof value === 'string' ? value : JSON.stringify(value, null, 2)}
-            </p>
-          </div>
-        ))}
+    <LocalizedTextBoundary>
+      <div className="mt-5 space-y-5 text-sm leading-7 text-slate-700">
+        <div className="grid gap-3 border-b border-slate-100 pb-5 sm:grid-cols-2">
+          {metadata.map(([key, value]) => (
+            <div key={key}>
+              <p className="text-xs font-black text-slate-500">{key}</p>
+              <p className="mt-1 whitespace-pre-wrap break-words">
+                {typeof value === 'string' ? value : JSON.stringify(value, null, 2)}
+              </p>
+            </div>
+          ))}
+        </div>
+        <div>
+          <h3 className="text-sm font-black text-slate-900">此前辩论记录</h3>
+          {history.length ? (
+            <div className="mt-3 divide-y divide-slate-100">
+              {history.map((speech, index) => {
+                const speechId = String(speech.speech_id ?? '');
+                const side = speech.side === 'AFFIRMATIVE' ? '正方' : '反方';
+                return (
+                  <article className="py-4" key={speechId || index}>
+                    <p className="text-xs font-black text-blue-700">
+                      {side} · {String(speech.seat_no ?? '?')} 辩 ·{' '}
+                      {speech.speaker_kind === 'AGENT' ? 'AI' : '真人'}
+                    </p>
+                    <p className="mt-2 whitespace-pre-wrap text-sm leading-7">
+                      {String(speech.text ?? '') || '（无可用文字）'}
+                    </p>
+                    {speechId ? (
+                      <AudioWaveform
+                        className="mt-3"
+                        url={`/api/experiments/expert-tasks/${taskId}/audio/${speechId}`}
+                      />
+                    ) : null}
+                  </article>
+                );
+              })}
+            </div>
+          ) : (
+            <p className="mt-3 text-slate-500">该机会之前没有已完成发言。</p>
+          )}
+        </div>
       </div>
-      <div>
-        <h3 className="text-sm font-black text-slate-900">此前辩论记录</h3>
-        {history.length ? (
-          <div className="mt-3 divide-y divide-slate-100">
-            {history.map((speech, index) => {
-              const speechId = String(speech.speech_id ?? '');
-              const side = speech.side === 'AFFIRMATIVE' ? '正方' : '反方';
-              return (
-                <article className="py-4" key={speechId || index}>
-                  <p className="text-xs font-black text-blue-700">
-                    {side} · {String(speech.seat_no ?? '?')} 辩 ·{' '}
-                    {speech.speaker_kind === 'AGENT' ? 'AI' : '真人'}
-                  </p>
-                  <p className="mt-2 whitespace-pre-wrap text-sm leading-7">
-                    {String(speech.text ?? '') || '（无可用文字）'}
-                  </p>
-                  {speechId ? (
-                    <AudioWaveform
-                      className="mt-3"
-                      url={`/api/experiments/expert-tasks/${taskId}/audio/${speechId}`}
-                    />
-                  ) : null}
-                </article>
-              );
-            })}
-          </div>
-        ) : (
-          <p className="mt-3 text-slate-500">该机会之前没有已完成发言。</p>
-        )}
-      </div>
-    </div></LocalizedTextBoundary>
+    </LocalizedTextBoundary>
   );
 }
 
@@ -149,92 +151,94 @@ function ExpertQuestionPanel({
   const locked = Boolean(item.submitted_at) || task.status === 'SUBMITTED';
 
   return (
-    <LocalizedTextBoundary><>
-      <fieldset disabled={locked}>
-        <legend className="text-sm font-black">Q1 当前是否存在明确的团队行动需求？</legend>
-        <div className="mt-3 grid gap-2">
-          {Q1.map((value) => (
-            <label
-              className={`rounded-lg border px-3 py-2 text-sm font-bold ${q1 === value ? 'border-blue-600 bg-blue-50 text-blue-800' : 'border-slate-200'}`}
-              key={value}
-            >
-              <input
-                checked={q1 === value}
-                className="mr-2"
-                onChange={() => setQ1(value)}
-                type="radio"
-              />
-              {value}
-            </label>
-          ))}
-        </div>
-      </fieldset>
-      <fieldset className="mt-7" disabled={locked}>
-        <legend className="text-sm font-black">Q2 各行动的必要程度</legend>
-        <div className="mt-3 overflow-x-auto">
-          <table className="w-full min-w-[38rem] border-collapse text-xs">
-            <thead>
-              <tr>
-                <th className="p-2 text-left">行动</th>
-                {NECESSITY.map((value) => (
-                  <th className="p-2 font-bold" key={value}>
-                    {value}
-                  </th>
-                ))}
-              </tr>
-            </thead>
-            <tbody>
-              {ACTIONS.map((action) => (
-                <tr className="border-t border-slate-100" key={action}>
-                  <th className="p-2 text-left font-black">{action}</th>
+    <LocalizedTextBoundary>
+      <>
+        <fieldset disabled={locked}>
+          <legend className="text-sm font-black">Q1 当前是否存在明确的团队行动需求？</legend>
+          <div className="mt-3 grid gap-2">
+            {Q1.map((value) => (
+              <label
+                className={`rounded-lg border px-3 py-2 text-sm font-bold ${q1 === value ? 'border-blue-600 bg-blue-50 text-blue-800' : 'border-slate-200'}`}
+                key={value}
+              >
+                <input
+                  checked={q1 === value}
+                  className="mr-2"
+                  onChange={() => setQ1(value)}
+                  type="radio"
+                />
+                {value}
+              </label>
+            ))}
+          </div>
+        </fieldset>
+        <fieldset className="mt-7" disabled={locked}>
+          <legend className="text-sm font-black">Q2 各行动的必要程度</legend>
+          <div className="mt-3 overflow-x-auto">
+            <table className="w-full min-w-[38rem] border-collapse text-xs">
+              <thead>
+                <tr>
+                  <th className="p-2 text-left">行动</th>
                   {NECESSITY.map((value) => (
-                    <td className="p-2 text-center" key={value}>
-                      <input
-                        aria-label={`${action}-${value}`}
-                        checked={q2[action] === value}
-                        onChange={() => setQ2((current) => ({ ...current, [action]: value }))}
-                        type="radio"
-                      />
-                    </td>
+                    <th className="p-2 font-bold" key={value}>
+                      {value}
+                    </th>
                   ))}
                 </tr>
-              ))}
-            </tbody>
-          </table>
+              </thead>
+              <tbody>
+                {ACTIONS.map((action) => (
+                  <tr className="border-t border-slate-100" key={action}>
+                    <th className="p-2 text-left font-black">{action}</th>
+                    {NECESSITY.map((value) => (
+                      <td className="p-2 text-center" key={value}>
+                        <input
+                          aria-label={`${action}-${value}`}
+                          checked={q2[action] === value}
+                          onChange={() => setQ2((current) => ({ ...current, [action]: value }))}
+                          type="radio"
+                        />
+                      </td>
+                    ))}
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+        </fieldset>
+        <fieldset className="mt-7" disabled={locked}>
+          <legend className="text-sm font-black">Q3 这个机会更适合谁介入？</legend>
+          <div className="mt-3 grid gap-2">
+            {Q3.map((value) => (
+              <label
+                className={`rounded-lg border px-3 py-2 text-sm font-bold ${q3 === value ? 'border-blue-600 bg-blue-50 text-blue-800' : 'border-slate-200'}`}
+                key={value}
+              >
+                <input
+                  checked={q3 === value}
+                  className="mr-2"
+                  onChange={() => setQ3(value)}
+                  type="radio"
+                />
+                {value}
+              </label>
+            ))}
+          </div>
+        </fieldset>
+        <div className="mt-7 flex flex-wrap gap-3">
+          <Button
+            disabled={!valid || save.isPending || locked}
+            onClick={() => save.mutate(false)}
+            variant="secondary"
+          >
+            <Save className="size-4" /> 保存
+          </Button>
+          <Button disabled={!valid || save.isPending || locked} onClick={() => save.mutate(true)}>
+            <Check className="size-4" /> 锁定本机会
+          </Button>
         </div>
-      </fieldset>
-      <fieldset className="mt-7" disabled={locked}>
-        <legend className="text-sm font-black">Q3 这个机会更适合谁介入？</legend>
-        <div className="mt-3 grid gap-2">
-          {Q3.map((value) => (
-            <label
-              className={`rounded-lg border px-3 py-2 text-sm font-bold ${q3 === value ? 'border-blue-600 bg-blue-50 text-blue-800' : 'border-slate-200'}`}
-              key={value}
-            >
-              <input
-                checked={q3 === value}
-                className="mr-2"
-                onChange={() => setQ3(value)}
-                type="radio"
-              />
-              {value}
-            </label>
-          ))}
-        </div>
-      </fieldset>
-      <div className="mt-7 flex flex-wrap gap-3">
-        <Button
-          disabled={!valid || save.isPending || locked}
-          onClick={() => save.mutate(false)}
-          variant="secondary"
-        >
-          <Save className="size-4" /> 保存
-        </Button>
-        <Button disabled={!valid || save.isPending || locked} onClick={() => save.mutate(true)}>
-          <Check className="size-4" /> 锁定本机会
-        </Button>
-      </div>
-    </></LocalizedTextBoundary>
+      </>
+    </LocalizedTextBoundary>
   );
 }
 
@@ -275,54 +279,56 @@ function ExpertWorkspaceContent({ taskId }: Readonly<{ taskId: string }>) {
       </main>
     );
   return (
-    <LocalizedTextBoundary><main className="jx-page-viewport bg-[#f7faff] p-4 text-slate-950 md:p-7">
-      <div className="mx-auto grid min-h-[calc(100vh-7rem)] max-w-[1500px] grid-cols-1 overflow-hidden bg-white shadow-sm lg:grid-cols-[15rem_minmax(0,1fr)_minmax(25rem,.85fr)]">
-        <aside className="border-b border-slate-100 p-4 lg:border-b-0 lg:border-r">
-          <Link className="text-xs font-black text-blue-700" href="/experiments">
-            返回实验安排
-          </Link>
-          <h1 className="mt-3 text-xl font-black">专家机会标注</h1>
-          <p className="mt-1 text-xs text-slate-500">{task.items.length} 个机会</p>
-          <div className="mt-5 grid grid-cols-6 gap-1 lg:grid-cols-4">
-            {task.items.map((candidate, candidateIndex) => (
-              <button
-                aria-label={`机会 ${candidateIndex + 1}`}
-                className={`h-9 rounded-md text-xs font-black ${candidateIndex === index ? 'bg-blue-600 text-white' : candidate.submitted_at ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-600'}`}
-                key={candidate.opportunity_id}
-                onClick={() => setIndex(candidateIndex)}
-                type="button"
+    <LocalizedTextBoundary>
+      <main className="jx-page-viewport bg-[#f7faff] p-4 text-slate-950 md:p-7">
+        <div className="mx-auto grid min-h-[calc(100vh-7rem)] max-w-[1500px] grid-cols-1 overflow-hidden bg-white shadow-sm lg:grid-cols-[15rem_minmax(0,1fr)_minmax(25rem,.85fr)]">
+          <aside className="border-b border-slate-100 p-4 lg:border-b-0 lg:border-r">
+            <Link className="text-xs font-black text-blue-700" href="/experiments">
+              返回实验安排
+            </Link>
+            <h1 className="mt-3 text-xl font-black">专家机会标注</h1>
+            <p className="mt-1 text-xs text-slate-500">{task.items.length} 个机会</p>
+            <div className="mt-5 grid grid-cols-6 gap-1 lg:grid-cols-4">
+              {task.items.map((candidate, candidateIndex) => (
+                <button
+                  aria-label={`机会 ${candidateIndex + 1}`}
+                  className={`h-9 rounded-md text-xs font-black ${candidateIndex === index ? 'bg-blue-600 text-white' : candidate.submitted_at ? 'bg-emerald-100 text-emerald-800' : 'bg-slate-100 text-slate-600'}`}
+                  key={candidate.opportunity_id}
+                  onClick={() => setIndex(candidateIndex)}
+                  type="button"
+                >
+                  {candidateIndex + 1}
+                </button>
+              ))}
+            </div>
+          </aside>
+
+          <section className="min-h-0 overflow-y-auto border-b border-slate-100 p-5 lg:border-b-0 lg:border-r lg:p-7">
+            <p className="text-xs font-black text-blue-700">机会 {index + 1} · 仅显示此前信息</p>
+            <h2 className="mt-2 text-xl font-black">冻结场上状态</h2>
+            <FrozenState payload={item.frozen_payload} taskId={task.id} />
+          </section>
+
+          <section className="min-h-0 overflow-y-auto p-5 lg:p-7">
+            <ExpertQuestionPanel
+              item={item}
+              key={item.opportunity_id}
+              onUpdated={update}
+              task={task}
+            />
+            <div className="mt-3">
+              <Button
+                disabled={finalSubmit.isPending || task.status === 'SUBMITTED'}
+                onClick={() => finalSubmit.mutate()}
+                variant="danger"
               >
-                {candidateIndex + 1}
-              </button>
-            ))}
-          </div>
-        </aside>
-
-        <section className="min-h-0 overflow-y-auto border-b border-slate-100 p-5 lg:border-b-0 lg:border-r lg:p-7">
-          <p className="text-xs font-black text-blue-700">机会 {index + 1} · 仅显示此前信息</p>
-          <h2 className="mt-2 text-xl font-black">冻结场上状态</h2>
-          <FrozenState payload={item.frozen_payload} taskId={task.id} />
-        </section>
-
-        <section className="min-h-0 overflow-y-auto p-5 lg:p-7">
-          <ExpertQuestionPanel
-            item={item}
-            key={item.opportunity_id}
-            onUpdated={update}
-            task={task}
-          />
-          <div className="mt-3">
-            <Button
-              disabled={finalSubmit.isPending || task.status === 'SUBMITTED'}
-              onClick={() => finalSubmit.mutate()}
-              variant="danger"
-            >
-              最终提交全部
-            </Button>
-          </div>
-        </section>
-      </div>
-    </main></LocalizedTextBoundary>
+                最终提交全部
+              </Button>
+            </div>
+          </section>
+        </div>
+      </main>
+    </LocalizedTextBoundary>
   );
 }
 
