@@ -3655,3 +3655,18 @@ C代码+1569unique/315源/15speech完整混合赛独审7a5d9e9a…通过，仍�
 cleanup_timeout事件；业务最终runtime57a13/servicef4d6冻结不变。发布工具新V3
 87控/static0、A准备真实合格包，C窄审中。15:24:12UTC两目标只读：034835WAITING
 无match/lease0；766345PAUSED+同match/lease1/历史connections5，尚未关闭或停服。
+
+
+### Spec305发布材料就绪，等待明确结束现有房间授权
+
+A真实08转换器4控/static0，实际4件qualification3d4678bb…；Root独立对照embedded
+TAILQUAL9897/pressure原件、Ffinal4094、Cpublisherreview61364fd、当前2源完全一致，
+建立外部canonical audioReview352b7c360bb5e30b92ce57ca9abe3f2d3ccdaf84d688707f8ddf78ad89b9406f信任。
+5文件仅上传/tmp/jx-spec305-release-24ccc540add540b59d6cac0b11ef56dd并逐SHA核验；
+预定回滚目录/opt/jixia-release-backups/20261015-spec305-24ccc540尚未创建，未执行发布。
+代码仅10个305文件提交b75bc168df3676bcf6edfb5b5764938ef44b07ce，GitHub main远端同SHA；
+并行Spec306/.claude完整保留未stage/提交。15:31:22UTC RO122源全同/原PID0restart/
+WebHX2A/schema0047/ownedrtc0，仍paused766345/lease1、waiting034835。已发明确结束
+两房async请求，暂停比赛终止不可恢复、候场关闭不可继续，保留历史；答复前不创建
+管理session、不调用终止接口、不停服务。发布后尾音/混合赛尚未执行。报告
+profile_output/spec305/release/RELEASE_REPORT.md、ROOT_TRUST_RECEIPT、UPLOAD_RECEIPT。
