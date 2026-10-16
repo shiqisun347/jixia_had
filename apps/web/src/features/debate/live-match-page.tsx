@@ -11,7 +11,12 @@ import { useToast } from '@/components/ui/toast-provider';
 import { useCurrentUser } from '@/features/auth/use-auth';
 import { AdminEmergencyControls } from '@/features/admin/admin-emergency-controls';
 import { ApiClientError } from '@/lib/auth-api';
-import { matchesApi } from '@/lib/matches-api';
+import {
+  matchesApi,
+  newestMatchTranscript,
+  type MatchSnapshot,
+  type MatchTranscript,
+} from '@/lib/matches-api';
 import { roomsApi, type RoomSnapshot } from '@/lib/rooms-api';
 import { useSubmissionGate } from '@/lib/use-submission-gate';
 import { useAppTranslations } from '@/i18n';
@@ -26,12 +31,15 @@ import {
   type RemoteAudioSource,
 } from './match-audio-playback';
 import { shouldConnectMatchAudio } from './match-audio-policy';
+import { HumanMicrophoneStart, type HumanMicrophoneContext } from './human-microphone-start';
+import { mutedMicrophonePreparation } from './muted-microphone-preparation';
 import { canRequestHand, resolveCurrentSeat } from './match-presentation';
 import { useMatchRuntime } from './use-match-runtime';
 import { shouldRestoreMicrophone, useMatchCommand } from './use-match-command';
 import { useSmoothMatchSnapshot } from './use-smooth-match-snapshot';
 
 interface MatchAudioSession {
+  prepareMicrophone(): Promise<void>;
   setMicrophoneEnabled(enabled: boolean): Promise<void>;
   enableAudio(): Promise<void>;
   canPlaybackAudio?: boolean;
@@ -304,11 +312,20 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
   });
   const transcriptQuery = useQuery({
     queryKey: ['matches', matchId, 'transcript'],
-    queryFn: () => matchesApi.transcript(matchId),
+    queryFn: async () => {
+      const incoming = await matchesApi.transcript(matchId);
+      return newestMatchTranscript(
+        queryClient.getQueryData<MatchTranscript>(['matches', matchId, 'transcript']),
+        incoming,
+      );
+    },
     enabled: Boolean(runtime.snapshot),
     staleTime: Number.POSITIVE_INFINITY,
   });
   const audioSessionRef = useRef<MatchAudioSession | null>(null);
+  const manuallyClosedSpeechRef = useRef<string | null>(null);
+  const [microphoneStartPending, setMicrophoneStartPending] = useState(false);
+  const [microphoneStart] = useState(() => new HumanMicrophoneStart(setMicrophoneStartPending));
   // Transport readiness controls microphone commands; playback consent is independent.
   const [audioStatus, setAudioStatus] = useState<'connecting' | 'ready' | 'error'>('connecting');
   const [playbackStatus, setPlaybackStatus] = useState<'ready' | 'blocked'>('ready');
@@ -434,7 +451,7 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
       if (terminal) {
         const session = audioSessionRef.current;
         if (session) {
-          void session.setMicrophoneEnabled(false);
+          void microphoneStart.stop(session).catch(() => undefined);
           session.disconnect();
           audioSessionRef.current = null;
         }
@@ -450,7 +467,7 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
         if (canUseLocalAudioOverride() && window.__JX_MATCH_AUDIO_OVERRIDE__) {
           const session = await window.__JX_MATCH_AUDIO_OVERRIDE__();
           if (cancelled) {
-            void session.setMicrophoneEnabled(false);
+            void microphoneStart.stop(session).catch(() => undefined);
             session.disconnect();
           } else {
             audioSessionRef.current = session;
@@ -541,7 +558,16 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
             await room.disconnect();
             return;
           }
+          const microphone = mutedMicrophonePreparation({
+            currentTrack: () =>
+              room.localParticipant.getTrackPublication(Track.Source.Microphone)?.track,
+            createTracks: () => room.localParticipant.createTracks({ audio: true }),
+            publish: (track) =>
+              room.localParticipant.publishTrack(track, { source: Track.Source.Microphone }),
+            unpublish: (track) => room.localParticipant.unpublishTrack(track, true),
+          });
           audioSessionRef.current = {
+            prepareMicrophone: () => microphone.prepare(),
             setMicrophoneEnabled: (enabled) =>
               room.localParticipant.setMicrophoneEnabled(enabled).then(() => undefined),
             enableAudio: async () => {
@@ -569,6 +595,7 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
               }
             },
             disconnect: () => {
+              microphone.close();
               room.off(RoomEvent.TrackSubscribed, attachAudio);
               room.off(RoomEvent.TrackUnsubscribed, detachAudio);
               for (const track of attachedElementsByTrack.keys()) track.detach();
@@ -620,16 +647,34 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
       cancelled = true;
       const session = audioSessionRef.current;
       if (session) {
-        void session.setMicrophoneEnabled(false);
+        void microphoneStart.stop(session).catch(() => undefined);
         session.disconnect();
       }
       audioSessionRef.current = null;
     };
-  }, [matchId, roomQuery.isSuccess, runtime.connectionEpoch, shouldConnectAudio, terminal]);
+  }, [
+    matchId,
+    microphoneStart,
+    roomQuery.isSuccess,
+    runtime.connectionEpoch,
+    shouldConnectAudio,
+    terminal,
+  ]);
 
   const displaySnapshot = useSmoothMatchSnapshot(snapshot);
   const room = roomQuery.data;
   const userId = currentUser.data?.user.id;
+  const { connectionEpoch, isCurrentConnection } = runtime;
+  const readMicrophoneContext = useCallback(
+    (): HumanMicrophoneContext => ({
+      snapshot: queryClient.getQueryData<MatchSnapshot>(['matches', matchId, 'snapshot']),
+      session: audioSessionRef.current,
+      epoch: connectionEpoch,
+      userId,
+      connectionCurrent: isCurrentConnection(connectionEpoch),
+    }),
+    [matchId, queryClient, connectionEpoch, isCurrentConnection, userId],
+  );
   const isCurrentSpeaker = Boolean(
     userId && snapshot?.current_speaker_user_id && snapshot.current_speaker_user_id === userId,
   );
@@ -660,16 +705,19 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
     if (audioStatus !== 'ready') return;
     const session = audioSessionRef.current;
     if (!session) return;
-    const microphoneEnabled =
-      snapshot?.action_state === 'HUMAN_SPEAKING' && snapshot.current_speaker_user_id === userId;
-    void session.setMicrophoneEnabled(microphoneEnabled);
-  }, [
-    audioStatus,
-    runtime.connectionEpoch,
-    snapshot?.action_state,
-    snapshot?.current_speaker_user_id,
-    userId,
-  ]);
+    void microphoneStart
+      .sync(
+        {
+          snapshot,
+          session,
+          epoch: connectionEpoch,
+          userId,
+          connectionCurrent: isCurrentConnection(connectionEpoch),
+        },
+        manuallyClosedSpeechRef.current,
+      )
+      .catch(() => setAudioError(debateTRef.current('errors.asrNotReady')));
+  }, [audioStatus, microphoneStart, connectionEpoch, isCurrentConnection, snapshot, userId]);
 
   const confirmationIsStillValid = useMemo(() => {
     if (!confirmation || !snapshot) return false;
@@ -710,8 +758,14 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
         | 'match.pause'
         | 'match.resume'
         | 'match.terminate',
-    ) => runtime.sendCommand({ type, message_id: crypto.randomUUID() }),
-    [runtime],
+    ) =>
+      runtime.sendCommand(
+        { type, message_id: crypto.randomUUID() },
+        type === 'speech.start'
+          ? microphoneStart.submissionGuard(readMicrophoneContext)
+          : undefined,
+      ),
+    [microphoneStart, readMicrophoneContext, runtime],
   );
   const { command, isPending: commandPending } = useMatchCommand(
     sendMatchCommand,
@@ -783,15 +837,44 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
       setAudioError(debateT('dialog.audioNotReady'));
       return;
     }
-    if (await command('speech.start')) {
-      await audioSessionRef.current?.setMicrophoneEnabled(true);
+    try {
+      setAudioError(null);
+      await microphoneStart.start(
+        readMicrophoneContext,
+        () => command('speech.start'),
+        () => {
+          manuallyClosedSpeechRef.current = null;
+        },
+      );
+    } catch {
+      setAudioError(debateT('errors.asrNotReady'));
     }
   }
 
   async function finishSpeech() {
-    await audioSessionRef.current?.setMicrophoneEnabled(false);
-    if (shouldRestoreMicrophone(await command('speech.finish'), isCurrentSpeaker)) {
-      await audioSessionRef.current?.setMicrophoneEnabled(true);
+    await closeMicrophoneForCommand('speech.finish');
+  }
+
+  async function closeMicrophoneForCommand(type: 'speech.finish' | 'match.pause' | 'speech.reset') {
+    const sourceSpeechId = snapshot?.current_speech_id;
+    const sourceEpoch = runtime.connectionEpoch;
+    const sourceSession = audioSessionRef.current;
+    manuallyClosedSpeechRef.current = sourceSpeechId ?? null;
+    if (sourceSession) await microphoneStart.stop(sourceSession);
+    const succeeded = await command(type);
+    const current = queryClient.getQueryData<MatchSnapshot>(['matches', matchId, 'snapshot']);
+    if (
+      shouldRestoreMicrophone(succeeded, isCurrentSpeaker) &&
+      sourceSpeechId &&
+      current?.current_speech_id === sourceSpeechId &&
+      current.status === 'RUNNING' &&
+      current.action_state === 'HUMAN_SPEAKING' &&
+      current.current_speaker_user_id === userId &&
+      sourceSession === audioSessionRef.current &&
+      runtime.isCurrentConnection(sourceEpoch)
+    ) {
+      manuallyClosedSpeechRef.current = null;
+      if (sourceSession) await microphoneStart.setEnabled(sourceSession, true);
     }
   }
 
@@ -806,7 +889,9 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
     setSavingSpeechId(speechId);
     try {
       const transcript = await matchesApi.updateDisplayText(matchId, speechId, displayText);
-      queryClient.setQueryData(['matches', matchId, 'transcript'], transcript);
+      queryClient.setQueryData<MatchTranscript>(['matches', matchId, 'transcript'], (current) =>
+        newestMatchTranscript(current, transcript),
+      );
       setEditingSpeechId(null);
       showToast({ message: debateT('dialog.textSaved'), tone: 'success' });
     } catch (saveError: unknown) {
@@ -822,17 +907,11 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
   }
 
   async function pauseMatch() {
-    await audioSessionRef.current?.setMicrophoneEnabled(false);
-    if (shouldRestoreMicrophone(await command('match.pause'), isCurrentSpeaker)) {
-      await audioSessionRef.current?.setMicrophoneEnabled(true);
-    }
+    await closeMicrophoneForCommand('match.pause');
   }
 
   async function resetSpeech() {
-    await audioSessionRef.current?.setMicrophoneEnabled(false);
-    if (shouldRestoreMicrophone(await command('speech.reset'), isCurrentSpeaker)) {
-      await audioSessionRef.current?.setMicrophoneEnabled(true);
-    }
+    await closeMicrophoneForCommand('speech.reset');
   }
 
   async function leaveMatch() {
@@ -939,7 +1018,7 @@ export function LiveMatchPage({ matchId }: Readonly<{ matchId: string }>) {
         outputMuted={outputMuted}
         mutedHumanUserIds={mutedHumanUserIds}
         canRaiseHand={canRaiseHand}
-        commandPending={commandPending}
+        commandPending={commandPending || microphoneStartPending}
         currentSeat={currentSeat}
         currentUserId={userId ?? ''}
         draftText={draftText}

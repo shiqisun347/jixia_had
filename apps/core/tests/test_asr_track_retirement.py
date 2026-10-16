@@ -69,6 +69,13 @@ class Stream:
 
 
 class Speech:
+    input_closed = False
+    input_admitted = True
+    pending_provider_tasks = ()
+
+    def discard_audio(self) -> None:
+        self.frames.clear()
+
     def __init__(self) -> None:
         self.frames: list[bytes] = []
 

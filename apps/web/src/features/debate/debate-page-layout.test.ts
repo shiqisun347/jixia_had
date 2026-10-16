@@ -7,8 +7,46 @@ import {
   localizedStageName,
   runtimeErrorLabel,
   shouldShowRuntimeFault,
+  transcriptPendingSource,
 } from './debate-page-layout';
 import type { MatchSnapshot } from '@/lib/matches-api';
+
+describe('pending transcript ownership', () => {
+  it('shows the current first speech as pending before any official record exists', () => {
+    const snapshot = {
+      action_state: 'SPEECH_FINALIZING',
+      current_speech_id: 'human-a',
+      current_speaker_side: 'AFFIRMATIVE',
+      current_speaker_seat_no: 1,
+    } as MatchSnapshot;
+    expect(transcriptPendingSource(snapshot)).toEqual({
+      speech_id: 'human-a',
+      speaker_kind: 'HUMAN',
+      side: 'AFFIRMATIVE',
+      seat_no: 1,
+      status: 'FINALIZING',
+    });
+  });
+
+  it('keeps the earlier source separate from the next selected speaker', () => {
+    const pending = {
+      speech_id: 'previous-agent',
+      speaker_kind: 'AGENT',
+      side: 'NEGATIVE',
+      seat_no: 2,
+      status: 'FINALIZING',
+    } as const;
+    const snapshot = {
+      action_state: 'HUMAN_READY_TO_START',
+      current_speech_id: null,
+      current_speaker_side: 'AFFIRMATIVE',
+      current_speaker_seat_no: 3,
+      pending_source: pending,
+    } as MatchSnapshot;
+    expect(transcriptPendingSource(snapshot)).toBe(pending);
+    expect(transcriptPendingSource({ ...snapshot, pending_source: null })).toBeNull();
+  });
+});
 
 describe('freeDebateProgress', () => {
   it.each([
@@ -102,6 +140,14 @@ describe('experimentAgentSeatStatus', () => {
 });
 
 describe('runtimeErrorLabel', () => {
+  it.each([
+    ['asr_recovery_required', '保留'],
+    ['asr_finalization_timeout', '20 秒'],
+    ['asr_not_ready', '尚未就绪'],
+    ['asr_audio_missing', '没有可恢复录音'],
+  ])('explains the new recoverable ASR failure %s', (code, expected) => {
+    expect(runtimeErrorLabel(code)).toContain(expected);
+  });
   it('explains a human start timeout with a recovery action', () => {
     expect(runtimeErrorLabel('HUMAN_START_TIMEOUT')).toBe(
       '当前辩手 60 秒内未开始发言，比赛已暂停；确认设备后可申请恢复。',

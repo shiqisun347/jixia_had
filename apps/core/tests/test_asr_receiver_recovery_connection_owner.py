@@ -85,7 +85,7 @@ async def test_actual_receiver_recovery_starts_new_provider_without_releasing_ol
         await asyncio.wait_for(old_factory.entered.wait(), timeout=1)
         assert old_connection._lock.locked() and factory_calls == 1
         await asyncio.wait_for(receiver.abort_speech(), timeout=0.4)
-        assert not old_task.done() and old_factory.cancelled.is_set()
+        assert old_session.pending_provider_tasks and old_factory.cancelled.is_set()
         assert not old_factory.release.is_set()
         new_envelope = envelope(receiver.match_id, uuid4(), attempt=2)
         assert new_envelope.speech_id is not None
@@ -101,7 +101,7 @@ async def test_actual_receiver_recovery_starts_new_provider_without_releasing_ol
             "new_provider_entered": new_entered.is_set(),
             "new_pcm_frames": new_socket.pcm_frames,
             "old_factory_still_held": not old_factory.release.is_set(),
-            "old_task_pending": not old_task.done(),
+            "old_provider_task_pending": bool(old_session.pending_provider_tasks),
             "connections": len(connections),
             "factory_calls": factory_calls,
             "current_reuses_old_connection": receiver._connection is old_connection,
@@ -111,7 +111,7 @@ async def test_actual_receiver_recovery_starts_new_provider_without_releasing_ol
         print("recovery_connection_product_observations=" + json.dumps(snapshot, sort_keys=True))
         assert ready and new_entered.is_set() and new_socket.pcm_frames == 1, snapshot
         assert receiver._connection is not old_connection and len(connections) == 2, snapshot
-        assert not old_factory.release.is_set() and not old_task.done(), snapshot
+        assert not old_factory.release.is_set() and old_session.pending_provider_tasks, snapshot
         assert cast(Any, receiver._room) is room and not external_guard
     finally:
         await asyncio.wait_for(receiver.close(), timeout=0.4)

@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import re
+import stat
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -13,7 +14,8 @@ from dataclasses import dataclass, replace
 from datetime import timedelta
 from functools import partial
 from pathlib import Path
-from typing import Any, BinaryIO, Protocol
+from time import monotonic
+from typing import Any, BinaryIO, Protocol, TypedDict
 from uuid import UUID, uuid4
 from weakref import ref
 
@@ -116,7 +118,7 @@ async def _bounded_cleanup_call(
 
 
 async def _wait_for_retired_asr_tasks(
-    tasks: tuple[asyncio.Task[None], ...], *, resource: str, match_id: UUID
+    tasks: tuple[asyncio.Task[Any], ...], *, resource: str, match_id: UUID
 ) -> None:
     """Wait only for an already-cancelled exact snapshot, without a receiver ref."""
 
@@ -150,7 +152,7 @@ async def _wait_for_retired_asr_tasks(
 
 async def _close_retired_asr_provider(
     connection: FunAsrConnection,
-    tasks: tuple[asyncio.Task[None], ...],
+    tasks: tuple[asyncio.Task[Any], ...],
     *,
     match_id: UUID,
 ) -> None:
@@ -236,6 +238,7 @@ class _TrackConsumer:
     participant: rtc.RemoteParticipant
     task: asyncio.Task[None] | None = None
     retired: bool = False
+    reader_ready: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -246,6 +249,93 @@ class PausedSpeech:
     last_segment_no: int
     first_interim_latency_ms: int | None
     callback_envelope: CallbackEnvelope
+    automatic_retries_used: int = 0
+
+
+class RecoverySourceInfo(TypedDict):
+    """Internal durable failure metadata; never a public transcript DTO."""
+
+    audio_storage_path: str
+    audio_duration_ms: int
+    confirmed_prefix: str
+    max_audio_duration_ms: int
+
+
+def _read_recovery_pcm(
+    storage_root: str,
+    match_id: UUID,
+    speech_id: UUID,
+    user_id: UUID,
+    audio_storage_path: str,
+    audio_duration_ms: int,
+    max_audio_duration_ms: int,
+) -> bytes:
+    """Read only the exact owned raw PCM asset, with no followed child links."""
+    try:
+        if (
+            type(audio_duration_ms) is not int
+            or type(max_audio_duration_ms) is not int
+            or audio_duration_ms <= 0
+            or max_audio_duration_ms < audio_duration_ms
+        ):
+            raise ValueError("invalid audio budget")
+        configured_root = Path(storage_root).absolute()
+        root = configured_root.resolve(strict=True)
+        parts = ("matches", str(match_id), "human", str(user_id), f"{speech_id}.pcm")
+        expected = root.joinpath(*parts)
+        supplied = Path(audio_storage_path).absolute()
+        # Relative configured roots and persisted paths use the normal Core cwd.
+        if supplied not in (expected, configured_root.joinpath(*parts)):
+            raise ValueError("asset identity mismatch")
+        descriptors: list[int] = []
+        try:
+            parent = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            descriptors.append(parent)
+            for part in parts[:-1]:
+                parent = os.open(part, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent)
+                descriptors.append(parent)
+            descriptor = os.open(
+                parts[-1], os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=parent
+            )
+            descriptors.append(descriptor)
+            before = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(before.st_mode)
+                or before.st_size <= 0
+                or before.st_size % 2
+                or before.st_size > max_audio_duration_ms * 32
+                or before.st_size // 32 != audio_duration_ms
+            ):
+                raise ValueError("invalid raw PCM size")
+            chunks: list[bytes] = []
+            remaining = before.st_size
+            while remaining:
+                chunk = os.read(descriptor, min(65536, remaining))
+                if not chunk:
+                    raise ValueError("short PCM read")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            after = os.fstat(descriptor)
+            if (
+                after.st_size != before.st_size
+                or after.st_mtime_ns != before.st_mtime_ns
+                or os.read(descriptor, 1)
+            ):
+                raise ValueError("PCM changed during read")
+            return b"".join(chunks)
+        finally:
+            for descriptor in reversed(descriptors):
+                os.close(descriptor)
+    except (OSError, ValueError, TypeError):
+        raise FunAsrError("asr_recovery_source_invalid") from None
+
+
+@dataclass(slots=True)
+class _RetainedSpeech:
+    session: AsrSpeechSession
+    envelope: CallbackEnvelope
+    speaker_user_id: UUID
+    callback_current: bool = True
 
 
 class AsrRuntimeCallbacks(Protocol):
@@ -301,11 +391,13 @@ class MatchAudioReceiver:
         settings: Settings,
         callbacks: AsrRuntimeCallbacks,
         capture_writer: ProviderCaptureWriter | None = None,
+        input_clock: Callable[[], float] = monotonic,
     ) -> None:
         self.match_id = match_id
         self._settings = settings
         self._callbacks = callbacks
         self._capture_writer = capture_writer
+        self._input_clock = input_clock
         self._room: rtc.Room | None = None
         self._connection: FunAsrConnection | None = None
         self._track_tasks: set[asyncio.Task[None]] = set()
@@ -314,9 +406,16 @@ class MatchAudioReceiver:
         self._failed_start_attempt: _ReceiverStartAttempt | None = None
         self._speech: AsrSpeechSession | None = None
         self._speech_task: asyncio.Task[None] | None = None
+        self._input_deadline_session: AsrSpeechSession | None = None
+        self._input_deadline_timer_id: str | None = None
+        self._input_deadline_task: asyncio.Task[None] | None = None
+        self._input_deadline_tasks: set[asyncio.Task[None]] = set()
         self._speaker_user_id: UUID | None = None
         self._pause_requested = False
         self._paused_speech: PausedSpeech | None = None
+        self._retained_speech: _RetainedSpeech | None = None
+        self._retrying_session: AsrSpeechSession | None = None
+        self._callback_fenced_session: AsrSpeechSession | None = None
         self._recording_file: BinaryIO | None = None
         self._recording_speech_id: UUID | None = None
         self._recording_spool_path: Path | None = None
@@ -684,7 +783,13 @@ class MatchAudioReceiver:
         )
 
     async def start_speech(
-        self, speech_id: UUID, speaker_user_id: UUID, envelope: CallbackEnvelope
+        self,
+        speech_id: UUID,
+        speaker_user_id: UUID,
+        envelope: CallbackEnvelope,
+        *,
+        max_audio_duration_ms: int = 180000,
+        defer_registration: bool = False,
     ) -> None:
         envelope.require("speech_id", "connection_epoch")
         if envelope.match_id != self.match_id or envelope.speech_id != speech_id:
@@ -694,7 +799,13 @@ class MatchAudioReceiver:
                 raise FunAsrError("asr_receiver_closed")
             async with self._lock:
                 await self._start()
-                await self._start_speech_locked(speech_id, speaker_user_id, envelope)
+                await self._start_speech_locked(
+                    speech_id,
+                    speaker_user_id,
+                    envelope,
+                    max_audio_duration_ms=max_audio_duration_ms,
+                    defer_registration=defer_registration,
+                )
 
     def _new_provider_connection(self) -> FunAsrConnection:
         if self._settings.asr_api_key is None:
@@ -710,9 +821,17 @@ class MatchAudioReceiver:
         )
 
     async def _start_speech_locked(
-        self, speech_id: UUID, speaker_user_id: UUID, envelope: CallbackEnvelope
+        self,
+        speech_id: UUID,
+        speaker_user_id: UUID,
+        envelope: CallbackEnvelope,
+        *,
+        max_audio_duration_ms: int = 180000,
+        recovery: _RetainedSpeech | None = None,
+        deadline_mono: float | None = None,
+        defer_registration: bool = False,
     ) -> None:
-        if self._room is None:
+        if self._room is None and recovery is None:
             raise FunAsrError("asr_not_configured")
         if self._connection is None:
             self._connection = self._new_provider_connection()
@@ -731,8 +850,18 @@ class MatchAudioReceiver:
                 context_version=envelope.context_version,
             )
             if paused
-            else envelope
+            else replace(envelope)
         )
+        checkpoint = recovery.session.checkpoint() if recovery is not None else None
+        replay_pcm = recovery.session.pcm_snapshot(unconfirmed_only=True) if recovery else b""
+        confirmed_samples = recovery.session.confirmed_sample_count if recovery else 0
+        replay_prefix = checkpoint.final_text if checkpoint is not None else ""
+        if recovery is not None and not replay_pcm:
+            replay_pcm = recovery.session.pcm_snapshot()
+            confirmed_samples = recovery.session.initial_sample_count
+            replay_prefix = recovery.session.initial_text
+        if recovery is not None and not replay_pcm:
+            raise FunAsrError("asr_empty_audio")
         session: AsrSpeechSession
 
         def owned(
@@ -764,59 +893,435 @@ class MatchAudioReceiver:
             on_segment_started=owned(self._on_segment_started),
             on_segment_failed=owned(self._on_segment_failed),
             on_capture=owned(self._on_capture, capture_callback=True),
-            start_segment_no=paused.last_segment_no if paused else 0,
-            initial_text=paused.final_text if paused else "",
-            initial_sample_count=(paused.audio_duration_ms * 16 if paused else 0),
-            initial_first_interim_latency_ms=(paused.first_interim_latency_ms if paused else None),
+            start_segment_no=(
+                checkpoint.last_segment_no
+                if checkpoint
+                else paused.last_segment_no
+                if paused
+                else 0
+            ),
+            initial_text=replay_prefix if recovery else paused.final_text if paused else "",
+            initial_sample_count=(
+                confirmed_samples if recovery else paused.audio_duration_ms * 16 if paused else 0
+            ),
+            initial_first_interim_latency_ms=(
+                checkpoint.first_interim_latency_ms
+                if checkpoint
+                else paused.first_interim_latency_ms
+                if paused
+                else None
+            ),
+            max_audio_duration_ms=max_audio_duration_ms,
+            automatic_retry_limit=0
+            if recovery or (paused and paused.automatic_retries_used)
+            else 1,
+            defer_registration=defer_registration,
+            input_clock=self._input_clock,
+            automatic_retries_used=(
+                recovery.session.automatic_retries_used
+                if recovery
+                else paused.automatic_retries_used
+                if paused
+                else 0
+            ),
         )
+        if recovery is not None:
+            session.feed_pcm(replay_pcm)
+            await session.finish(deadline_mono=deadline_mono)
         self._speech = session
+        self._callback_fenced_session = None
         self._speaker_user_id = speaker_user_id
         self._speech_envelope = callback_envelope
-        if paused is None:
+        if paused is None and recovery is None:
+            retained, self._retained_speech = self._retained_speech, None
+            if retained is not None:
+                retained.session.discard_audio()
             self._start_recording(speech_id, speaker_user_id)
+        self._retrying_session = session if recovery is not None else None
         self._speech_task = asyncio.create_task(
             self._run_speech(session, callback_envelope), name=f"asr-speech-{speech_id}"
         )
         self._paused_speech = None
 
-    async def finish_speech(self, speech_id: UUID) -> None:
+    def commit_speech_start(
+        self,
+        speech_id: UUID,
+        *,
+        envelope: CallbackEnvelope,
+        input_deadline_mono: float,
+        timer_message_id: str,
+    ) -> float:
+        session = self._speech
+        if (
+            session is None
+            or session.speech_id != speech_id
+            or self._speech_envelope is not envelope
+            or self._callback_fenced_session is session
+        ):
+            raise FunAsrError("asr_callback_identity_mismatch")
+        session.install_input_deadline(input_deadline_mono)
+        if self._input_deadline_session is not session:
+            self._cancel_input_deadline()
+            self._input_deadline_session = session
+            self._input_deadline_timer_id = timer_message_id
+            task = asyncio.create_task(
+                self._watch_input_deadline(session, envelope),
+                name=f"asr-input-deadline-{speech_id}",
+            )
+            self._input_deadline_task = task
+            self._input_deadline_tasks.add(task)
+            task.add_done_callback(self._input_deadline_tasks.discard)
+            task.add_done_callback(_consume_task_exception)
+        session.admit_input()
+        assert session.finalization_deadline is not None
+        return session.finalization_deadline
+
+    def _cancel_input_deadline(self, session: AsrSpeechSession | None = None) -> None:
+        if session is not None and self._input_deadline_session is not session:
+            return
+        task = self._input_deadline_task
+        self._input_deadline_task = None
+        self._input_deadline_session = None
+        self._input_deadline_timer_id = None
+        if task is not None and task is not asyncio.current_task() and not task.done():
+            task.cancel()
+
+    async def _watch_input_deadline(
+        self, session: AsrSpeechSession, envelope: CallbackEnvelope
+    ) -> None:
+        await session.wait_input_deadline()
+        deadline = session.finalization_deadline
+        assert deadline is not None
+        await asyncio.sleep(max(0.0, deadline - monotonic()))
+        if self._speech is not session or self._speech_envelope is not envelope:
+            return
+        # This also retires a provider exception whose failure callback is still
+        # waiting on a timer's SQL transaction. Only finish_speech may replace
+        # this watchdog with its own wait on the same absolute deadline.
+        await self._retain_and_retire(session, envelope)
+        try:
+            await asyncio.wait_for(
+                self._callbacks.handle_asr_failure(
+                    envelope=envelope, code="asr_finalization_timeout"
+                ),
+                timeout=ASR_FAILURE_CALLBACK_TIMEOUT_SECONDS,
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            logger.warning(
+                "ASR input deadline failure callback failed",
+                extra={
+                    "error_code": "asr_deadline_failure_callback",
+                    "match_id": str(self.match_id),
+                    "exception_type": type(error).__name__,
+                },
+            )
+
+    def expired_input_owner(self, timer_message_id: str) -> CallbackEnvelope | None:
+        session = self._input_deadline_session
+        if (
+            session is not None
+            and session is self._speech
+            and self._input_deadline_timer_id == timer_message_id
+            and self._callback_fenced_session is not session
+            and session.input_deadline_mono is not None
+            and self._input_clock() >= session.input_deadline_mono
+        ):
+            return self._speech_envelope
+        return None
+
+    async def retire_expired_input(
+        self, timer_message_id: str, *, envelope: CallbackEnvelope
+    ) -> float | None:
+        if self.expired_input_owner(timer_message_id) is not envelope:
+            return None
+        session = self._speech
+        assert session is not None
+        if not session.pcm_snapshot():
+            return None
+        await self._retain_and_retire(session, envelope)
+        return session.finalization_deadline
+
+    def fence_speech_input(self, speech_id: UUID) -> None:
+        session = self._speech
+        if session is not None and session.speech_id == speech_id:
+            self._cancel_input_deadline(session)
+            self._callback_fenced_session = session
+            self._pause_requested = True
+            session.close_input()
+        retained = self._retained_speech
+        if retained is not None and retained.session.speech_id == speech_id:
+            retained.callback_current = False
+
+    def recovery_source_envelope(self, speech_id: UUID) -> CallbackEnvelope | None:
+        retained = self._retained_speech
+        return (
+            retained.envelope
+            if retained is not None and retained.session.speech_id == speech_id
+            else None
+        )
+
+    def recovery_source_available(self, speech_id: UUID) -> bool:
+        retained = self._retained_speech
+        return bool(
+            retained is not None
+            and retained.session.speech_id == speech_id
+            and retained.session.pcm_snapshot()
+        )
+
+    def recovery_source_info(self, speech_id: UUID) -> RecoverySourceInfo | None:
+        retained = self._retained_speech
+        path = self._recording_storage_path
+        if (
+            retained is None
+            or retained.session.speech_id != speech_id
+            or self._recording_speech_id != speech_id
+            or path is None
+        ):
+            return None
+        try:
+            size = path.lstat()
+        except OSError:
+            return None
+        if not stat.S_ISREG(size.st_mode) or size.st_size <= 0 or size.st_size % 2:
+            return None
+        return {
+            "audio_storage_path": str(path),
+            "audio_duration_ms": size.st_size // 32,
+            "confirmed_prefix": retained.session.checkpoint().final_text,
+            "max_audio_duration_ms": (
+                retained.session.max_audio_duration_ms + retained.session.initial_sample_count // 16
+            ),
+        }
+
+    async def restore_recovery_source(
+        self,
+        speech_id: UUID,
+        user_id: UUID,
+        envelope: CallbackEnvelope,
+        *,
+        audio_storage_path: str,
+        audio_duration_ms: int,
+        max_audio_duration_ms: int,
+        last_segment_no: int = 0,
+    ) -> None:
+        if (
+            envelope.match_id != self.match_id
+            or envelope.speech_id != speech_id
+            or type(last_segment_no) is not int
+            or last_segment_no < 0
+        ):
+            raise FunAsrError("asr_recovery_source_invalid")
+        pcm = await asyncio.to_thread(
+            _read_recovery_pcm,
+            self._settings.agent_audio_storage_dir,
+            self.match_id,
+            speech_id,
+            user_id,
+            audio_storage_path,
+            audio_duration_ms,
+            max_audio_duration_ms,
+        )
         async with self._lifecycle_lock:
-            session = self._speech
-            task = self._speech_task
-            if session is None or task is None or session.speech_id != speech_id:
+            if self._closed or self._close_requested:
+                raise FunAsrError("asr_receiver_closed")
+            if (
+                self._speech is not None
+                or self._retained_speech is not None
+                or self._paused_speech is not None
+                or self._recording_file is not None
+            ):
+                raise FunAsrError("asr_recovery_source_unavailable")
+
+            async def unused(*_args: Any) -> None:
+                return None
+
+            # This connection is unopened. Only an explicit retry may start IO.
+            session = AsrSpeechSession(
+                speech_id=speech_id,
+                connection=self._new_provider_connection(),
+                start_segment_no=last_segment_no,
+                on_interim=unused,
+                on_segment=unused,
+                max_audio_duration_ms=max_audio_duration_ms,
+                automatic_retry_limit=0,
+            )
+            session.feed_pcm(pcm)
+            session.close_input()
+            self._retained_speech = _RetainedSpeech(
+                session, replace(envelope), user_id, callback_current=False
+            )
+            self._recording_speech_id = speech_id
+            self._recording_storage_path = Path(audio_storage_path)
+            self._recording_error = None
+
+    def speech_callback_envelope(self, speech_id: UUID) -> CallbackEnvelope | None:
+        if self._speech is not None and self._speech.speech_id == speech_id:
+            return None if self._callback_fenced_session is self._speech else self._speech_envelope
+        retained = self._retained_speech
+        if (
+            retained is not None
+            and retained.session.speech_id == speech_id
+            and retained.callback_current
+        ):
+            return retained.envelope
+        return None
+
+    def finalization_callback_is_current(self, envelope: CallbackEnvelope) -> bool:
+        if (
+            envelope.speech_id is None
+            or self.speech_callback_envelope(envelope.speech_id) is not envelope
+        ):
+            return False
+        return bool(
+            (self._speech is not None and self._speech.input_closed)
+            or self._retained_speech is not None
+        )
+
+    async def wait_speech_ready(self, speech_id: UUID, *, seconds: float = 3.0) -> None:
+        session, envelope = self._speech, self._speech_envelope
+        if session is None or envelope is None or session.speech_id != speech_id:
+            raise FunAsrError("asr_speech_not_found")
+        deadline = asyncio.get_running_loop().time() + seconds
+        await session.wait_ready(seconds)
+        while self._speech is session and self._speech_envelope is envelope:
+            for owner in self._subscribed_tracks.values():
+                identity = _identity_parts(owner.key[0])
+                if (
+                    self._track_consumer_is_current(owner)
+                    and owner.reader_ready
+                    and owner.task is not None
+                    and not owner.task.done()
+                    and identity == (self._speaker_user_id, envelope.connection_epoch)
+                ):
+                    return
+            if asyncio.get_running_loop().time() >= deadline:
+                raise FunAsrError("asr_not_ready")
+            await asyncio.sleep(0.01)
+        raise FunAsrError("asr_speech_not_found")
+
+    async def finish_speech(self, speech_id: UUID, *, deadline_mono: float | None = None) -> None:
+        async with self._lifecycle_lock:
+            session, task, envelope = self._speech, self._speech_task, self._speech_envelope
+            if (
+                session is None
+                or task is None
+                or session.speech_id != speech_id
+                or envelope is None
+            ):
                 raise FunAsrError("asr_speech_not_found")
-        await session.finish()
+        await session.finish(deadline_mono=deadline_mono)
+        self._cancel_input_deadline(session)
+        deadline = session.finalization_deadline
+        assert deadline is not None
+        done, _ = await asyncio.wait(
+            {task}, timeout=max(0, deadline - asyncio.get_running_loop().time())
+        )
+        if not done:
+            await self._retain_and_retire(session, envelope)
+            raise FunAsrError("asr_finalization_timeout")
         await task
+
+    async def _retain_and_retire(
+        self, session: AsrSpeechSession, envelope: CallbackEnvelope
+    ) -> None:
+        if self._speech is not session:
+            return
+        self._cancel_input_deadline(session)
+        user_id = self._speaker_user_id
+        if user_id is None:
+            raise FunAsrError("asr_callback_identity_mismatch")
+        await session.finish()
+        self._retained_speech = _RetainedSpeech(session, envelope, user_id)
+        self._publish_recording()
+        task, self._speech_task = self._speech_task, None
+        self._speech, self._speaker_user_id, self._speech_envelope = None, None, None
+        self._pause_requested = False
+        if task is not None and task is not asyncio.current_task():
+            task.cancel()
+            task.add_done_callback(_consume_task_exception)
+        connection, self._connection = self._connection, None
+        if connection is not None:
+            cleanup = asyncio.create_task(
+                _close_retired_asr_provider(
+                    connection,
+                    ((task,) if task is not None else ()) + session.pending_provider_tasks,
+                    match_id=self.match_id,
+                )
+            )
+            cleanup.add_done_callback(_consume_task_exception)
+
+    async def retry_from_recording(
+        self, speech_id: UUID, envelope: CallbackEnvelope, *, deadline_mono: float
+    ) -> None:
+        async with self._lifecycle_lock:
+            retained = self._retained_speech
+            if (
+                self._speech is not None
+                or retained is None
+                or retained.session.speech_id != speech_id
+                or envelope.match_id != self.match_id
+                or envelope.speech_id != speech_id
+            ):
+                raise FunAsrError("asr_recovery_source_unavailable")
+            retained.callback_current = False
+            old_connection, self._connection = self._connection, self._new_provider_connection()
+            if old_connection is not None:
+                cleanup = asyncio.create_task(
+                    _close_retired_asr_provider(old_connection, (), match_id=self.match_id)
+                )
+                cleanup.add_done_callback(_consume_task_exception)
+            await self._start_speech_locked(
+                speech_id,
+                retained.speaker_user_id,
+                envelope,
+                max_audio_duration_ms=retained.session.max_audio_duration_ms,
+                recovery=retained,
+                deadline_mono=deadline_mono,
+            )
+        await self.finish_speech(speech_id, deadline_mono=deadline_mono)
 
     async def abort_speech(self, *, expected_session: AsrSpeechSession | None = None) -> None:
         async with self._lifecycle_lock:
             if expected_session is not None and self._speech is not expected_session:
                 return
+            session = self._speech
             task = self._detach_speech()
             connection = self._connection
             try:
                 await self._cancel_task(task)
             finally:
+                producers: tuple[asyncio.Task[Any], ...] = (
+                    (task,) if task is not None and task is not asyncio.current_task() else ()
+                ) + (session.pending_provider_tasks if session is not None else ())
                 if (
-                    task is not None
-                    and task is not asyncio.current_task()
-                    and not task.done()
+                    any(not producer.done() for producer in producers)
                     and connection is not None
                     and self._connection is connection
                 ):
                     self._connection = None
                     cleanup = asyncio.create_task(
-                        _close_retired_asr_provider(connection, (task,), match_id=self.match_id)
+                        _close_retired_asr_provider(connection, producers, match_id=self.match_id)
                     )
                     cleanup.add_done_callback(_consume_task_exception)
 
     def _detach_speech(self) -> asyncio.Task[None] | None:
+        self._cancel_input_deadline()
         task, self._speech_task = self._speech_task, None
+        previous = self._speech
         self._speech = None
         self._speaker_user_id = None
         self._paused_speech = None
         self._speech_envelope = None
         self._pause_requested = False
+        self._retrying_session = None
+        self._callback_fenced_session = None
+        retained, self._retained_speech = self._retained_speech, None
+        if retained is not None:
+            retained.session.discard_audio()
+        if previous is not None and (retained is None or retained.session is not previous):
+            previous.discard_audio()
         self._discard_recording()
         return task
 
@@ -825,7 +1330,7 @@ class MatchAudioReceiver:
             return
         await self._cancel_tasks((task,), resource="speech")
 
-    async def _cancel_tasks(self, tasks: tuple[asyncio.Task[None], ...], *, resource: str) -> None:
+    async def _cancel_tasks(self, tasks: tuple[asyncio.Task[Any], ...], *, resource: str) -> None:
         current = asyncio.current_task()
         pending_tasks = {task for task in tasks if task is not current and not task.done()}
         if not pending_tasks:
@@ -861,12 +1366,25 @@ class MatchAudioReceiver:
     async def pause_speech(self, speech_id: UUID) -> None:
         async with self._lifecycle_lock:
             session = self._speech
-            task = self._speech_task
-            if session is None or task is None or session.speech_id != speech_id:
+            retained = self._retained_speech
+            if session is None:
+                if retained is not None and retained.session.speech_id == speech_id:
+                    retained.callback_current = False
+                return
+            if session.speech_id != speech_id:
+                return
+            if self._retrying_session is session:
+                envelope = self._speech_envelope
+                assert envelope is not None
+                await self._retain_and_retire(session, envelope)
+                assert self._retained_speech is not None
+                self._retained_speech.callback_current = False
+                self._retrying_session = None
                 return
             self._pause_requested = True
-        await session.finish()
-        await task
+        await self.finish_speech(speech_id)
+        if self._paused_speech is None and self._retained_speech is not None:
+            raise FunAsrError("asr_recovery_required")
 
     async def close(self) -> None:
         self.request_close()
@@ -875,6 +1393,7 @@ class MatchAudioReceiver:
                 return
             self._closed = True
             speech_task = self._speech_task
+            provider_tasks = self._speech.pending_provider_tasks if self._speech is not None else ()
             try:
                 self._detach_speech()
             except Exception as error:
@@ -893,7 +1412,7 @@ class MatchAudioReceiver:
                         "exception_type": type(error).__name__,
                     },
                 )
-            track_tasks = tuple(self._track_tasks)
+            track_tasks = tuple(self._track_tasks) + tuple(self._input_deadline_tasks)
             self._track_tasks.clear()
             for owner in tuple(self._subscribed_tracks.values()):
                 self._retire_track_consumer(owner)
@@ -906,7 +1425,7 @@ class MatchAudioReceiver:
             (speech_task,) if speech_task is not None and speech_task is not current else ()
         )
         track_tasks = tuple(task for task in track_tasks if task is not current)
-        retired_tasks = speech_tasks + track_tasks
+        retired_tasks = speech_tasks + track_tasks + provider_tasks
         for task in retired_tasks:
             task.add_done_callback(_consume_task_exception)
             if not task.done() and (task not in track_tasks or not task.cancelling()):
@@ -955,6 +1474,7 @@ class MatchAudioReceiver:
                     last_segment_no=result.last_segment_no,
                     first_interim_latency_ms=result.first_interim_latency_ms,
                     callback_envelope=envelope,
+                    automatic_retries_used=session.automatic_retries_used,
                 )
             else:
                 audio_storage_path = self._publish_recording()
@@ -969,12 +1489,16 @@ class MatchAudioReceiver:
                     audio_storage_path=audio_storage_path,
                     audio_recording_error=self._recording_error,
                 )
+                if self._speech is session:
+                    retained, self._retained_speech = self._retained_speech, None
+                    if retained is not None and retained.session is not session:
+                        retained.session.discard_audio()
         except asyncio.CancelledError:
             raise
         except Exception as error:
             if self._speech is not session:
                 return
-            if self._pause_requested:
+            if self._pause_requested and not session.has_unconfirmed_audio:
                 checkpoint = session.checkpoint()
                 self._paused_speech = PausedSpeech(
                     speech_id=session.speech_id,
@@ -983,14 +1507,19 @@ class MatchAudioReceiver:
                     last_segment_no=checkpoint.last_segment_no,
                     first_interim_latency_ms=checkpoint.first_interim_latency_ms,
                     callback_envelope=envelope,
+                    automatic_retries_used=session.automatic_retries_used,
                 )
                 logger.info(
                     "asr pause retained checkpoint after provider close failure",
                     extra={"match_id": str(self.match_id), "speech_id": str(session.speech_id)},
                 )
             else:
-                if self._recording_storage_path is not None:
-                    self._recording_storage_path.unlink(missing_ok=True)
+                await session.finish()
+                if self._speaker_user_id is not None:
+                    self._retained_speech = _RetainedSpeech(
+                        session, envelope, self._speaker_user_id
+                    )
+                self._publish_recording()
                 code = error.code if isinstance(error, FunAsrError) else "asr_stream_failed"
                 await self._callbacks.handle_asr_failure(
                     envelope=envelope,
@@ -998,10 +1527,14 @@ class MatchAudioReceiver:
                 )
         finally:
             if self._speech is session:
+                self._cancel_input_deadline(session)
                 self._pause_requested = False
                 self._speech = None
                 self._speech_task = None
                 self._speaker_user_id = None
+                if self._retained_speech is None or self._retained_speech.session is not session:
+                    session.discard_audio()
+                self._retrying_session = None
 
     async def _on_interim(
         self, speech_id: UUID, segment_no: int, text: str, *, envelope: CallbackEnvelope
@@ -1096,6 +1629,8 @@ class MatchAudioReceiver:
             frame_size_ms=100,
         )
         frame_count = 0
+        if owner is not None:
+            owner.reader_ready = True
         try:
             async for event in stream:
                 if owner is not None and not self._track_consumer_is_current(owner):
@@ -1117,14 +1652,19 @@ class MatchAudioReceiver:
                 if session is None or self._speaker_user_id != user_id:
                     continue
                 if envelope is None or identity_epoch is None:
-                    return
-                if envelope.connection_epoch != identity_epoch:
-                    return
+                    continue
+                if (
+                    envelope.connection_epoch != identity_epoch
+                    or session.input_closed
+                    or not session.input_admitted
+                ):
+                    continue
                 try:
                     pcm = bytes(event.frame.data)
-                    self._write_recording(pcm)
-                    session.feed_pcm(pcm)
+                    if session.feed_pcm(pcm):
+                        self._write_recording(pcm)
                 except AsrQueueFull:
+                    await self._retain_and_retire(session, envelope)
                     try:
                         await asyncio.wait_for(
                             self._callbacks.handle_asr_failure(
@@ -1146,7 +1686,6 @@ class MatchAudioReceiver:
                     # The callback may reset this attempt and release a new
                     # speech. Retire only the producer which actually overflowed,
                     # then retain this publication's audio consumer for retries.
-                    await self.abort_speech(expected_session=session)
         finally:
             logger.info(
                 "livekit audio stream closed",
@@ -1196,7 +1735,9 @@ class MatchAudioReceiver:
     def _publish_recording(self) -> str | None:
         spool = self._recording_spool_path
         storage = self._recording_storage_path
-        if self._recording_file is None or spool is None or storage is None:
+        if self._recording_file is None:
+            return str(storage) if storage is not None and storage.is_file() else None
+        if spool is None or storage is None:
             return None
         try:
             self._recording_file.flush()
@@ -1264,6 +1805,10 @@ class AsrRuntime:
         self._closed = False
         self._closed_matches: OrderedDict[UUID, None] = OrderedDict()
 
+    @property
+    def model_id(self) -> str:
+        return self._settings.asr_model
+
     def _remember_closed_match_locked(self, match_id: UUID) -> None:
         self._closed_matches[match_id] = None
         self._closed_matches.move_to_end(match_id)
@@ -1313,14 +1858,133 @@ class AsrRuntime:
         speech_id: UUID,
         user_id: UUID,
         envelope: CallbackEnvelope,
+        *,
+        max_audio_duration_ms: int = 180000,
     ) -> None:
         receiver = await self.ensure_match(match_id)
-        await receiver.start_speech(speech_id, user_id, envelope)
+        await receiver.start_speech(
+            speech_id,
+            user_id,
+            envelope,
+            max_audio_duration_ms=max_audio_duration_ms,
+            defer_registration=True,
+        )
+        await receiver.wait_speech_ready(speech_id)
 
-    async def finish_speech(self, match_id: UUID, speech_id: UUID) -> None:
+    async def wait_speech_ready(
+        self, match_id: UUID, speech_id: UUID, *, seconds: float = 3.0
+    ) -> None:
+        receiver = self._receivers.get(match_id)
+        if receiver is None:
+            raise FunAsrError("asr_speech_not_found")
+        await receiver.wait_speech_ready(speech_id, seconds=seconds)
+
+    def commit_speech_start(
+        self,
+        match_id: UUID,
+        speech_id: UUID,
+        *,
+        envelope: CallbackEnvelope,
+        input_deadline_mono: float,
+        timer_message_id: str,
+    ) -> float | None:
         receiver = self._receivers.get(match_id)
         if receiver is not None:
-            await receiver.finish_speech(speech_id)
+            return receiver.commit_speech_start(
+                speech_id,
+                envelope=envelope,
+                input_deadline_mono=input_deadline_mono,
+                timer_message_id=timer_message_id,
+            )
+        return None
+
+    def expired_input_owner(self, match_id: UUID, timer_message_id: str) -> CallbackEnvelope | None:
+        receiver = self._receivers.get(match_id)
+        return receiver.expired_input_owner(timer_message_id) if receiver is not None else None
+
+    async def retire_expired_input(
+        self, match_id: UUID, timer_message_id: str, *, envelope: CallbackEnvelope
+    ) -> float | None:
+        receiver = self._receivers.get(match_id)
+        if receiver is None:
+            return None
+        return await receiver.retire_expired_input(timer_message_id, envelope=envelope)
+
+    def fence_speech_input(self, match_id: UUID, speech_id: UUID) -> None:
+        receiver = self._receivers.get(match_id)
+        if receiver is not None:
+            receiver.fence_speech_input(speech_id)
+
+    def recovery_source_envelope(self, match_id: UUID, speech_id: UUID) -> CallbackEnvelope | None:
+        receiver = self._receivers.get(match_id)
+        return receiver.recovery_source_envelope(speech_id) if receiver is not None else None
+
+    def recovery_source_available(self, match_id: UUID, speech_id: UUID) -> bool:
+        receiver = self._receivers.get(match_id)
+        return receiver.recovery_source_available(speech_id) if receiver is not None else False
+
+    def recovery_source_info(self, match_id: UUID, speech_id: UUID) -> RecoverySourceInfo | None:
+        receiver = self._receivers.get(match_id)
+        return receiver.recovery_source_info(speech_id) if receiver is not None else None
+
+    async def restore_recovery_source(
+        self,
+        match_id: UUID,
+        speech_id: UUID,
+        user_id: UUID,
+        envelope: CallbackEnvelope,
+        *,
+        audio_storage_path: str,
+        audio_duration_ms: int,
+        max_audio_duration_ms: int,
+        last_segment_no: int = 0,
+    ) -> None:
+        async with self._lock:
+            if self._closed or match_id in self._closed_matches:
+                raise FunAsrError("asr_receiver_closed")
+            receiver = self._receivers.get(match_id)
+            if receiver is None:
+                receiver = MatchAudioReceiver(
+                    match_id=match_id,
+                    settings=self._settings,
+                    callbacks=self._callbacks,
+                    capture_writer=self._capture_writer,
+                )
+                self._receivers[match_id] = receiver
+        await receiver.restore_recovery_source(
+            speech_id,
+            user_id,
+            envelope,
+            audio_storage_path=audio_storage_path,
+            audio_duration_ms=audio_duration_ms,
+            max_audio_duration_ms=max_audio_duration_ms,
+            last_segment_no=last_segment_no,
+        )
+
+    def speech_callback_envelope(self, match_id: UUID, speech_id: UUID) -> CallbackEnvelope | None:
+        receiver = self._receivers.get(match_id)
+        return receiver.speech_callback_envelope(speech_id) if receiver is not None else None
+
+    def finalization_callback_is_current(self, *, envelope: CallbackEnvelope) -> bool:
+        receiver = self._receivers.get(envelope.match_id)
+        return (
+            receiver.finalization_callback_is_current(envelope) if receiver is not None else False
+        )
+
+    async def retry_from_recording(
+        self, match_id: UUID, speech_id: UUID, envelope: CallbackEnvelope, *, deadline_mono: float
+    ) -> None:
+        receiver = self._receivers.get(match_id)
+        if receiver is None:
+            raise FunAsrError("asr_recovery_source_unavailable")
+        await receiver.retry_from_recording(speech_id, envelope, deadline_mono=deadline_mono)
+
+    async def finish_speech(
+        self, match_id: UUID, speech_id: UUID, *, deadline_mono: float | None = None
+    ) -> None:
+        receiver = self._receivers.get(match_id)
+        if receiver is not None:
+            await receiver.finish_speech(speech_id, deadline_mono=deadline_mono)
 
     async def pause_speech(self, match_id: UUID, speech_id: UUID) -> None:
         receiver = self._receivers.get(match_id)

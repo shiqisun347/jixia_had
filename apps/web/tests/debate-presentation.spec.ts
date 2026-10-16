@@ -62,10 +62,18 @@ const room = {
       id: `${side}-${seat_no}`,
       side,
       seat_no,
-      occupant_type: 'HUMAN',
-      user_id: side === 'AFFIRMATIVE' && seat_no === 1 ? 'speaker-a1' : `${side}-${seat_no}`,
-      occupant_name: `${side === 'AFFIRMATIVE' ? '正' : '反'}方${seat_no}辩·会议现场长姓名测试`,
-      agent_profile_id: null,
+      occupant_type: seat_no % 2 === 0 ? 'AGENT' : 'HUMAN',
+      user_id:
+        seat_no % 2 === 0
+          ? null
+          : side === 'AFFIRMATIVE' && seat_no === 1
+            ? 'speaker-a1'
+            : `${side}-${seat_no}`,
+      occupant_name:
+        seat_no % 2 === 0
+          ? `${side === 'AFFIRMATIVE' ? (seat_no === 2 ? '执锋' : '博闻') : seat_no === 2 ? '睿断' : '明辨'} Agent`
+          : `${side === 'AFFIRMATIVE' ? '正' : '反'}方${seat_no}辩·会议现场长姓名测试`,
+      agent_profile_id: seat_no % 2 === 0 ? `${side}-agent-${seat_no}` : null,
     })),
   ),
 };
@@ -142,6 +150,7 @@ test.beforeEach(async ({ page }) => {
     }
     window.__JX_MATCH_SOCKET_FACTORY__ = () => new OwnedSocket() as unknown as WebSocket;
     window.__JX_MATCH_AUDIO_OVERRIDE__ = async () => ({
+      prepareMicrophone: async () => undefined,
       setMicrophoneEnabled: async (enabled) => {
         owned.__SPEC304_MICROPHONE_STATES__.push(enabled);
       },
@@ -185,6 +194,170 @@ test.beforeEach(async ({ page }) => {
       },
     }),
   );
+});
+
+test('presentation uses the home brand at conference scale and shows the complete long topic', async ({
+  page,
+}, testInfo) => {
+  const longTopic =
+    '面对人工智能不断重塑知识传播与公共讨论的时代，人类与智能体共同参与现场辩论，应当更重视观点表达的多元公平，还是持续追求信息交锋的效率与深度？';
+  await page.route(`**/api/rooms/${roomId}/snapshot`, (route) =>
+    route.fulfill({ json: { ...room, topic: { ...room.topic, title: longTopic } } }),
+  );
+  await page.goto(`/debate?match_id=${matchId}`);
+  await page.getByRole('button', { name: '切换大屏展示' }).click();
+  for (const [width, height, logoSize, wordmarkSize] of [
+    [1280, 720, 72, 30],
+    [1920, 1080, 104, 42],
+  ]) {
+    await page.setViewportSize({ width, height });
+    const header = page.locator('.debate-topic');
+    await expect(header.getByRole('heading', { name: longTopic })).toBeVisible();
+    const geometry = await header.evaluate((element) => {
+      const logo = element.querySelector('.jx-brand__mark')!;
+      const wordmark = element.querySelector('.jx-brand__copy strong')!;
+      const topic = element.querySelector('h1')!;
+      const canvas = document.createElement('canvas');
+      canvas.width = canvas.height = 1;
+      const context = canvas.getContext('2d', { willReadFrequently: true })!;
+      const rgb = (css: string) => {
+        context.clearRect(0, 0, 1, 1);
+        context.fillStyle = css;
+        context.fillRect(0, 0, 1, 1);
+        return Array.from(context.getImageData(0, 0, 1, 1).data).slice(0, 3);
+      };
+      const luminance = (color: number[]) =>
+        color
+          .map((channel) => channel / 255)
+          .map((channel) =>
+            channel <= 0.04045 ? channel / 12.92 : ((channel + 0.055) / 1.055) ** 2.4,
+          )
+          .reduce((sum, channel, index) => sum + channel * [0.2126, 0.7152, 0.0722][index], 0);
+      const background = luminance(rgb(getComputedStyle(element).backgroundColor));
+      const contrast = (node: Element) => {
+        const ink = luminance(rgb(getComputedStyle(node).color));
+        return (Math.max(background, ink) + 0.05) / (Math.min(background, ink) + 0.05);
+      };
+      return {
+        logo: logo.getBoundingClientRect().width,
+        wordmark: parseFloat(getComputedStyle(wordmark).fontSize),
+        textWidth: topic.scrollWidth,
+        width: topic.clientWidth,
+        textHeight: topic.scrollHeight,
+        height: topic.clientHeight,
+        overflow: document.documentElement.scrollWidth > innerWidth,
+        topicContrast: contrast(topic),
+        wordmarkContrast: contrast(wordmark),
+        secondaryContrast: contrast(element.querySelector('.jx-brand__copy small')!),
+      };
+    });
+    expect(geometry.logo).toBeCloseTo(logoSize, 0);
+    expect(geometry.wordmark).toBeCloseTo(wordmarkSize, 0);
+    expect(geometry.textWidth).toBeLessThanOrEqual(geometry.width + 1);
+    expect(geometry.textHeight).toBeLessThanOrEqual(geometry.height + 1);
+    expect(geometry.overflow).toBe(false);
+    expect(geometry.topicContrast).toBeGreaterThanOrEqual(4.5);
+    expect(geometry.wordmarkContrast).toBeGreaterThanOrEqual(4.5);
+    expect(geometry.secondaryContrast).toBeGreaterThanOrEqual(4.5);
+    const namesFit = await page.locator('.debate-seat-card').evaluateAll((cards) =>
+      cards.every((card) => {
+        const name = card.querySelector('strong')!.getBoundingClientRect();
+        const position = card.querySelector('p')!.getBoundingClientRect();
+        const box = card.getBoundingClientRect();
+        return (
+          name.top >= box.top &&
+          position.bottom <= box.bottom &&
+          name.left >= box.left &&
+          name.right <= box.right
+        );
+      }),
+    );
+    expect(namesFit).toBe(true);
+    for (const name of ['执锋 Agent', '博闻 Agent', '睿断 Agent', '明辨 Agent']) {
+      await expect(
+        page.locator('.debate-seat-card').getByText(name, { exact: true }),
+      ).toBeVisible();
+    }
+    const capturePath = resolve('..', '..', 'profile_output', 'spec307', 'conference-visual');
+    mkdirSync(capturePath, { recursive: true });
+    await page.screenshot({
+      path: resolve(capturePath, `${testInfo.project.name}-${width}x${height}.png`),
+    });
+  }
+});
+
+test('transcript keeps official records and the earlier source visible through malformed refreshes', async ({
+  page,
+}) => {
+  let malformed = false;
+  const official = '这段正式文字已经提交，识别异常和下一辩手的申请不能清空它。';
+  await page.route(`**/api/matches/${matchId}/transcript`, (route) =>
+    route.fulfill({
+      json: malformed
+        ? { speeches: {} }
+        : {
+            match_id: matchId,
+            context_version: 1,
+            speeches: [
+              {
+                id: 'official-before-error',
+                action_key: '1:1',
+                side: 'AFFIRMATIVE',
+                seat_no: 1,
+                speaker_kind: 'HUMAN',
+                user_id: 'speaker-a1',
+                status: 'FINALIZED',
+                display_text: official,
+              },
+            ],
+          },
+    }),
+  );
+  await page.goto(`/debate?match_id=${matchId}`);
+  await expect(page.getByTestId('current-debate-stage')).toBeVisible();
+  const transcriptButton = page.getByRole('button', { name: '文字记录' });
+  if (await transcriptButton.isVisible()) await transcriptButton.click();
+  await expect(page.getByText(official).last()).toBeVisible();
+  malformed = true;
+  await page.evaluate(() =>
+    (window as unknown as { __SPEC304_EMIT__: (patch: object) => void }).__SPEC304_EMIT__({
+      action_state: 'HUMAN_READY_TO_START',
+      current_speech_id: null,
+      current_speaker_user_id: 'NEGATIVE-3',
+      current_speaker_side: 'NEGATIVE',
+      current_speaker_seat_no: 3,
+      pending_source: {
+        speech_id: 'previous-human-a1',
+        speaker_kind: 'HUMAN',
+        side: 'AFFIRMATIVE',
+        seat_no: 1,
+        status: 'FINALIZING',
+      },
+    }),
+  );
+  await expect(page.getByText(official).last()).toBeVisible();
+  const pending = page.getByTestId('transcript-pending-source').last();
+  await expect(pending).toHaveAttribute('data-speech-id', 'previous-human-a1');
+  await expect(pending).toContainText('正方一辩');
+  await expect(pending).not.toContainText('反方三辩');
+  await expect(page.getByText('文字记录同步中断，当前显示上次结果。').last()).toBeVisible();
+  await page.evaluate(() =>
+    (window as unknown as { __SPEC304_EMIT__: (patch: object) => void }).__SPEC304_EMIT__({
+      status: 'ERROR',
+      action_state: 'RECOVERY_REQUIRED',
+      error_code: 'asr_finalization_failed',
+      pending_source: {
+        speech_id: 'previous-human-a1',
+        speaker_kind: 'HUMAN',
+        side: 'AFFIRMATIVE',
+        seat_no: 1,
+        status: 'FAILED',
+      },
+    }),
+  );
+  await expect(pending).toContainText('尚未保存成功');
+  await expect(page.getByText(official).last()).toBeVisible();
+  await expect(page.locator('.debate-arena')).toBeVisible();
 });
 
 test('native fullscreen can be exited with Escape', async ({ page }) => {

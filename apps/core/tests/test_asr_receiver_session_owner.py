@@ -50,13 +50,14 @@ class OwnedProvider:
         on_sentence: Any,
         on_started: Any,
         task_id: UUID,
+        **_budgets: Any,
     ) -> SegmentResult:
         self.calls += 1
         old = self.retired_source and self.calls == 1
-        async for chunk in chunks:
-            assert len(chunk) == PCM_FRAME_BYTES
         if on_started is not None:
             on_started()
+        async for chunk in chunks:
+            assert len(chunk) == PCM_FRAME_BYTES
         if old:
             self.old_sentence, self.old_task_id = on_sentence, task_id
             self.old_entered.set()

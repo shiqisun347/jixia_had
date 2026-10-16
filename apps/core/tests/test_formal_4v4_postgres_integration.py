@@ -627,13 +627,36 @@ async def test_human_asr_retries_are_scoped_to_the_allocated_opportunity() -> No
             selection_phase="COMPETING",
         )
         manager = MatchRuntimeManager(factory)
+        now = [100.0]
         actor = MatchActor(
             state,
+            clock=lambda: now[0],
             commit=manager._commit,  # pyright: ignore[reportPrivateUsage]
             publish=manager._publish,  # pyright: ignore[reportPrivateUsage]
         )
         manager._actors[match.id] = actor  # pyright: ignore[reportPrivateUsage]
         await actor.start()
+
+        async def explicit_reset(message: str, context_version: int) -> None:
+            from test_match_emergency_domain import operator_payload
+
+            await actor.submit(
+                MatchCommand(
+                    "speech.reset",
+                    message,
+                    actor_user_id=human.id,
+                    payload=operator_payload(actor, context_version=context_version),
+                )
+            )
+            assert actor.state.status == "PAUSED" and actor.state.current_speech_id is None
+            assert actor.state.asr_failed_speech_id is None
+            await actor.submit(
+                MatchCommand(
+                    "match.resume", message + "-resume", payload={"privileged": True, "reasons": []}
+                )
+            )
+            await actor.submit(MatchCommand("resume.elapsed", message + "-resumed"))
+
         try:
             stale_envelopes = (
                 CallbackEnvelope(
@@ -718,9 +741,10 @@ async def test_human_asr_retries_are_scoped_to_the_allocated_opportunity() -> No
                 ),
                 code="asr_task_failed",
             )
-            assert actor.state.status == "RUNNING"
-            assert actor.state.action_state == "HUMAN_READY_TO_START"
-            assert actor.state.current_speech_id is None
+            assert actor.state.status == "ERROR"
+            assert actor.state.action_state == "RECOVERY_REQUIRED"
+            assert actor.state.current_speech_id == current_speech.id
+            assert actor.state.asr_failed_speech_id == current_speech.id
             assert actor.state.speech_remaining_ms == 30_000
             await manager._persist_late_experiment_asr(  # pyright: ignore[reportPrivateUsage]
                 match_id=match.id,
@@ -733,6 +757,7 @@ async def test_human_asr_retries_are_scoped_to_the_allocated_opportunity() -> No
                 audio_recording_error=None,
             )
 
+            await explicit_reset("operator-first-reset", 0)
             retry = await actor.submit(
                 MatchCommand(
                     type="speech.start",
@@ -769,19 +794,23 @@ async def test_human_asr_retries_are_scoped_to_the_allocated_opportunity() -> No
             assert retry_envelope.context_version == 1
             assert retry_envelope.opportunity_id == allocated.id
             assert retry_envelope.opportunity_generation == 2
+            now[0] += 2.5
             await manager.handle_asr_failure(envelope=retry_envelope, code="asr_task_failed")
             assert actor.state.status == "ERROR"
-            assert actor.state.current_speech_id is None
-            assert actor.state.speech_remaining_ms == 30_000
-
+            assert actor.state.current_speech_id == retry_speech_id
+            assert actor.state.asr_failed_speech_id == retry_speech_id
+            assert actor.state.speech_remaining_ms == 27_500
             await actor.submit(
                 MatchCommand(
-                    type="match.resume",
-                    message_id="asr-retry-resume",
+                    "match.resume",
+                    "ordinary-resume-is-blocked",
                     payload={"privileged": True, "reasons": []},
                 )
             )
-            await actor.submit(MatchCommand(type="resume.elapsed", message_id="asr-resumed"))
+            assert (
+                actor.state.status == "ERROR" and actor.state.current_speech_id == retry_speech_id
+            )
+            await explicit_reset("operator-second-reset", 1)
             recovered = await actor.submit(
                 MatchCommand(
                     type="speech.start",
@@ -807,7 +836,7 @@ async def test_human_asr_retries_are_scoped_to_the_allocated_opportunity() -> No
                 ).all()
             )
             assert [item.attempt_no for item in attempts] == [1, 2, 3]
-            assert [item.status for item in attempts] == ["FAILED", "FAILED", "STARTED"]
+            assert [item.status for item in attempts] == ["RESET", "RESET", "STARTED"]
             assert attempts[0].asr_error_code == "asr_task_failed"
             assert attempts[0].display_text is None
             assert attempts[1].asr_error_code == "asr_task_failed"

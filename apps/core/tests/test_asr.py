@@ -492,8 +492,10 @@ async def test_fun_asr_reconnects_after_active_socket_fails() -> None:
     async def one_chunk():
         yield b"\x00" * 3200
 
-    with pytest.raises(ConnectionError):
+    with pytest.raises(FunAsrError) as failure:
         await connection.recognize_segment(one_chunk(), on_sentence=lambda *_args: _record([], ""))
+    assert failure.value.code == "asr_stream_failed"
+    assert isinstance(failure.value.__cause__, ConnectionError)
 
     result = await connection.recognize_segment(
         one_chunk(), on_sentence=lambda *_args: _record([], "")
@@ -572,7 +574,7 @@ async def _record(target: list[str], value: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_asr_speech_session_rotates_after_bounded_task() -> None:
+async def test_asr_speech_session_keeps_one_continuous_bounded_task() -> None:
     socket = FakeSocket()
 
     async def factory(_: str, __: dict[str, str]) -> FakeSocket:
@@ -599,8 +601,8 @@ async def test_asr_speech_session_rotates_after_bounded_task() -> None:
         await speech.finish()
 
     result, _ = await asyncio.gather(speech.run(), feed())
-    assert len(result.segments) == 2
-    assert segments == [1, 2]
+    assert len(result.segments) == 1
+    assert segments == [1]
     assert result.audio_duration_ms == 301 * 100
 
 
@@ -655,20 +657,18 @@ async def test_asr_session_rejects_empty_audio_before_provider_request() -> None
     assert provider_calls == 0
 
 
-def test_asr_session_rejects_oversized_pcm_before_growing_pending_buffer() -> None:
+def test_asr_session_rejects_oversized_pcm_before_growing_replay_buffer() -> None:
     connection = FunAsrConnection(url="wss://asr.test", api_key="secret")
     speech = AsrSpeechSession(
         speech_id=uuid4(),
         connection=connection,
         on_interim=lambda *_args: _record([], ""),
         on_segment=lambda *_args: _record_int([], 0),
+        max_audio_duration_ms=1000,
     )
-
     with pytest.raises(AsrQueueFull, match="asr_pcm_queue_full"):
         speech.feed_pcm(b"\x00" * (PCM_FRAME_BYTES * (QUEUE_FRAMES + 1)))
-
-    assert len(speech._pending) == 0
-    assert speech._queue.qsize() == 0
+    assert speech.pcm_snapshot() == b""
 
 
 @pytest.mark.asyncio
@@ -789,7 +789,7 @@ async def test_receiver_pause_resumes_same_business_speech_without_early_final()
     await receiver.pause_speech(speech_id)
     assert callbacks.finalized == []
 
-    await receiver.start_speech(speech_id, user_id, resumed_envelope)
+    await receiver.start_speech(speech_id, user_id, resumed_envelope, max_audio_duration_ms=100)
     assert receiver._speech is not None
     receiver._speech.feed_pcm(b"\x00" * 3200)
     await receiver.finish_speech(speech_id)
@@ -814,11 +814,17 @@ async def test_receiver_pause_does_not_report_provider_close_failure() -> None:
     speech_id = uuid4()
 
     class FailingSession:
+        automatic_retries_used = 0
+        has_unconfirmed_audio = False
+
+        def discard_audio(self) -> None:
+            pass
+
         def __init__(self) -> None:
             self.speech_id = speech_id
 
-        async def finish(self) -> None:
-            return
+        async def finish(self, *, deadline_mono: float | None = None) -> None:
+            self.finalization_deadline = deadline_mono or asyncio.get_running_loop().time() + 20
 
         async def run(self) -> None:
             raise FunAsrError("asr_task_failed")
@@ -843,6 +849,7 @@ async def test_receiver_pause_does_not_report_provider_close_failure() -> None:
         opportunity_id=None,
         opportunity_generation=None,
     )
+    receiver._speech_envelope = envelope
     receiver._speech_task = asyncio.create_task(receiver._run_speech(session, envelope))
 
     await receiver.pause_speech(speech_id)

@@ -91,7 +91,15 @@ async def prepare(monkeypatch: pytest.MonkeyPatch, callbacks: AsyncMock):
     monkeypatch.setattr(runtime_module.rtc, "AudioStream", lambda *_a, **_kw: stream)
     user_id = uuid4()
     old_envelope = envelope(receiver, 1)
-    await receiver.start_speech(old_envelope.speech_id, user_id, old_envelope)
+    await receiver.start_speech(
+        old_envelope.speech_id, user_id, old_envelope, max_audio_duration_ms=1000
+    )
+    receiver._new_provider_connection = lambda: FunAsrConnection(
+        url="wss://synthetic.invalid/asr",
+        api_key="synthetic-unused-material",
+        socket_factory=factory,
+    )
+
     track = SimpleNamespace(kind=runtime_module.rtc.TrackKind.KIND_AUDIO)
     publication = SimpleNamespace(sid="owned-track")
     participant = SimpleNamespace(identity=f"jx-human-{receiver.match_id}-{user_id}-1-owned")
@@ -221,18 +229,19 @@ async def test_finish_closes_input_before_waiting_for_queue_sentinel(
     finish = asyncio.create_task(session.finish())
     try:
         assert await observe(lambda: session._closed, timeout=0.2)
-        assert not finish.done()
-        before = session._queue.qsize()
+        assert finish.done()
+        before = session.pcm_snapshot()
         session.feed_pcm(b"\x02" * ((QUEUE_FRAMES + 1) * PCM_FRAME_BYTES))
         snapshot = {
             "closed": session._closed,
             "finish_still_waits": not finish.done(),
-            "queue_before": before,
-            "queue_after": session._queue.qsize(),
+            "bytes_before": len(before),
+            "bytes_after": len(session.pcm_snapshot()),
             "guard": dict(external_guard),
         }
         print("finish_input_control=" + json.dumps(snapshot, sort_keys=True))
-        assert before == session._queue.qsize() == QUEUE_FRAMES and not external_guard, snapshot
+        assert session.pcm_snapshot() == before and len(before) == QUEUE_FRAMES * PCM_FRAME_BYTES
+        assert not external_guard, snapshot
     finally:
         finish.cancel()
         await asyncio.gather(finish, return_exceptions=True)

@@ -111,6 +111,7 @@ class MatchControlRequest(BaseModel):
         "reset_stage",
         "skip_speech",
         "cancel_skip",
+        "retry_asr",
     ]
     operation_id: UUID | None = None
     expected_sequence: int | None = Field(default=None, ge=0)
@@ -122,12 +123,12 @@ class MatchControlRequest(BaseModel):
     @model_validator(mode="after")
     def require_emergency_identity(self) -> MatchControlRequest:
         if (
-            self.action in {"reset_stage", "skip_speech", "cancel_skip"}
+            self.action in {"reset_stage", "skip_speech", "cancel_skip", "retry_asr"}
             and self.operation_id is None
         ):
             raise ValueError("应急操作需要稳定的操作编号")
         if (
-            self.action in {"reset_speech", "reset_stage", "skip_speech"}
+            self.action in {"reset_speech", "reset_stage", "skip_speech", "retry_asr"}
             and self.operation_id is not None
         ):
             if any(
@@ -156,6 +157,7 @@ class MatchControlTargetResponse(BaseModel):
     can_reset_stage: bool
     can_reset_speech: bool
     can_skip_speech: bool
+    can_retry_asr: bool = False
     operation: dict[str, Any] | None
 
 
@@ -1048,6 +1050,7 @@ async def control_match(
                         "recover": "system.recover",
                         "reset_speech": "speech.reset",
                         "reset_stage": "stage.reset",
+                        "retry_asr": "asr.retry.begin",
                     }[payload.action],
                     message_id=(
                         f"admin-control:{payload.action}:{match_id}:"
@@ -1114,6 +1117,7 @@ async def match_control_target(
     active = state.status in {"RUNNING", "PAUSED", "ERROR", "SYSTEM_RECOVERY"} and not pending
     current = state.action_state if state.status == "RUNNING" else state.paused_from_action_state
     speaker = bool(state.current_speaker_user_id or state.current_agent_profile_id)
+    retry_source_available = manager.asr_recovery_available(state)
     return MatchControlTargetResponse(
         match_id=match_id,
         status=state.status,
@@ -1147,6 +1151,7 @@ async def match_control_target(
             "AGENT_SPEAKING",
             "AGENT_FINALIZING",
         },
+        can_retry_asr=active and state.status == "ERROR" and retry_source_available,
         operation=operation,
     )
 

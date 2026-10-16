@@ -54,7 +54,7 @@ def formal_seats(round_no: int) -> tuple[Seat, ...]:
     return tuple(
         Seat(side, seat_no, kind, stable(f"round-{round_no}-{side}-{kind}-{seat_no}"))
         for side in ("AFFIRMATIVE", "NEGATIVE")
-        for seat_no, kind in ((1, "HUMAN"), (2, "HUMAN"), (3, "AGENT"), (4, "AGENT"))
+        for seat_no, kind in ((1, "HUMAN"), (2, "AGENT"), (3, "HUMAN"), (4, "AGENT"))
     )
 
 
@@ -320,6 +320,23 @@ async def run_round(round_no: int) -> tuple[int, int, bool]:
                 },
             )
         )
+        # Every eligible candidate gets an outcome. A partial result now leaves
+        # the opportunity in MODEL_WAIT until its bounded decision deadline.
+        for decision in actor.state.agent_decisions:
+            if decision.status != "DECIDING":
+                continue
+            await actor.submit(
+                MatchCommand(
+                    type="free.agent_decision_result",
+                    message_id=f"sim:{round_no}:free-agent-skip:{decision.agent_profile_id}",
+                    payload={
+                        "action_key": actions[-1].action_key,
+                        "agent_profile_id": str(decision.agent_profile_id),
+                        "decision_round_id": str(decision_round_id),
+                        "should_speak": False,
+                    },
+                )
+            )
         selected_agent = await actor.submit(
             MatchCommand(type="hand.window_closed", message_id=f"sim:{round_no}:free-agent-select")
         )

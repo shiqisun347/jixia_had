@@ -418,6 +418,10 @@ export const zhCN = {
     transcriptInterrupted: '文字记录同步中断，当前显示上次结果。',
     transcriptUnavailable: '文字记录暂时无法加载。',
     noSpeeches: '当前还没有完成的正式发言。',
+    debaterPosition: '{side}{seat}辩',
+    sourceFinalizing: '这段发言正在收尾并保存记录，正式文字尚未确认。此状态属于上面的辩手。',
+    sourceSaveFailed:
+      '这段发言尚未保存成功。已有正式记录保留，请主持人按应急控制台的可用操作重试、重置或安全跳过。',
     editSpeech: '修改本人发言文字',
     editMine: '修改我的文字',
     save: '保存',
@@ -498,6 +502,8 @@ export const zhCN = {
       selectionSide: '等待{side}申请发言',
       applicantSide: '申请方 · {side}',
       selectionHint: '举手申请由服务端排序；当前申请窗口结束后确定下一位辩手。',
+      modelWaitHint:
+        '真人优先申请窗口已结束，正在等待本方 Agent 的决策结果。比赛发言计时尚未开始。',
       preparingTitle: '准备阶段',
       preparationRemaining: '本阶段准备时间',
       confirmingSpeaker: '正在确认当前辩手',
@@ -551,6 +557,11 @@ export const zhCN = {
       ttsParameterInvalid:
         '语音服务拒绝了当前音色或参数，比赛已暂停，请联系管理员检查音色配置后申请恢复。',
       asrInterrupted: '语音识别连续失败，比赛已暂停，请申请恢复。',
+      asrRecoveryRequired: '本次录音和已确认文字已保留。请管理员重试识别、显式重置或安全跳过。',
+      asrFinalizationTimeout:
+        '语音整理与保存未在 20 秒内完成。已有记录保留，请管理员重试识别、重置或安全跳过。',
+      asrNotReady: '麦克风或识别服务尚未就绪，请检查设备后再试，尚未开始正式收音。',
+      asrAudioMissing: '没有可恢复录音，请管理员重置本次发言或安全跳过。',
       llmInterrupted: 'Agent 文本生成连续失败，比赛已暂停，请申请恢复。',
       default: '实时服务发生异常，比赛已暂停，请检查设备后申请恢复。',
     },
@@ -1045,6 +1056,11 @@ export const en: MessageShape<typeof zhCN> = {
     transcriptInterrupted: 'Transcript sync was interrupted. Showing the most recent result.',
     transcriptUnavailable: 'Transcript is temporarily unavailable.',
     noSpeeches: 'There are no completed formal speeches yet.',
+    debaterPosition: '{side} speaker {seat}',
+    sourceFinalizing:
+      'This speech is being finalized and saved. Its official text is not confirmed yet; this status belongs to the speaker above.',
+    sourceSaveFailed:
+      'This speech has not been saved. Existing records remain available. Ask the host to retry, reset or safely skip using the available recovery controls.',
     editSpeech: 'Edit my speech text',
     editMine: 'Edit my text',
     save: 'Save',
@@ -1130,6 +1146,8 @@ export const en: MessageShape<typeof zhCN> = {
         'Timing and audio input have stopped. The transcript is being saved; valid requests for the next turn remain open.',
       selectionSide: 'Waiting for the {side} to request a turn',
       applicantSide: 'Requesting side · {side}',
+      modelWaitHint:
+        'The human priority window has closed. Waiting for this side’s Agent decisions; speech time has not started.',
       selectionHint:
         'The server orders hand raises and selects the next speaker when this window ends.',
       preparingTitle: 'Preparation stage',
@@ -1192,6 +1210,14 @@ export const en: MessageShape<typeof zhCN> = {
         'The speech service rejected the voice or parameters. Ask an administrator to check the voice configuration, then request recovery.',
       asrInterrupted:
         'Speech recognition failed repeatedly. The match is paused; request recovery.',
+      asrRecoveryRequired:
+        'The recording and confirmed text are retained. Ask an administrator to retry recognition, explicitly reset or safely skip.',
+      asrFinalizationTimeout:
+        'Recognition and saving did not finish within 20 seconds. Existing records remain; ask an administrator to retry, reset or safely skip.',
+      asrNotReady:
+        'The microphone or recognition service is not ready. Check the device and try again; official audio capture has not started.',
+      asrAudioMissing:
+        'No recoverable recording is available. Ask an administrator to reset this speech or safely skip.',
       llmInterrupted:
         'Agent text generation failed repeatedly. The match is paused; request recovery.',
       default: 'A live service error paused the match. Check the device, then request recovery.',

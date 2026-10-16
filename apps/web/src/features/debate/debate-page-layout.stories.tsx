@@ -521,7 +521,7 @@ export const TranscriptReadingOrder: Story = {
     const page = within(document.body);
     const dialog = page.getByRole('dialog', { name: '文字记录' });
     await expect(within(dialog).getByText('正方一辩立论')).toBeVisible();
-    await expect(within(dialog).getByText('正在进行 · 正方 1')).toBeVisible();
+    await expect(within(dialog).getByText('正在进行 · 正方一辩')).toBeVisible();
     await expect(within(dialog).getByRole('button', { name: '复制全部记录' })).toBeVisible();
     const closeButton = within(dialog).getByRole('button', { name: '关闭文字记录' });
     await expect(closeButton).toHaveFocus();

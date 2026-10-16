@@ -976,7 +976,7 @@ class AgentRuntime:
                     )
                     result = await client.stream_chat(
                         messages=decision_messages,
-                        max_tokens=32 if boolean_decision else 64,
+                        max_tokens=128 if boolean_decision else 64,
                         generation_params={
                             **config.generation_params,
                             **(

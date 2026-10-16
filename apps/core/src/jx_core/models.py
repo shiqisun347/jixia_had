@@ -2462,7 +2462,7 @@ class FreeDebateOpportunity(Base):
             "status IN ('ACTIVE', 'COMPLETED', 'INVALIDATED')", name="ck_opportunities_status"
         ),
         CheckConstraint(
-            "selection_phase IN ('COMPETING', 'HUMAN_ONLY_WAIT', 'ALLOCATED')",
+            "selection_phase IN ('COMPETING', 'MODEL_WAIT', 'HUMAN_ONLY_WAIT', 'ALLOCATED')",
             name="ck_opportunities_selection_phase",
         ),
         CheckConstraint(

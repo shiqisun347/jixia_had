@@ -20,6 +20,8 @@ class RoomCreateRequest(BaseModel):
     negative_text: str | None = Field(default=None, max_length=1000)
     is_all_agent: bool = False
     auto_fill_agents: bool = True
+    # Explicit for rolling compatibility; the current Web defaults to this preset.
+    conference_roster: bool = False
     human_participation_terms_version: str | None = Field(default=None, max_length=128)
 
     @model_validator(mode="after")

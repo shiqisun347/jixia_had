@@ -43,10 +43,18 @@ class FreeDebateHandEntryResponse(BaseModel):
 class ExperimentTeamStateResponse(BaseModel):
     opportunity_id: UUID | None
     opportunity_generation: int
-    selection_phase: Literal["COMPETING", "HUMAN_ONLY_WAIT", "ALLOCATED"] | None
+    selection_phase: Literal["COMPETING", "MODEL_WAIT", "HUMAN_ONLY_WAIT", "ALLOCATED"] | None
     agent_status: Literal["WAITING", "DECIDING", "RAISE", "SKIP", "TECHNICAL_MISSING"] | None
     selection_remaining_ms: int | None
     human_wait_remaining_ms: int | None
+
+
+class PendingSpeechSourceResponse(BaseModel):
+    speech_id: UUID
+    speaker_kind: Literal["HUMAN", "AGENT"]
+    side: str
+    seat_no: int
+    status: Literal["STARTED", "FINALIZING", "FAILED"]
 
 
 class MatchSnapshotResponse(BaseModel):
@@ -55,6 +63,8 @@ class MatchSnapshotResponse(BaseModel):
     status: str
     action_state: str
     sequence: int
+    context_version: int = 0
+    pending_source: PendingSpeechSourceResponse | None = None
     current_action_index: int
     current_action: MatchActionResponse | None
     current_speech_id: UUID | None

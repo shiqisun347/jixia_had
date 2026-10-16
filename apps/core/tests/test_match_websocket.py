@@ -63,6 +63,13 @@ class _Dumpable:
         return self.value
 
 
+@pytest.fixture(autouse=True)
+def _isolate_database_snapshot_projection(monkeypatch: pytest.MonkeyPatch) -> None:
+    # These transport controls replace the complete snapshot and database.
+    # Source projection is exercised separately with an actual session.
+    monkeypatch.setattr(routes, "_snapshot_text_metadata", AsyncMock(return_value={}))
+
+
 @pytest.mark.asyncio
 async def test_websocket_sender_serializes_event_and_command_messages() -> None:
     websocket = _FakeWebSocket()

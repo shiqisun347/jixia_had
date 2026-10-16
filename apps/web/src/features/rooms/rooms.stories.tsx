@@ -291,7 +291,9 @@ export const CreateRoom: Story = {
     });
     await expect(canvas.queryByRole('option', { name: '选择已启用赛制' })).not.toBeInTheDocument();
     await expect(
-      await canvas.findByText('先确定赛制和辩题。系统会填满空席，创建后再选择你的辩手席位。'),
+      await canvas.findByText(
+        '先确定赛制和辩题。会议阵容预留双方一、三辩真人席，二、四辩为指定 Agent。',
+      ),
     ).toBeVisible();
     await expect(canvas.queryByText('我的席位')).not.toBeInTheDocument();
     await userEvent.type(await canvas.findByLabelText('比赛名称'), '缺少辩题的测试');

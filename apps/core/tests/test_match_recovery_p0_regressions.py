@@ -102,9 +102,9 @@ async def test_next_human_gets_a_new_speech_while_previous_asr_is_pending(
         now[0] += 3.0
         await actor.submit(MatchCommand(type="hand.window_closed", message_id="next-cutoff"))
         if select_after_wait:
-            assert actor.state.selection_phase == "HUMAN_ONLY_WAIT"
+            assert actor.state.selection_phase == "MODEL_WAIT"
             # Match the production sequence: pause/resume during delayed ASR,
-            # then the other side applies through the human-only wait window.
+            # then the other side applies through the new recovery priority window.
             await actor.submit(
                 MatchCommand(
                     type="match.pause",
@@ -127,6 +127,9 @@ async def test_next_human_gets_a_new_speech_while_previous_asr_is_pending(
                     type="hand.raise", message_id="late-next-hand", actor_user_id=next_human
                 )
             )
+        if select_after_wait:
+            now[0] += 3.0
+            await actor.submit(MatchCommand("hand.window_closed", "new-recovery-human-cutoff"))
         assert actor.state.current_speaker_user_id == next_human
         assert actor.state.action_state == "HUMAN_READY_TO_START"
         ready_speech_id = actor.state.current_speech_id

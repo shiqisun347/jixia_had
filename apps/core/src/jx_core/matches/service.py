@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Coroutine
+from collections.abc import Callable, Coroutine, Mapping
+from dataclasses import replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal, Protocol, cast
@@ -14,6 +15,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from ..agent.runtime import AgentRuntime, AgentRuntimeCallbacks
+from ..asr.protocol import FunAsrError
 from ..audit.service import AuditService
 from ..auth.errors import AuthError
 from ..data_capture.provider import PROVIDER_CAPTURE_VERSION, ProviderCallCapture
@@ -48,7 +50,6 @@ from ..models import MatchEvent as MatchEventRow
 from ..runtime_identity import CallbackEnvelope
 from ..survey_definitions import POSTMATCH_QUESTIONNAIRE_VERSION
 from .domain import (
-    FREE_MINIMUM_SPEECH_MS,
     AgentDecisionState,
     DebateParticipant,
     MatchAction,
@@ -64,6 +65,8 @@ from .domain import (
 
 logger = logging.getLogger("jx-core.matches")
 HUMAN_SPEECH_START_TIMEOUT_SECONDS = 10.0
+ASR_FINALIZATION_TIMEOUT_SECONDS = 20.0
+SPEECH_MEDIA_RECOVERY_GRACE_SECONDS = 3.0
 AGENT_SOURCE_FINAL_WAIT_SECONDS = 10.0
 EMERGENCY_RESOURCE_CLEANUP_TIMEOUT_SECONDS = 5.0
 TERMINAL_ACTOR_RETENTION_SECONDS = 60.0
@@ -78,6 +81,8 @@ _SPEECH_START_ERROR_CODES = frozenset(
         "asr_callback_timeout",
         "asr_receiver_closed",
         "asr_finalization_pending",
+        "asr_not_ready",
+        "asr_recovery_required",
         "livekit_not_configured",
     }
 )
@@ -186,6 +191,15 @@ def _required_uuid(value: object) -> UUID:
     return parsed
 
 
+def _frozen_agent_name(room: Room, agent: AgentProfile) -> str:
+    for raw in (room.format_snapshot or {}).get("agents", []):
+        if isinstance(raw, dict):
+            item = cast(dict[str, Any], raw)
+            if str(item.get("id")) == str(agent.id):
+                return str(item.get("name") or agent.name)
+    return agent.name
+
+
 def _action_snapshot(action: MatchAction) -> dict[str, Any]:
     return {
         "stage_position": action.stage_position,
@@ -214,11 +228,49 @@ def _action_snapshot(action: MatchAction) -> dict[str, Any]:
 
 
 class SpeechRuntime(Protocol):
+    @property
+    def model_id(self) -> str: ...
+
     async def start_speech(
-        self, match_id: UUID, speech_id: UUID, user_id: UUID, envelope: CallbackEnvelope
+        self,
+        match_id: UUID,
+        speech_id: UUID,
+        user_id: UUID,
+        envelope: CallbackEnvelope,
+        *,
+        max_audio_duration_ms: int = 180_000,
     ) -> None: ...
 
-    async def finish_speech(self, match_id: UUID, speech_id: UUID) -> None: ...
+    async def finish_speech(
+        self, match_id: UUID, speech_id: UUID, *, deadline_mono: float | None = None
+    ) -> None: ...
+
+    def finalization_callback_is_current(self, *, envelope: CallbackEnvelope) -> bool: ...
+
+    def speech_callback_envelope(
+        self, match_id: UUID, speech_id: UUID
+    ) -> CallbackEnvelope | None: ...
+
+    def recovery_source_info(
+        self, match_id: UUID, speech_id: UUID
+    ) -> Mapping[str, object] | None: ...
+
+    async def restore_recovery_source(
+        self,
+        match_id: UUID,
+        speech_id: UUID,
+        user_id: UUID,
+        envelope: CallbackEnvelope,
+        *,
+        audio_storage_path: str,
+        audio_duration_ms: int,
+        max_audio_duration_ms: int,
+        last_segment_no: int = 0,
+    ) -> None: ...
+
+    async def retry_from_recording(
+        self, match_id: UUID, speech_id: UUID, envelope: CallbackEnvelope, *, deadline_mono: float
+    ) -> None: ...
 
     async def pause_speech(self, match_id: UUID, speech_id: UUID) -> None: ...
 
@@ -251,6 +303,9 @@ def state_snapshot(state: MatchRuntimeState) -> dict[str, Any]:
             str(state.current_agent_profile_id) if state.current_agent_profile_id else None
         ),
         "interim_text": state.interim_text,
+        "asr_failed_speech_id": str(state.asr_failed_speech_id)
+        if state.asr_failed_speech_id
+        else None,
         "speech_start_sequence": state.speech_start_sequence,
         "speech_remaining_ms": state.speech_remaining_ms,
         "speech_budget_start_ms": state.speech_budget_start_ms,
@@ -420,6 +475,7 @@ def _state_from_snapshot(match_id: UUID, snapshot: dict[str, Any]) -> MatchRunti
         if snapshot.get("current_agent_profile_id")
         else None,
         interim_text=str(snapshot.get("interim_text", "")),
+        asr_failed_speech_id=_optional_uuid(snapshot.get("asr_failed_speech_id")),
         speech_start_sequence=(
             int(snapshot["speech_start_sequence"])
             if snapshot.get("speech_start_sequence") is not None
@@ -515,6 +571,9 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         self._background_tasks: set[asyncio.Task[None]] = set()
         self._terminal_eviction_tasks: dict[UUID, asyncio.Task[None]] = {}
         self._speech_presence_tasks: dict[UUID, asyncio.Task[None]] = {}
+        self._speech_presence_grace: set[asyncio.Task[Any]] = set()
+        self._asr_final_deadlines: dict[tuple[UUID, UUID], float] = {}
+        self._asr_retry_tasks: dict[UUID, asyncio.Task[None]] = {}
         self._prepared_speech_starts: set[tuple[UUID, str]] = set()
         self._pending_agent_full_text: dict[tuple[UUID, UUID], tuple[CallbackEnvelope, str]] = {}
         self._late_experiment_rounds: set[UUID] = set()
@@ -522,6 +581,55 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
 
     def set_speech_runtime(self, runtime: SpeechRuntime) -> None:
         self._speech_runtime = runtime
+
+    def _asr_model_id(self) -> str:
+        value = getattr(self._speech_runtime, "model_id", None)
+        return value if isinstance(value, str) and value else "unknown"
+
+    async def _retire_asr_diagnostics(
+        self, session: AsyncSession, *, match_id: UUID, speech_ids: set[UUID]
+    ) -> None:
+        """Close unfinished diagnostics when authority explicitly retires their input.
+
+        A retired callback cannot finish these rows later. Cancellation records
+        that fact without claiming recognition succeeded or changing old results.
+        """
+        if not speech_ids:
+            return
+        now = datetime.now(UTC)
+        for segment in (
+            await session.scalars(
+                select(AsrSegment)
+                .where(AsrSegment.speech_id.in_(speech_ids), AsrSegment.status == "STARTED")
+                .with_for_update()
+            )
+        ).all():
+            segment.status = "DISCARDED"
+            segment.error_code = "asr_cancelled"
+            segment.finalized_at = now
+        for call in (
+            await session.scalars(
+                select(ExternalCall)
+                .where(
+                    ExternalCall.match_id == match_id,
+                    ExternalCall.speech_id.in_(speech_ids),
+                    ExternalCall.call_kind == "ASR",
+                    ExternalCall.status == "STARTED",
+                )
+                .with_for_update()
+            )
+        ).all():
+            call.status = "CANCELLED"
+            call.error_code = "asr_cancelled"
+            call.completed_at = now
+
+    def asr_recovery_available(self, state: MatchRuntimeState) -> bool:
+        check = getattr(self._speech_runtime, "recovery_source_available", None)
+        return bool(
+            state.asr_failed_speech_id is not None
+            and check is not None
+            and check(state.match_id, state.asr_failed_speech_id)
+        )
 
     def set_agent_runtime(self, runtime: AgentRuntime) -> None:
         self._agent_runtime = runtime
@@ -566,7 +674,9 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                 opportunity_id=logical_opportunity_id,
                 opportunity_generation=(
                     state.opportunity_generation
-                    if state is not None and state.opportunity_generation > 0
+                    if logical_opportunity_id is not None
+                    and state is not None
+                    and state.opportunity_generation > 0
                     else None
                 ),
             )
@@ -611,10 +721,14 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         )
         opportunity_id = logical_opportunity_id
         opportunity_generation = (
-            logical_opportunity_generation
-            if logical_opportunity_generation is not None
-            else state.opportunity_generation
-            if state is not None and state.opportunity_generation > 0
+            (
+                logical_opportunity_generation
+                if logical_opportunity_generation is not None
+                else state.opportunity_generation
+                if state is not None and state.opportunity_generation > 0
+                else None
+            )
+            if opportunity_id is not None
             else None
         )
         return CallbackEnvelope(
@@ -630,14 +744,46 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             opportunity_generation=opportunity_generation,
         )
 
+    def _asr_epoch_is_current(
+        self,
+        *,
+        actor: MatchActor,
+        speech: Speech,
+        envelope: CallbackEnvelope,
+        recording_recovery: bool = False,
+    ) -> bool:
+        expected_epoch = (
+            dict(actor.state.connection_epochs).get(speech.user_id, 1)
+            if speech.user_id is not None
+            else None
+        )
+        if recording_recovery:
+            retained = getattr(self._speech_runtime, "recovery_source_envelope", None)
+            return (
+                retained is not None and retained(envelope.match_id, envelope.speech_id) is envelope
+            )
+        if envelope.connection_epoch == expected_epoch:
+            return True
+        if getattr(speech, "status", None) != "FINALIZING" or self._speech_runtime is None:
+            return False
+        check = getattr(self._speech_runtime, "finalization_callback_is_current", None)
+        return check is not None and bool(check(envelope=envelope))
+
     async def _asr_callback_is_current(
-        self, *, actor: MatchActor, envelope: CallbackEnvelope
+        self, *, actor: MatchActor, envelope: CallbackEnvelope, recording_recovery: bool = False
     ) -> bool:
         speech_id = envelope.speech_id
         # ASR callbacks are scoped to a speech attempt.  They never carry an
         # agent generation id; accepting one here would let a callback from a
         # different runtime family pass the generic identity check.
         if speech_id is None or envelope.generation_id is not None:
+            return False
+        owner = getattr(
+            self._speech_runtime,
+            "recovery_source_envelope" if recording_recovery else "speech_callback_envelope",
+            None,
+        )
+        if owner is not None and owner(envelope.match_id, speech_id) is not envelope:
             return False
         async with self._session_factory() as session:
             speech = await session.get(Speech, speech_id)
@@ -649,14 +795,12 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                 if speech.opportunity_id is not None
                 else None
             )
-        expected_epoch = (
-            dict(actor.state.connection_epochs).get(speech.user_id, 1)
-            if speech.user_id is not None
-            else None
-        )
         return (
             envelope.attempt_no == speech.attempt_no
-            and envelope.connection_epoch == expected_epoch
+            and self._asr_epoch_is_current(
+                actor=actor, speech=speech, envelope=envelope, recording_recovery=recording_recovery
+            )
+            and getattr(speech, "status", "STARTED") in {"STARTED", "FINALIZING"}
             and envelope.context_version == match.context_version
             and envelope.opportunity_id == speech.opportunity_id
             and envelope.opportunity_generation
@@ -670,6 +814,7 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         actor: MatchActor,
         envelope: CallbackEnvelope,
         speech_id: UUID,
+        recording_recovery: bool = False,
     ) -> tuple[Match, Speech] | None:
         """Lock and re-check the durable ASR callback identity.
 
@@ -683,40 +828,42 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
 
         if envelope.speech_id != speech_id or envelope.generation_id is not None:
             return None
-        speech = await session.scalar(
-            select(Speech)
-            .where(Speech.id == speech_id, Speech.match_id == envelope.match_id)
-            .with_for_update()
+        owner = getattr(
+            self._speech_runtime,
+            "recovery_source_envelope" if recording_recovery else "speech_callback_envelope",
+            None,
         )
-        if speech is None:
+        if owner is not None and owner(envelope.match_id, speech_id) is not envelope:
             return None
-        opportunity = (
-            await session.get(
-                FreeDebateOpportunity,
-                speech.opportunity_id,
-                with_for_update=True,
-            )
-            if speech.opportunity_id is not None
-            else None
-        )
         match = await session.scalar(
             select(Match).where(Match.id == envelope.match_id).with_for_update()
         )
         if match is None:
             return None
-        expected_epoch = (
-            dict(actor.state.connection_epochs).get(speech.user_id, 1)
-            if speech.user_id is not None
+        speech = await session.scalar(
+            select(Speech)
+            .where(Speech.id == speech_id, Speech.match_id == envelope.match_id)
+            .with_for_update()
+        )
+        if speech is None or speech.status not in {"STARTED", "FINALIZING"}:
+            return None
+        opportunity = (
+            await session.get(FreeDebateOpportunity, speech.opportunity_id)
+            if speech.opportunity_id is not None
             else None
         )
         if (
             envelope.attempt_no != speech.attempt_no
-            or envelope.connection_epoch != expected_epoch
+            or not self._asr_epoch_is_current(
+                actor=actor, speech=speech, envelope=envelope, recording_recovery=recording_recovery
+            )
             or envelope.context_version != match.context_version
             or envelope.opportunity_id != speech.opportunity_id
             or envelope.opportunity_generation
             != (opportunity.opportunity_generation if opportunity is not None else None)
         ):
+            return None
+        if owner is not None and owner(envelope.match_id, speech_id) is not envelope:
             return None
         return match, speech
 
@@ -732,7 +879,113 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             and call.opportunity_id == envelope.opportunity_id
         )
 
+    async def _prepare_command(
+        self, state: MatchRuntimeState, command: MatchCommand
+    ) -> MatchCommand:
+        if (
+            command.type == "system.error"
+            and command.payload.get("error_code") == "internal_timer_failed"
+            and command.message_id.startswith("internal-error:speech.deadline:")
+        ):
+            if command.actor_user_id is not None or command.host_guard_id is not None:
+                raise MatchDomainError("stale_callback")
+            timer_id = command.message_id.removeprefix("internal-error:speech.deadline:")
+            owner = getattr(self._speech_runtime, "expired_input_owner", None)
+            retire = getattr(self._speech_runtime, "retire_expired_input", None)
+            envelope = owner(state.match_id, timer_id) if owner is not None else None
+            if owner is not None and (
+                envelope is None
+                or state.status != "RUNNING"
+                or state.action_state != "HUMAN_SPEAKING"
+                or state.current_speech_id != envelope.speech_id
+            ):
+                # A late failure from an older timer must not error a replacement.
+                raise MatchDomainError("stale_callback")
+            if (
+                envelope is not None
+                and envelope.match_id == state.match_id
+                and envelope.speech_id == state.current_speech_id
+                and retire is not None
+            ):
+                deadline = await retire(state.match_id, timer_id, envelope=envelope)
+                if deadline is None:
+                    return command
+                async with asyncio.timeout_at(deadline), self._session_factory() as session:
+                    stored_match = await session.get(Match, state.match_id)
+                    stored_speech = await session.get(Speech, state.current_speech_id)
+                if (
+                    stored_match is None
+                    or stored_speech is None
+                    or stored_speech.status != "STARTED"
+                    or stored_match.runtime_snapshot.get("sequence") != state.sequence
+                ):
+                    # A lost commit acknowledgement is not permission to replace
+                    # already-committed events with a guessed failure snapshot.
+                    raise MatchDomainError("asr_recovery_required")
+                logger.warning(
+                    "ASR input deadline transaction failed; retained recording for recovery",
+                    extra={
+                        "error_code": "asr_deadline_commit_failed",
+                        "match_id": str(state.match_id),
+                        "speech_id": str(state.current_speech_id),
+                    },
+                )
+                return replace(
+                    command,
+                    type="asr.failed",
+                    payload={
+                        "speech_id": str(state.current_speech_id),
+                        "error_code": "asr_recovery_required",
+                    },
+                    asr_callback_envelope=envelope,
+                    asr_deadline_mono=deadline,
+                )
+        if command.type not in {"match.resume", "resume.elapsed"}:
+            return command
+        from .resume import required_resume_reasons
+
+        async with self._session_factory() as session:
+            match = await session.get(Match, state.match_id)
+            if match is None:
+                raise MatchDomainError("match_not_found")
+            reasons = await required_resume_reasons(session, match.room_id, state)
+        return replace(command, payload={**command.payload, "reasons": reasons})
+
+    async def continue_after_operation(self, match_id: UUID, *, operation_id: str) -> None:
+        actor = await self.get_actor(match_id)
+        operation = actor.state.emergency_operation
+        if (
+            not operation
+            or operation.get("id") != operation_id
+            or operation.get("status") != "SUCCEEDED"
+            or not operation.get("auto_continue")
+            or actor.state.status != "PAUSED"
+            or actor.state.action_state != "RECOVERY_REQUIRED"
+        ):
+            return
+        await self.submit(
+            match_id,
+            MatchCommand(
+                "match.resume",
+                f"operation-resume:{operation_id}",
+                payload={"privileged": True, "completed_operation_id": operation_id},
+            ),
+        )
+
     async def _pre_commit(
+        self,
+        previous: MatchRuntimeState,
+        candidate: MatchRuntimeState,
+        events: tuple[MatchEvent, ...],
+        command: MatchCommand,
+    ) -> None:
+        if command.asr_deadline_mono is None:
+            await self._pre_commit_within_deadline(previous, candidate, events, command)
+        else:
+            async with asyncio.timeout_at(command.asr_deadline_mono):
+                await self._pre_commit_within_deadline(previous, candidate, events, command)
+
+    async def _pre_commit_within_deadline(
         self,
         previous: MatchRuntimeState,
         candidate: MatchRuntimeState,
@@ -741,6 +994,14 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
     ) -> None:
         if command.host_guard_id is not None and events:
             self._require_current_host_guard(previous.match_id, command.host_guard_id)
+        if command.asr_callback_envelope is not None:
+            actor = self._actors.get(previous.match_id)
+            if actor is None or not await self._asr_callback_is_current(
+                actor=actor,
+                envelope=command.asr_callback_envelope,
+                recording_recovery=command.asr_recording_recovery,
+            ):
+                raise MatchDomainError("stale_callback")
         agent_failure = command.agent_callback_envelope
         if agent_failure is not None and not self._agent_failure_target_is_current(
             previous, agent_failure, command.agent_logical_call_id
@@ -758,6 +1019,26 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                 )
             ):
                 raise MatchDomainError("stale_callback")
+        if command.type == "speech.media_ready" and events:
+            if previous.current_speech_id is None or self._speech_runtime is None:
+                raise MatchDomainError("stale_callback")
+            getter = getattr(self._speech_runtime, "speech_callback_envelope", None)
+            if getter is not None:
+                current = getter(previous.match_id, previous.current_speech_id)
+                if current is None or current.connection_epoch != command.payload.get(
+                    "connection_epoch"
+                ):
+                    raise MatchDomainError("stale_callback")
+        if command.type == "asr.retry.begin" and events:
+            source = previous.asr_failed_speech_id
+            available = getattr(self._speech_runtime, "recovery_source_available", None)
+            getter = getattr(self._speech_runtime, "speech_callback_envelope", None)
+            if source is None or (
+                not available(previous.match_id, source)
+                if available is not None
+                else getter is None or getter(previous.match_id, source) is None
+            ):
+                raise MatchDomainError("asr_audio_missing")
         if command.type == "speech.start" and self._speech_runtime is not None:
             if previous.free_source_speech_id is not None:
                 async with self._session_factory() as session:
@@ -784,11 +1065,27 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             try:
                 async with asyncio.timeout(HUMAN_SPEECH_START_TIMEOUT_SECONDS):
                     await self._speech_runtime.start_speech(
-                        previous.match_id, speech_id, user_id, envelope
+                        previous.match_id,
+                        speech_id,
+                        user_id,
+                        envelope,
+                        max_audio_duration_ms=max(
+                            1,
+                            int(
+                                candidate.speech_remaining_ms
+                                if candidate.speech_remaining_ms is not None
+                                else 180_000
+                            ),
+                        ),
                     )
             except Exception as error:
-                if getattr(error, "code", None) == "asr_finalization_pending":
-                    raise MatchDomainError("asr_finalization_pending") from error
+                if getattr(error, "code", None) in {
+                    "asr_finalization_pending",
+                    "asr_recovery_required",
+                }:
+                    raise MatchDomainError(
+                        str(getattr(error, "code", "asr_recovery_required"))
+                    ) from error
                 try:
                     await self._speech_runtime.reset_speech(previous.match_id)
                 except Exception as cleanup_error:
@@ -833,7 +1130,7 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             if key[0] == previous.match_id:
                 self._pending_agent_full_text.pop(key, None)
 
-    def _spawn(self, coroutine: Coroutine[Any, Any, None], *, name: str) -> None:
+    def _spawn(self, coroutine: Coroutine[Any, Any, None], *, name: str) -> asyncio.Task[None]:
         task = asyncio.create_task(coroutine, name=name)
         self._background_tasks.add(task)
 
@@ -852,6 +1149,7 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                 )
 
         task.add_done_callback(finished)
+        return task
 
     def _remember_pending_agent_full_text(
         self, *, match_id: UUID, generation_id: UUID, envelope: CallbackEnvelope, text: str
@@ -928,6 +1226,7 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             await asyncio.gather(*eviction_tasks, return_exceptions=True)
         presence_tasks = tuple(self._speech_presence_tasks.values())
         self._speech_presence_tasks.clear()
+        self._asr_final_deadlines.clear()
         for task in presence_tasks:
             task.cancel()
         if presence_tasks:
@@ -973,6 +1272,46 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         await actor.close()
 
     async def _publish(self, state: MatchRuntimeState, events: tuple[MatchEvent, ...]) -> None:
+        stop = next(
+            (
+                event
+                for event in events
+                if event.type
+                in {
+                    "match.paused",
+                    "stage.reset",
+                    "speech.skip.started",
+                    "speech.reset",
+                    "match.system_recovery",
+                    "match.finished",
+                    "match.terminated",
+                }
+            ),
+            None,
+        )
+        if stop is not None:
+            source = (
+                _optional_uuid(stop.payload.get("speech_id"))
+                or state.asr_failed_speech_id
+                or state.current_speech_id
+            )
+            getter = getattr(self._speech_runtime, "speech_callback_envelope", None)
+            captured = getter(state.match_id, source) if getter is not None and source else None
+            fence = getattr(self._speech_runtime, "fence_speech_input", None)
+            if source is not None and fence is not None:
+                fence(state.match_id, source)
+            retry_task = self._asr_retry_tasks.pop(state.match_id, None)
+            if retry_task is not None and retry_task is not asyncio.current_task():
+                retry_task.cancel()
+            if (
+                stop.type == "match.paused"
+                and source is not None
+                and self._speech_runtime is not None
+            ):
+                self._spawn(
+                    self._pause_human_input(state.match_id, source, captured),
+                    name=f"asr-interruption-pause-{source}",
+                )
         if any(
             event.type
             in {
@@ -1059,6 +1398,41 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         pass
                     queue.put_nowait(event)
             speech_id = event.payload.get("speech_id")
+            if speech_id and event.type in {"speech.started", "speech.media_ready"}:
+                commit = getattr(self._speech_runtime, "commit_speech_start", None)
+                getter = getattr(self._speech_runtime, "speech_callback_envelope", None)
+                envelope = getter(event.match_id, UUID(str(speech_id))) if getter else None
+                if commit is not None and state.speech_deadline_mono is not None:
+                    # Provider readiness never admits PCM. Install this committed
+                    # Core cutoff and exact owner before opening the input gate.
+                    timer_id = (
+                        f"internal:speech-deadline:{speech_id}:{event.sequence}"
+                        if event.type == "speech.started"
+                        else f"internal:media-ready:{speech_id}:{event.sequence - 1}"
+                    )
+                    final_deadline = commit(
+                        event.match_id,
+                        UUID(str(speech_id)),
+                        envelope=envelope,
+                        input_deadline_mono=state.speech_deadline_mono,
+                        timer_message_id=timer_id,
+                    )
+                    if isinstance(final_deadline, float):
+                        self._asr_final_deadlines[(event.match_id, UUID(str(speech_id)))] = (
+                            final_deadline
+                        )
+            if speech_id and event.type in {"speech.finished", "asr.failed"}:
+                self._asr_final_deadlines.pop((event.match_id, UUID(str(speech_id))), None)
+            if event.type in {
+                "stage.reset",
+                "speech.skip.started",
+                "speech.reset",
+                "match.finished",
+                "match.terminated",
+            }:
+                for key in tuple(self._asr_final_deadlines):
+                    if key[0] == event.match_id:
+                        self._asr_final_deadlines.pop(key, None)
             if event.type in ("match.offline", "match.online"):
                 self._queue_speech_presence_transition(state, event)
             if event.type == "host.play" or (
@@ -1088,10 +1462,31 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             elif (
                 event.type == "speech.finalizing" and speech_id and self._speech_runtime is not None
             ):
+                source_id = UUID(str(speech_id))
+                key = (event.match_id, source_id)
+                deadline = min(
+                    self._asr_final_deadlines.get(key, float("inf")),
+                    asyncio.get_running_loop().time() + ASR_FINALIZATION_TIMEOUT_SECONDS,
+                )
+                self._asr_final_deadlines[key] = deadline
                 self._spawn(
-                    self._speech_runtime.finish_speech(event.match_id, UUID(str(speech_id))),
+                    self._finish_human_speech(event.match_id, source_id, deadline_mono=deadline),
                     name=f"asr-finish-{speech_id}",
                 )
+            elif event.type == "asr.retry.started" and speech_id:
+                task = self._spawn(
+                    self._retry_human_asr(event.match_id, UUID(str(speech_id))),
+                    name=f"asr-retry-recording-{speech_id}",
+                )
+                self._asr_retry_tasks[event.match_id] = task
+
+                def clear_retry(
+                    completed: asyncio.Task[None], match_id: UUID = event.match_id
+                ) -> None:
+                    if self._asr_retry_tasks.get(match_id) is completed:
+                        self._asr_retry_tasks.pop(match_id, None)
+
+                task.add_done_callback(clear_retry)
             elif event.type == "agent.preparing":
                 agent_profile_id = event.payload.get("agent_profile_id")
                 action_key = event.payload.get("action_key")
@@ -1168,6 +1563,22 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                             ),
                             name=f"agent-decision-error-{event.match_id}-{agent_profile_id}",
                         )
+            if event.type == "speech.finished" and speech_id and state.free_competition_enabled:
+                self._spawn(
+                    self._start_current_experiment_decision(
+                        match_id=event.match_id, source_speech_id=UUID(str(speech_id))
+                    ),
+                    name=f"source-ready-decision-{speech_id}",
+                )
+            if event.type in {"speech.skipped", "asr.retry.completed"} and event.payload.get(
+                "operation_id"
+            ):
+                self._spawn(
+                    self.continue_after_operation(
+                        event.match_id, operation_id=str(event.payload["operation_id"])
+                    ),
+                    name=f"operation-continue-{event.match_id}-{event.payload['operation_id']}",
+                )
             if event.type == "agent.playback_started" and event.payload.get("generation_id"):
                 generation_id = _required_uuid(event.payload["generation_id"])
                 if (event.match_id, generation_id) in self._pending_agent_full_text:
@@ -1243,6 +1654,127 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         self._request_postmatch_judge(event.match_id),
                         name=f"judge-request-{event.match_id}",
                     )
+
+    async def _pause_human_input(
+        self, match_id: UUID, speech_id: UUID, envelope: CallbackEnvelope | None
+    ) -> None:
+        runtime = self._speech_runtime
+        if runtime is None:
+            return
+        try:
+            await runtime.pause_speech(match_id, speech_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if getattr(error, "code", None) != "asr_recovery_required" or envelope is None:
+                raise
+            actor = self._actors.get(match_id)
+            retained = getattr(runtime, "recovery_source_envelope", None)
+            if (
+                actor is None
+                or retained is None
+                or retained(match_id, speech_id) is not envelope
+                or not await self._asr_callback_is_current(
+                    actor=actor, envelope=envelope, recording_recovery=True
+                )
+            ):
+                return
+            try:
+                await actor.submit(
+                    MatchCommand(
+                        "asr.failed",
+                        f"asr-paused-recording:{speech_id}:{uuid4()}",
+                        payload={
+                            "speech_id": str(speech_id),
+                            "error_code": "asr_recovery_required",
+                        },
+                        asr_callback_envelope=envelope,
+                        asr_recording_recovery=True,
+                    )
+                )
+            except MatchDomainError as stale:
+                if stale.code not in {"stale_callback", "match_not_running"}:
+                    raise
+
+    async def _retry_human_asr(self, match_id: UUID, speech_id: UUID) -> None:
+        runtime = self._speech_runtime
+        actor = self._actors.get(match_id)
+        operation = dict(actor.state.emergency_operation or {}) if actor else {}
+        if (
+            runtime is None
+            or operation.get("kind") != "asr.retry"
+            or operation.get("status") != "PENDING"
+        ):
+            return
+        deadline = asyncio.get_running_loop().time() + ASR_FINALIZATION_TIMEOUT_SECONDS
+        self._asr_final_deadlines[(match_id, speech_id)] = deadline
+        try:
+            getter = getattr(runtime, "recovery_source_envelope", runtime.speech_callback_envelope)
+            envelope = getter(match_id, speech_id)
+            if envelope is None:
+                raise MatchDomainError("asr_audio_missing")
+            async with asyncio.timeout_at(deadline):
+                await runtime.retry_from_recording(
+                    match_id, speech_id, envelope, deadline_mono=deadline
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            if actor is None:
+                return
+            try:
+                await actor.submit(
+                    MatchCommand(
+                        "asr.retry.failed",
+                        f"asr-retry-failed:{operation['id']}",
+                        payload={
+                            "operation_id": operation["id"],
+                            "operation_generation": operation["generation"],
+                            "speech_id": str(speech_id),
+                            "context_version": operation["context_version"],
+                            "error_code": "asr_finalization_timeout"
+                            if isinstance(error, TimeoutError)
+                            else str(getattr(error, "code", "asr_stream_failed")),
+                        },
+                    )
+                )
+            except MatchDomainError as stale:
+                if stale.code not in {"stale_callback", "match_not_running"}:
+                    raise
+
+    async def _finish_human_speech(
+        self, match_id: UUID, speech_id: UUID, *, deadline_mono: float
+    ) -> None:
+        runtime = self._speech_runtime
+        if runtime is None:
+            return
+        getter = getattr(runtime, "speech_callback_envelope", None)
+        envelope = getter(match_id, speech_id) if getter is not None else None
+        if envelope is None:
+            # Legacy runtime test doubles have no owner projection. Production
+            # supplies the exact frozen object, never a guessed attempt/epoch.
+            if getter is not None:
+                return
+            actor = self._actors.get(match_id)
+            envelope = await self._speech_callback_envelope(
+                match_id=match_id,
+                speech_id=speech_id,
+                user_id=actor.state.current_speaker_user_id if actor else None,
+            )
+        try:
+            if asyncio.get_running_loop().time() >= deadline_mono:
+                await self.handle_asr_failure(envelope=envelope, code="asr_finalization_timeout")
+                return
+            async with asyncio.timeout_at(deadline_mono):
+                await runtime.finish_speech(match_id, speech_id, deadline_mono=deadline_mono)
+        except TimeoutError:
+            await self.handle_asr_failure(envelope=envelope, code="asr_finalization_timeout")
+        except asyncio.CancelledError:
+            raise
+        except Exception as error:
+            await self.handle_asr_failure(
+                envelope=envelope, code=str(getattr(error, "code", "asr_stream_failed"))
+            )
 
     async def _start_host_for_current_action(
         self,
@@ -1378,6 +1910,8 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         if speech_id is None or speaker_id is None or str(speaker_id) != str(event_user_id):
             return
         previous = self._speech_presence_tasks.get(event.match_id)
+        if event.type == "match.online" and previous in self._speech_presence_grace:
+            previous.cancel()
 
         async def transition() -> None:
             if previous is not None:
@@ -1386,6 +1920,14 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             if runtime is None:
                 return
             if event.type == "match.offline":
+                owner = asyncio.current_task()
+                if owner is not None:
+                    self._speech_presence_grace.add(owner)
+                try:
+                    await asyncio.sleep(SPEECH_MEDIA_RECOVERY_GRACE_SECONDS)
+                finally:
+                    if owner is not None:
+                        self._speech_presence_grace.discard(owner)
                 actor = self._actors.get(event.match_id)
                 if actor is None:
                     return
@@ -1395,9 +1937,12 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                     or current.action_state != "HUMAN_SPEAKING"
                     or current.current_speech_id != speech_id
                     or current.current_speaker_user_id != speaker_id
+                    or speaker_id not in dict(current.offline_since_ms)
                 ):
                     return
-                await runtime.pause_speech(event.match_id, speech_id)
+                getter = getattr(runtime, "speech_callback_envelope", None)
+                captured = getter(event.match_id, speech_id) if getter is not None else None
+                await self._pause_human_input(event.match_id, speech_id, captured)
                 return
             actor = self._actors.get(event.match_id)
             if actor is None:
@@ -1411,25 +1956,62 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                 or speaker_id in dict(current.offline_since_ms)
             ):
                 return
+            envelope = await self._speech_callback_envelope(
+                match_id=event.match_id,
+                speech_id=speech_id,
+                user_id=speaker_id,
+            )
             try:
-                envelope = await self._speech_callback_envelope(
-                    match_id=event.match_id,
-                    speech_id=speech_id,
-                    user_id=speaker_id,
-                )
-                await runtime.start_speech(event.match_id, speech_id, speaker_id, envelope)
-            except Exception as error:
-                await self.handle_asr_failure(
-                    envelope=CallbackEnvelope(
-                        match_id=event.match_id,
-                        speech_id=speech_id,
-                        attempt_no=1,
-                        generation_id=None,
-                        connection_epoch=None,
-                        context_version=0,
-                        opportunity_id=None,
-                        opportunity_generation=None,
+                getter = getattr(runtime, "speech_callback_envelope", None)
+                previous_owner = getter(event.match_id, speech_id) if getter is not None else None
+                if (
+                    previous_owner is not None
+                    and previous_owner.connection_epoch != envelope.connection_epoch
+                ):
+                    await self._pause_human_input(event.match_id, speech_id, previous_owner)
+                    if actor.state.status != "RUNNING":
+                        return
+                await runtime.start_speech(
+                    event.match_id,
+                    speech_id,
+                    speaker_id,
+                    envelope,
+                    max_audio_duration_ms=max(
+                        1,
+                        int(
+                            current.speech_remaining_ms
+                            if current.speech_remaining_ms is not None
+                            else 180_000
+                        ),
                     ),
+                )
+                ready = getattr(runtime, "wait_speech_ready", None)
+                if ready is not None:
+                    await ready(event.match_id, speech_id, seconds=3.0)
+                await actor.submit(
+                    MatchCommand(
+                        "speech.media_ready",
+                        f"media-ready:{speech_id}:{envelope.connection_epoch}:{event.sequence}",
+                        actor_user_id=speaker_id,
+                        payload={
+                            "speech_id": str(speech_id),
+                            "connection_epoch": envelope.connection_epoch,
+                        },
+                        asr_callback_envelope=(
+                            getter(event.match_id, speech_id) if getter is not None else None
+                        ),
+                    )
+                )
+            except MatchDomainError as error:
+                if error.code not in {"stale_callback", "match_not_running"}:
+                    await self.handle_asr_failure(envelope=envelope, code=error.code)
+            except Exception as error:
+                owner = getattr(runtime, "speech_callback_envelope", None)
+                captured = owner(event.match_id, speech_id) if owner is not None else None
+                if captured is not None and captured == envelope:
+                    envelope = captured
+                await self.handle_asr_failure(
+                    envelope=envelope,
                     code=str(getattr(error, "code", "asr_start_timeout")),
                 )
 
@@ -1437,10 +2019,13 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             transition(), name=f"asr-presence-{event.type}-{event.match_id}-{speech_id}"
         )
         self._speech_presence_tasks[event.match_id] = task
+        if event.type == "match.offline":
+            self._speech_presence_grace.add(task)
         self._background_tasks.add(task)
 
         def finished(completed: asyncio.Task[None]) -> None:
             self._background_tasks.discard(completed)
+            self._speech_presence_grace.discard(completed)
             if self._speech_presence_tasks.get(event.match_id) is completed:
                 self._speech_presence_tasks.pop(event.match_id, None)
             if completed.cancelled():
@@ -1539,7 +2124,7 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         if (
             not state.free_competition_enabled
             or state.opportunity_id is None
-            or state.selection_phase != "COMPETING"
+            or state.selection_phase not in {"COMPETING", "MODEL_WAIT"}
             or state.agent_decision_round_id is not None
         ):
             return
@@ -1699,9 +2284,9 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         )
         state = actor.state
         known_late_round = decision_round_id in self._late_experiment_rounds
-        if state.experiment_mode and (
+        if state.free_competition_enabled and (
             known_late_round
-            or state.selection_phase != "COMPETING"
+            or state.selection_phase not in {"COMPETING", "MODEL_WAIT"}
             or state.agent_decision_round_id != decision_round_id
         ):
             await self._record_late_experiment_decision(
@@ -1878,7 +2463,18 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             return
         if not await self._asr_callback_is_current(actor=actor, envelope=envelope):
             return
-        if not await actor.set_interim_text(text, speech_id=speech_id):
+
+        def owner_is_current() -> bool:
+            owner = getattr(self._speech_runtime, "speech_callback_envelope", None)
+            return self._actors.get(match_id) is actor and (
+                owner is None or owner(match_id, speech_id) is envelope
+            )
+
+        if not owner_is_current():
+            return
+        if not await actor.set_interim_text(
+            text, speech_id=speech_id, owner_is_current=owner_is_current
+        ):
             return
         await self._publish(
             actor.state,
@@ -1985,7 +2581,7 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         capture_storage_mode="ASYNC_V1",
                         provider="BAILIAN",
                         operation="duplex.transcribe",
-                        model="fun-asr-realtime",
+                        model=self._asr_model_id(),
                         attempt_no=1,
                         status="SUCCEEDED",
                         match_id=match_id,
@@ -2086,7 +2682,7 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         call_kind="ASR",
                         provider="BAILIAN",
                         operation="duplex.transcribe",
-                        model="fun-asr-realtime",
+                        model=self._asr_model_id(),
                         attempt_no=int(previous_attempt or 0) + 1,
                         status="STARTED",
                         match_id=match_id,
@@ -2655,8 +3251,15 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         if not await self._asr_callback_is_current(actor=actor, envelope=envelope):
             return MatchCommandResult(state=actor.state, events=())
         action = actor.state.current_action
+        operation = actor.state.emergency_operation
+        retrying = bool(
+            operation
+            and operation.get("kind") == "asr.retry"
+            and operation.get("status") == "PENDING"
+        )
         if (
-            actor.state.free_competition_enabled
+            not retrying
+            and actor.state.free_competition_enabled
             and action is not None
             and action.action_kind == "FREE_DEBATE"
         ):
@@ -2675,15 +3278,16 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                     audio_storage_path=audio_storage_path,
                     audio_recording_error=audio_recording_error,
                 )
-                await self._start_late_asr_decision(match_id=match_id, source_speech_id=speech_id)
+                await self._start_current_experiment_decision(
+                    match_id=match_id, source_speech_id=speech_id
+                )
                 return MatchCommandResult(state=actor.state, events=())
-            await self._start_current_experiment_decision(
-                match_id=match_id, source_speech_id=speech_id
-            )
         return await self.submit(
             match_id,
             MatchCommand(
                 type="asr.finalized",
+                asr_callback_envelope=envelope,
+                asr_deadline_mono=self._asr_final_deadlines.get((match_id, speech_id)),
                 message_id=f"asr-finalized:{speech_id}",
                 payload={
                     "speech_id": str(speech_id),
@@ -2728,11 +3332,9 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         envelope.speech_id != speech.id
                         or envelope.attempt_no != speech.attempt_no
                         or envelope.opportunity_id != speech.opportunity_id
-                        or envelope.connection_epoch
-                        != (
-                            dict(actor.state.connection_epochs).get(speech.user_id, 1)
-                            if actor and speech.user_id
-                            else None
+                        or actor is None
+                        or not self._asr_epoch_is_current(
+                            actor=actor, speech=speech, envelope=envelope
                         )
                     ):
                         return
@@ -2928,108 +3530,50 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         speech_id = envelope.speech_id
         assert speech_id is not None
         actor = await self.get_actor(match_id)
-        if actor.state.status != "RUNNING":
+        operation = actor.state.emergency_operation
+        retrying = bool(
+            operation
+            and operation.get("kind") == "asr.retry"
+            and operation.get("status") == "PENDING"
+        )
+        if actor.state.status != "RUNNING" and not retrying:
             return
-        if actor.state.current_speech_id != speech_id or actor.state.action_state not in {
-            "HUMAN_SPEAKING",
-            "SPEECH_FINALIZING",
-        }:
+        if not retrying and (
+            actor.state.current_speech_id != speech_id
+            or actor.state.action_state
+            not in {
+                "HUMAN_SPEAKING",
+                "SPEECH_FINALIZING",
+            }
+        ):
             if (
                 actor.state.free_competition_enabled
                 and actor.state.free_source_speech_id == speech_id
             ):
-                await self._persist_late_asr_failure(actor=actor, envelope=envelope, code=code)
-            return
-        action = actor.state.current_action
-        late_free_finalizing = (
-            actor.state.action_state == "SPEECH_FINALIZING"
-            and actor.state.free_competition_enabled
-            and action is not None
-            and action.action_kind == "FREE_DEBATE"
-        )
-        speaker_id = actor.state.current_speaker_user_id
-        if speaker_id is not None and speaker_id in dict(actor.state.offline_since_ms):
-            return
+                pass
+            else:
+                return
         if not await self._asr_callback_is_current(actor=actor, envelope=envelope):
             return
-        failure_class = classify_asr_error(code)
-        async with self._session_factory() as session:
-            async with session.begin():
-                speech = await session.get(Speech, speech_id, with_for_update=True)
-                if speech is None or speech.match_id != match_id:
-                    return
-                speech.status = "FAILED"
-                speech.asr_error_code = code
-                speech.ended_at = datetime.now(UTC)
-                failure_query = (
-                    select(func.count())
-                    .select_from(Speech)
-                    .where(
-                        Speech.match_id == match_id,
-                        Speech.status == "FAILED",
-                    )
-                )
-                if speech.opportunity_id is not None:
-                    failure_query = failure_query.where(
-                        Speech.opportunity_id == speech.opportunity_id
-                    )
-                else:
-                    failure_query = failure_query.where(Speech.action_key == speech.action_key)
-                failures = await session.scalar(failure_query)
-        # In competitive free debate the next-speaker window opens while ASR
-        # drains.  A provider close error can race a buffered final result.
-        # Keep the failed attempt for diagnostics, but never reset the Actor
-        # after speech.finish has already been accepted: that would erase the
-        # speech identity and ask the same human to speak again.  The existing
-        # bounded selection window continues the match, and a genuinely late
-        # final result is persisted by the late-finalization path.
-        if late_free_finalizing and not all(
-            remaining is not None and remaining < FREE_MINIMUM_SPEECH_MS
-            for remaining in (
-                actor.state.free_affirmative_remaining_ms,
-                actor.state.free_negative_remaining_ms,
-            )
-        ):
-            return
-        # Configuration/protocol failures cannot be repaired by replaying the
-        # same request.  Surface them immediately for operator recovery.
-        if failure_class != "CONFIG" and int(failures or 0) < 2:
+        try:
             await actor.submit(
                 MatchCommand(
-                    type="speech.reset",
-                    message_id=f"asr-retry:{speech_id}",
-                    actor_user_id=actor.state.current_speaker_user_id,
-                    payload={"privileged": True, "preserve_failed": True},
+                    type="asr.failed",
+                    message_id=(
+                        f"asr-error:{speech_id}:{envelope.attempt_no}:"
+                        f"{operation.get('id') if retrying and operation else 'initial'}"
+                    ),
+                    payload={
+                        "speech_id": str(speech_id),
+                        "error_code": code,
+                        "asr_failure_class": classify_asr_error(code),
+                    },
+                    asr_callback_envelope=envelope,
                 )
             )
-            await self._publish(
-                actor.state,
-                (
-                    MatchEvent(
-                        type="asr.retry_required",
-                        match_id=match_id,
-                        sequence=actor.state.sequence,
-                        server_time_ms=int(datetime.now(UTC).timestamp() * 1000),
-                        payload={
-                            "speech_id": str(speech_id),
-                            "error_code": code,
-                            "asr_failure_class": failure_class,
-                        },
-                    ),
-                ),
-            )
-            return
-        await actor.submit(
-            MatchCommand(
-                type="system.error",
-                message_id=f"asr-error:{speech_id}",
-                payload={
-                    "error_code": code,
-                    "asr_failure": True,
-                    "asr_failure_class": failure_class,
-                },
-            )
-        )
+        except MatchDomainError as error:
+            if error.code not in {"stale_callback", "match_not_running"}:
+                raise
 
     async def _persist_started_speech(
         self,
@@ -3165,6 +3709,19 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         events: tuple[MatchEvent, ...],
         command: MatchCommand,
     ) -> None:
+        if command.asr_deadline_mono is None:
+            await self._commit_within_deadline(previous, candidate, events, command)
+        else:
+            async with asyncio.timeout_at(command.asr_deadline_mono):
+                await self._commit_within_deadline(previous, candidate, events, command)
+
+    async def _commit_within_deadline(
+        self,
+        previous: MatchRuntimeState,
+        candidate: MatchRuntimeState,
+        events: tuple[MatchEvent, ...],
+        command: MatchCommand,
+    ) -> None:
         async with self._session_factory() as session:
             async with session.begin():
                 match = await session.scalar(
@@ -3172,6 +3729,22 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                 )
                 if match is None or match.sequence != previous.sequence:
                     raise MatchDomainError("match_state_conflict")
+                if command.asr_callback_envelope is not None:
+                    envelope = command.asr_callback_envelope
+                    actor = self._actors.get(candidate.match_id)
+                    if (
+                        actor is None
+                        or envelope.speech_id is None
+                        or await self._lock_current_asr_callback(
+                            session=session,
+                            actor=actor,
+                            envelope=envelope,
+                            speech_id=envelope.speech_id,
+                            recording_recovery=command.asr_recording_recovery,
+                        )
+                        is None
+                    ):
+                        raise MatchDomainError("stale_callback")
                 agent_failure = command.agent_callback_envelope
                 if agent_failure is not None:
                     await self._require_locked_agent_failure(
@@ -3507,9 +4080,15 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                                     opportunity_id=opportunity_id,
                                     deadline_at=(
                                         datetime.fromtimestamp(event.server_time_ms / 1000, UTC)
-                                        + timedelta(seconds=3)
+                                        + timedelta(
+                                            seconds=(
+                                                self._actors[
+                                                    candidate.match_id
+                                                ].agent_decision_remaining_seconds(candidate)
+                                            )
+                                        )
                                         if candidate.free_competition_enabled
-                                        and candidate.selection_deadline_mono is not None
+                                        and candidate.agent_decision_deadline_mono is not None
                                         else None
                                     ),
                                     trigger_kind=(
@@ -3609,11 +4188,19 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                             with_for_update=True,
                         )
                         if opportunity is not None:
+                            actor = self._actors.get(candidate.match_id)
+                            remaining = (
+                                max(0.0, actor.agent_decision_remaining_seconds(candidate))
+                                if actor is not None
+                                and candidate.agent_decision_deadline_mono is not None
+                                else 3.0
+                            )
                             deadline = datetime.fromtimestamp(
                                 event.server_time_ms / 1000, UTC
-                            ) + timedelta(seconds=3)
-                            opportunity.source_ended_at = datetime.fromtimestamp(
-                                event.server_time_ms / 1000, UTC
+                            ) + timedelta(seconds=remaining)
+                            opportunity.source_ended_at = (
+                                opportunity.source_ended_at
+                                or datetime.fromtimestamp(event.server_time_ms / 1000, UTC)
                             )
                             opportunity.selection_deadline_at = deadline
                             decision_rows = list(
@@ -3629,6 +4216,32 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                             )
                             for decision_row in decision_rows:
                                 decision_row.deadline_at = deadline
+                    elif (
+                        event.type == "free.model_wait_started"
+                        and candidate.opportunity_id is not None
+                    ):
+                        opportunity = await session.get(
+                            FreeDebateOpportunity, candidate.opportunity_id, with_for_update=True
+                        )
+                        if opportunity is not None:
+                            opportunity.selection_phase = "MODEL_WAIT"
+                            deadline = datetime.fromtimestamp(
+                                event.server_time_ms / 1000, UTC
+                            ) + timedelta(milliseconds=int(event.payload["duration_ms"]))
+                            opportunity.selection_deadline_at = deadline
+                            rows = list(
+                                (
+                                    await session.scalars(
+                                        select(AgentFreeDebateDecision)
+                                        .where(
+                                            AgentFreeDebateDecision.opportunity_id == opportunity.id
+                                        )
+                                        .with_for_update()
+                                    )
+                                ).all()
+                            )
+                            for row in rows:
+                                row.deadline_at = deadline
                     elif event.type == "hand.window_closed" and candidate.free_competition_enabled:
                         if candidate.opportunity_id is not None:
                             pending_decisions = list(
@@ -3721,9 +4334,17 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                                 source_ended_at = datetime.fromtimestamp(
                                     event.server_time_ms / 1000, UTC
                                 )
-                                source_opportunity.source_ended_at = source_ended_at
+                                source_opportunity.source_ended_at = (
+                                    source_opportunity.source_ended_at or source_ended_at
+                                )
+                                actor = self._actors.get(candidate.match_id)
+                                remaining = (
+                                    actor.agent_decision_remaining_seconds(candidate)
+                                    if actor is not None
+                                    else 3.0
+                                )
                                 source_opportunity.selection_deadline_at = (
-                                    source_ended_at + timedelta(seconds=3)
+                                    source_ended_at + timedelta(seconds=remaining)
                                 )
                                 decision_rows = list(
                                     (
@@ -3827,6 +4448,47 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                     speech_id = event.payload.get("speech_id")
                     if event.type in ("speech.started", "agent.playback_started") and speech_id:
                         await self._persist_started_speech(session, candidate, event)
+                    elif event.type == "asr.retry.started" and speech_id:
+                        speech = await session.get(
+                            Speech, UUID(str(speech_id)), with_for_update=True
+                        )
+                        if (
+                            speech is None
+                            or speech.status != "FAILED"
+                            or speech.speaker_kind != "HUMAN"
+                        ):
+                            raise MatchDomainError("match_state_conflict")
+                        speech.status = "FINALIZING"
+                        speech.asr_error_code = None
+                    elif event.type == "asr.failed" and speech_id:
+                        speech = await session.get(
+                            Speech, UUID(str(speech_id)), with_for_update=True
+                        )
+                        if speech is not None:
+                            speech.status = "FAILED"
+                            speech.asr_error_code = str(
+                                event.payload.get("error_code", "asr_task_failed")
+                            )
+                            speech.ended_at = speech.ended_at or datetime.now(UTC)
+                            info_getter = getattr(
+                                type(self._speech_runtime), "recovery_source_info", None
+                            )
+                            info = (
+                                self._speech_runtime.recovery_source_info(
+                                    candidate.match_id, speech.id
+                                )
+                                if info_getter is not None and self._speech_runtime is not None
+                                else None
+                            )
+                            if info is not None:
+                                path = info.get("audio_storage_path")
+                                duration = info.get("audio_duration_ms")
+                                prefix = info.get("confirmed_prefix")
+                                if isinstance(path, str) and isinstance(duration, int):
+                                    speech.audio_storage_path = path
+                                    speech.audio_duration_ms = duration
+                                    if isinstance(prefix, str) and prefix:
+                                        speech.display_text = prefix
                     elif event.type == "speech.finalizing" and speech_id:
                         speech = await session.get(
                             Speech, UUID(str(speech_id)), with_for_update=True
@@ -3841,8 +4503,10 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         )
                         if speech is not None:
                             speech.status = "FINALIZED"
-                            speech.finish_reason = str(event.payload.get("reason", ""))
-                            speech.ended_at = datetime.now(UTC)
+                            speech.finish_reason = str(
+                                event.payload.get("reason") or speech.finish_reason or ""
+                            )
+                            speech.ended_at = speech.ended_at or datetime.now(UTC)
                             speech.finalized_at = datetime.now(UTC)
                             final_text = str(event.payload.get("final_text", ""))
                             speech.asr_raw_final_text = final_text
@@ -3953,10 +4617,24 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                                 for key, value in file_values.items():
                                     setattr(agent_file, key, value)
                             match.context_version += 1
+                if command.type == "system.recover" and previous.asr_failed_speech_id is not None:
+                    source = await session.get(
+                        Speech, previous.asr_failed_speech_id, with_for_update=True
+                    )
+                    if source is not None and source.match_id == candidate.match_id:
+                        source.status = "FAILED"
+                        source.asr_error_code = source.asr_error_code or "asr_recovery_required"
+                        await self._retire_asr_diagnostics(
+                            session, match_id=candidate.match_id, speech_ids={source.id}
+                        )
                 if (
                     command.type in ("speech.reset", "system.recover")
                     and previous.current_speech_id is not None
                     and not bool(command.payload.get("preserve_failed"))
+                    and not (
+                        command.type == "system.recover"
+                        and previous.asr_failed_speech_id is not None
+                    )
                 ):
                     speech = await session.get(
                         Speech, previous.current_speech_id, with_for_update=True
@@ -3964,6 +4642,9 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                     if speech is not None:
                         speech.status = "RESET"
                         speech.ended_at = datetime.now(UTC)
+                        await self._retire_asr_diagnostics(
+                            session, match_id=candidate.match_id, speech_ids={speech.id}
+                        )
                     match.context_version += 1
                 if (
                     command.type == "speech.reset"
@@ -3990,9 +4671,15 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                             query = query.where(Speech.id == previous.current_speech_id)
                         else:
                             query = query.where(Speech.id == UUID(int=0))
-                        for row in (await session.scalars(query.with_for_update())).all():
+                        retired_speeches = (await session.scalars(query.with_for_update())).all()
+                        for row in retired_speeches:
                             row.status = "RESET"
                             row.ended_at = row.ended_at or datetime.now(UTC)
+                        await self._retire_asr_diagnostics(
+                            session,
+                            match_id=candidate.match_id,
+                            speech_ids={row.id for row in retired_speeches},
+                        )
                         opportunities = select(FreeDebateOpportunity).where(
                             FreeDebateOpportunity.match_id == candidate.match_id,
                             FreeDebateOpportunity.status != "INVALIDATED",
@@ -4185,10 +4872,22 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                     continue
                 state = _state_from_snapshot(row.id, row.runtime_snapshot)
                 actor = MatchActor(
-                    state, commit=self._commit, publish=self._publish, pre_commit=self._pre_commit
+                    state,
+                    commit=self._commit,
+                    publish=self._publish,
+                    pre_commit=self._pre_commit,
+                    prepare_command=self._prepare_command,
                 )
                 await actor.start()
-                if row.status in ("START_PENDING_RUNTIME", "START_COUNTDOWN", "RUNNING"):
+                if (
+                    row.status
+                    in (
+                        "START_PENDING_RUNTIME",
+                        "START_COUNTDOWN",
+                        "RUNNING",
+                    )
+                    or state.asr_failed_speech_id is not None
+                ):
                     try:
                         await actor.submit(
                             MatchCommand(
@@ -4200,8 +4899,85 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         await actor.close()
                         raise
                 self._actors[row.id] = actor
+                await self._restore_failed_asr_recording(actor.state)
                 recovered += 1
         return recovered
+
+    async def _restore_failed_asr_recording(self, state: MatchRuntimeState) -> None:
+        """Restore a disk-only recovery owner; only explicit retry may run ASR."""
+        runtime = self._speech_runtime
+        source_id = state.asr_failed_speech_id
+        if (
+            runtime is None
+            or source_id is None
+            or getattr(type(runtime), "restore_recovery_source", None) is None
+        ):
+            return
+        async with self._session_factory() as session:
+            source = await session.get(Speech, source_id)
+            match = await session.get(Match, state.match_id)
+            if (
+                source is None
+                or match is None
+                or source.match_id != state.match_id
+                or source.speaker_kind != "HUMAN"
+                or source.status != "FAILED"
+                or source.user_id is None
+                or not source.audio_storage_path
+                or source.audio_duration_ms is None
+            ):
+                return
+            action = next(
+                (item for item in state.actions if item.action_key == source.action_key), None
+            )
+            if action is None:
+                return
+            maximum_ms = (
+                action.free_max_speech_seconds
+                if action.action_kind == "FREE_DEBATE"
+                else action.duration_seconds
+            ) * 1000
+            opportunity = (
+                await session.get(FreeDebateOpportunity, source.opportunity_id)
+                if source.opportunity_id is not None
+                else None
+            )
+            envelope = CallbackEnvelope(
+                match_id=state.match_id,
+                speech_id=source.id,
+                attempt_no=source.attempt_no,
+                generation_id=None,
+                connection_epoch=dict(state.connection_epochs).get(source.user_id, 1),
+                context_version=match.context_version,
+                opportunity_id=source.opportunity_id,
+                opportunity_generation=(
+                    opportunity.opportunity_generation if opportunity is not None else None
+                ),
+            )
+            last_segment_no = int(
+                await session.scalar(
+                    select(func.coalesce(func.max(AsrSegment.segment_no), 0)).where(
+                        AsrSegment.speech_id == source.id
+                    )
+                )
+                or 0
+            )
+            try:
+                await runtime.restore_recovery_source(
+                    state.match_id,
+                    source.id,
+                    source.user_id,
+                    envelope,
+                    audio_storage_path=source.audio_storage_path,
+                    audio_duration_ms=source.audio_duration_ms,
+                    max_audio_duration_ms=maximum_ms,
+                    last_segment_no=last_segment_no,
+                )
+            except (ValueError, OSError, FunAsrError):
+                logger.warning(
+                    "failed ASR recording unavailable after restart",
+                    extra={"match_id": str(state.match_id), "error_code": "asr_audio_missing"},
+                )
 
     async def start_room_match(
         self,
@@ -4359,14 +5135,18 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                                     match_id=match_id,
                                     kind="AGENT",
                                     agent_profile_id=agent.id,
-                                    display_name=agent.name,
+                                    display_name=_frozen_agent_name(room, agent),
                                     side=seat.side,
                                     seat_no=seat.seat_no,
                                 )
                             )
                 await session.flush()
             actor = MatchActor(
-                state, commit=self._commit, publish=self._publish, pre_commit=self._pre_commit
+                state,
+                commit=self._commit,
+                publish=self._publish,
+                pre_commit=self._pre_commit,
+                prepare_command=self._prepare_command,
             )
             await actor.start()
             self._actors[match_id] = actor
@@ -4400,6 +5180,9 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
         await session.rollback()
         async with self._lock:
             async with session.begin():
+                match = await session.scalar(
+                    select(Match).where(Match.room_id == room_id).with_for_update()
+                )
                 room = await session.scalar(
                     select(Room).where(Room.id == room_id).with_for_update()
                 )
@@ -4407,9 +5190,6 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                     raise AuthError("room_unavailable")
                 if actor_role != "ADMIN" and room.organizer_user_id != actor_user_id:
                     raise AuthError("forbidden")
-                match = await session.scalar(
-                    select(Match).where(Match.room_id == room_id).with_for_update()
-                )
                 if match is None:
                     raise AuthError("match_state_conflict")
                 if match.status != "START_PENDING_RUNTIME":
@@ -4426,6 +5206,7 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
                         commit=self._commit,
                         publish=self._publish,
                         pre_commit=self._pre_commit,
+                        prepare_command=self._prepare_command,
                     )
                     await actor.start()
                     self._actors[match.id] = actor
@@ -4455,6 +5236,7 @@ class MatchRuntimeManager(AgentRuntimeCallbacks):
             commit=self._commit,
             publish=self._publish,
             pre_commit=self._pre_commit,
+            prepare_command=self._prepare_command,
         )
         await actor.start()
         async with self._lock:

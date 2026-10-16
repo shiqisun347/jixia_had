@@ -26,9 +26,7 @@ def _actor(now: list[float]) -> tuple[MatchActor, MatchAction, object, object]:
         duration_seconds=360,
         free_max_speech_seconds=30,
         participants=(
-            DebateParticipant(
-                side="NEGATIVE", seat_no=2, agent_profile_id=agent_id
-            ),
+            DebateParticipant(side="NEGATIVE", seat_no=2, agent_profile_id=agent_id),
             DebateParticipant(side="NEGATIVE", seat_no=3, user_id=human_id),
         ),
     )
@@ -85,9 +83,7 @@ async def test_experiment_skip_enters_human_only_wait_and_first_raise_wins() -> 
         assert decision.state.agent_effective_status == "SKIP"
         assert decision.state.action_state == "FREE_SELECTING"
 
-        closed = await actor.submit(
-            MatchCommand(type="hand.window_closed", message_id="deadline")
-        )
+        closed = await actor.submit(MatchCommand(type="hand.window_closed", message_id="deadline"))
         assert closed.state.selection_phase == "HUMAN_ONLY_WAIT"
         assert closed.state.agent_effective_status == "SKIP"
         assert closed.state.human_wait_deadline_mono == 160.0
@@ -278,9 +274,8 @@ async def test_experiment_deadline_marks_pending_and_rejects_late_result() -> No
     actor, action, _, agent_id = _actor(now)
     await actor.start()
     try:
-        closed = await actor.submit(
-            MatchCommand(type="hand.window_closed", message_id="deadline")
-        )
+        now[0] = 108.0  # Spec307 independent model cutoff, not the human 3second window.
+        closed = await actor.submit(MatchCommand(type="hand.window_closed", message_id="deadline"))
         assert closed.state.selection_phase == "HUMAN_ONLY_WAIT"
         assert closed.state.agent_effective_status == "SKIP"
         assert closed.state.agent_decisions[0].failed is True
@@ -329,9 +324,7 @@ async def test_experiment_resume_restarts_full_human_only_wait() -> None:
     await actor.start()
     try:
         await actor.submit(_decision_command(actor, action, agent_id, should_speak=False))
-        waiting = await actor.submit(
-            MatchCommand(type="hand.window_closed", message_id="deadline")
-        )
+        waiting = await actor.submit(MatchCommand(type="hand.window_closed", message_id="deadline"))
         opportunity_id = waiting.state.opportunity_id
         now[0] = 125.0
         await actor.submit(
@@ -506,12 +499,10 @@ async def test_human_speech_cutoff_does_not_wait_for_asr_final() -> None:
         )
         assert cutoff.state.action_state == "FREE_SELECTING"
         assert cutoff.state.opportunity_id == opportunity_id
-        assert cutoff.state.selection_phase == "HUMAN_ONLY_WAIT"
-        assert cutoff.state.agent_effective_status == "SKIP"
-        wait_event = next(
-            event for event in cutoff.events if event.type == "free.human_wait_started"
-        )
-        assert wait_event.payload["decision_fact"] == "TECHNICAL_MISSING"
+        assert cutoff.state.selection_phase == "MODEL_WAIT"
+        assert cutoff.state.agent_effective_status == "WAITING"
+        assert cutoff.state.agent_decision_deadline_mono == 130.0
+        assert any(event.type == "free.model_wait_started" for event in cutoff.events)
     finally:
         await actor.close()
 
@@ -528,9 +519,7 @@ async def test_initial_experiment_decision_starts_with_host_and_cutoff_starts_af
         free_starting_side="AFFIRMATIVE",
         host_audio_path="host.ogg",
         host_audio_duration_ms=2_000,
-        participants=(
-            DebateParticipant(side="AFFIRMATIVE", seat_no=2, agent_profile_id=agent_id),
-        ),
+        participants=(DebateParticipant(side="AFFIRMATIVE", seat_no=2, agent_profile_id=agent_id),),
     )
     actor = MatchActor(
         MatchRuntimeState(
@@ -560,9 +549,7 @@ async def test_initial_experiment_decision_starts_with_host_and_cutoff_starts_af
             "agent.decision_started",
         ]
         now[0] = 52.0
-        elapsed = actor._host_elapsed(
-            MatchCommand(type="host.elapsed", message_id="host-elapsed")
-        )
+        elapsed = actor._host_elapsed(MatchCommand(type="host.elapsed", message_id="host-elapsed"))
         assert actor.state.action_state == "FREE_SELECTING"
         assert actor.state.free_holder_side == "AFFIRMATIVE"
         assert actor.state.agent_effective_status == "DECIDING"
@@ -611,9 +598,7 @@ async def test_experiment_reset_invalidates_next_opportunity_and_old_decision() 
         )
         old_round_id = decision_started.state.agent_decision_round_id
         await actor.submit(
-            MatchCommand(
-                type="hand.raise", message_id="next-hand", actor_user_id=opponent_human_id
-            )
+            MatchCommand(type="hand.raise", message_id="next-hand", actor_user_id=opponent_human_id)
         )
 
         reset = await actor.submit(
@@ -677,9 +662,7 @@ async def test_experiment_pause_during_speech_invalidates_next_opportunity() -> 
         )
         opportunity_id = started.state.opportunity_id
         await actor.submit(
-            MatchCommand(
-                type="hand.raise", message_id="next-hand", actor_user_id=opponent_human_id
-            )
+            MatchCommand(type="hand.raise", message_id="next-hand", actor_user_id=opponent_human_id)
         )
 
         paused = await actor.submit(

@@ -63,12 +63,23 @@ class MatchPresenceCoordinator:
                 self._announced_epoch.pop(key, None)
 
     def _complete_epochs(self, match_id: UUID, user_id: UUID, active_epochs: set[int]) -> set[int]:
-        return {
+        complete = {
             epoch
             for epoch in active_epochs
             if self._websocket.get((match_id, user_id, epoch))
             and self._media.get((match_id, user_id, epoch))
         }
+        # An authenticated, previously announced media owner remains useful
+        # while only the business WebSocket/lease reconnects. A new/untrusted
+        # media epoch cannot create online presence without the normal lease.
+        previous = self._announced_epoch.get((match_id, user_id))
+        if (
+            self._online_state.get((match_id, user_id))
+            and previous is not None
+            and self._media.get((match_id, user_id, previous))
+        ):
+            complete.add(previous)
+        return complete
 
     def _offline_timestamp_ms(self) -> int:
         """Use the same injectable wall-clock boundary as MatchActor."""

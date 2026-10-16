@@ -15,6 +15,7 @@ declare global {
     __JX_FAIL_NEXT_COMMAND__?: boolean;
     __JX_FAILED_COMMAND_COUNT__?: number;
     __JX_MICROPHONE_STATES__?: boolean[];
+    __JX_PREPARE_MICROPHONE_COUNT__?: number;
     __JX_OUTPUT_MUTED_STATES__?: boolean[];
     __JX_COMMAND_SEQUENCES__?: number[];
     __JX_EMIT_PRESENCE_SEQUENCE__?: (sequence: number) => void;
@@ -139,7 +140,7 @@ function snapshot(actionState: string) {
   };
 }
 
-test('human start waits for the latest sequence and opens the microphone only after ACK', async ({
+test('human start publishes a muted microphone before commit and unmutes only after the latest ACK', async ({
   page,
 }) => {
   let authoritativeSequence = 3;
@@ -234,6 +235,9 @@ test('human start waits for the latest sequence and opens the microphone only af
     window.__JX_MICROPHONE_STATES__ = [];
     window.__JX_MATCH_AUDIO_OVERRIDE__ = async () => ({
       canPlaybackAudio: true,
+      prepareMicrophone: async () => {
+        window.__JX_PREPARE_MICROPHONE_COUNT__ = (window.__JX_PREPARE_MICROPHONE_COUNT__ ?? 0) + 1;
+      },
       setMicrophoneEnabled: async (enabled) => {
         window.__JX_MICROPHONE_STATES__?.push(enabled);
       },
@@ -283,6 +287,7 @@ test('human start waits for the latest sequence and opens the microphone only af
   await startButton.click();
   await expect.poll(() => page.evaluate(() => window.__JX_COMMAND_SEQUENCES__)).toEqual([4]);
   expect(await page.evaluate(() => window.__JX_MICROPHONE_STATES__?.at(-1))).not.toBe(true);
+  expect(await page.evaluate(() => window.__JX_PREPARE_MICROPHONE_COUNT__)).toBe(1);
   await expect(page.getByRole('heading', { name: '轮到你发言了！' })).toBeVisible();
 
   await page.evaluate(() => window.__JX_RELEASE_START_ACK__?.());
@@ -483,7 +488,10 @@ test('real runtime page connects and starts human speech from server state', asy
           this.emit('message', {
             data: JSON.stringify({
               type: 'asr.interim',
-              payload: { text: '这是当前正在识别的实时发言' },
+              payload: {
+                speech_id: '80000000-0000-4000-8000-000000000001',
+                text: '这是当前正在识别的实时发言',
+              },
             }),
           });
         }
@@ -518,6 +526,9 @@ test('real runtime page connects and starts human speech from server state', asy
     window.__JX_COMMAND_SEQUENCES__ = [];
     window.__JX_MATCH_AUDIO_OVERRIDE__ = async () => ({
       canPlaybackAudio: false,
+      prepareMicrophone: async () => {
+        window.__JX_PREPARE_MICROPHONE_COUNT__ = (window.__JX_PREPARE_MICROPHONE_COUNT__ ?? 0) + 1;
+      },
       setMicrophoneEnabled: async (enabled) => {
         window.__JX_MICROPHONE_STATES__?.push(enabled);
       },

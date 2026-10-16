@@ -3541,7 +3541,8 @@ async def test_offline_grace_can_recover_or_pause_after_expiry() -> None:
         MatchRuntimeState(
             match_id=uuid4(),
             status="RUNNING",
-            action_state="FREE_SELECTING",
+            action_state="HUMAN_READY_TO_START",
+            current_speaker_user_id=user_id,
             actions=(),
         ),
         sleep=lambda _: asyncio.sleep(60),
@@ -3580,7 +3581,11 @@ async def test_offline_grace_does_not_pause_at_59_9_seconds_but_pauses_at_60() -
     wall_now = 1_000.0
     actor = MatchActor(
         MatchRuntimeState(
-            match_id=uuid4(), status="RUNNING", action_state="FREE_SELECTING", actions=()
+            match_id=uuid4(),
+            status="RUNNING",
+            action_state="HUMAN_READY_TO_START",
+            current_speaker_user_id=user_id,
+            actions=(),
         ),
         wall_clock=lambda: wall_now,
         sleep=lambda _: asyncio.sleep(60),
@@ -3663,6 +3668,15 @@ async def test_offline_grace_is_independent_from_speech_timer_and_other_users() 
                 type="member.online",
                 message_id="speaker-online",
                 actor_user_id=speaker_id,
+            )
+        )
+        assert actor.state.speech_deadline_mono is None
+        await actor.submit(
+            MatchCommand(
+                "speech.media_ready",
+                "speaker-media-ready",
+                actor_user_id=speaker_id,
+                payload={"speech_id": str(actor.state.current_speech_id), "connection_epoch": 1},
             )
         )
         assert actor.state.speech_deadline_mono == 130.0
@@ -3907,7 +3921,11 @@ async def test_higher_epoch_disconnect_preserves_original_offline_grace() -> Non
     wall_now = 1_000.0
     actor = MatchActor(
         MatchRuntimeState(
-            match_id=uuid4(), status="RUNNING", action_state="FREE_SELECTING", actions=()
+            match_id=uuid4(),
+            status="RUNNING",
+            action_state="HUMAN_READY_TO_START",
+            current_speaker_user_id=user_id,
+            actions=(),
         ),
         wall_clock=lambda: wall_now,
         sleep=lambda _: asyncio.sleep(60),

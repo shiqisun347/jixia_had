@@ -86,6 +86,16 @@ async def _snapshot(
         row[0]: (row[2], row[3], row[4] is not None) for row in user_rows
     }
     agent_avatars: dict[UUID, str] = {row[0]: row[2] for row in agent_rows}
+    frozen_agents = {
+        item.get("id"): item for item in (room.format_snapshot or {}).get("agents", [])
+    }
+    for agent_id in agent_ids:
+        frozen = frozen_agents.get(str(agent_id), {})
+        if isinstance(frozen.get("name"), str):
+            agent_names[agent_id] = frozen["name"]
+        avatar = frozen.get("voice", {}).get("avatar_key")
+        if isinstance(avatar, str):
+            agent_avatars[agent_id] = avatar
     current = viewer.member if viewer.member is not None and viewer.member.left_at is None else None
     viewer_membership_state = (
         "ACTIVE" if current is not None else "LEFT" if viewer.member else "NONE"

@@ -31,7 +31,6 @@ from ..auth.session import AuthContext, cookie_policy
 from ..config import Settings
 from ..experiments.permissions import is_experiment_side_controller, resolve_room_link
 from ..models import (
-    DeviceCheck,
     Match,
     Room,
     RoomConnection,
@@ -45,7 +44,7 @@ from ..models import (
 )
 from ..room_connections import RoomConnectionService
 from ..runtime import CoreRuntime
-from .domain import MatchCommand, MatchDomainError, MatchEvent, MatchRuntimeView
+from .domain import MatchCommand, MatchDomainError, MatchEvent, MatchRuntimeState, MatchRuntimeView
 from .schemas import (
     AgentDecisionResponse,
     ExperimentTeamStateResponse,
@@ -56,6 +55,7 @@ from .schemas import (
     MatchLiveKitTokenRequest,
     MatchLiveKitTokenResponse,
     MatchSnapshotResponse,
+    PendingSpeechSourceResponse,
     SpeechTextUpdateRequest,
     SpeechTranscriptResponse,
     TranscriptResponse,
@@ -171,6 +171,8 @@ def _snapshot_response(
     member_role: str | None = None,
     admin_control: bool = False,
     resume_reasons: list[str] | None = None,
+    context_version: int = 0,
+    pending_source: PendingSpeechSourceResponse | None = None,
 ) -> MatchSnapshotResponse:
     state = view.state
     action = state.current_action
@@ -218,6 +220,8 @@ def _snapshot_response(
         status=state.status,
         action_state=state.action_state,
         sequence=state.sequence,
+        context_version=context_version,
+        pending_source=pending_source,
         current_action_index=state.current_action_index,
         current_action=MatchActionResponse(
             stage_position=action.stage_position,
@@ -288,6 +292,29 @@ def _snapshot_response(
     )
 
 
+async def _snapshot_text_metadata(session: AsyncSession, view: MatchRuntimeView) -> dict[str, Any]:
+    """Read only the known source; never load transcript history for a snapshot."""
+
+    context_version = await session.scalar(
+        select(Match.context_version).where(Match.id == view.state.match_id)
+    )
+    source_id = view.state.free_source_speech_id
+    pending_source = None
+    if source_id is not None and source_id != view.state.current_speech_id:
+        source = await session.scalar(
+            select(Speech).where(Speech.id == source_id, Speech.match_id == view.state.match_id)
+        )
+        if source is not None and source.status in {"STARTED", "FINALIZING", "FAILED"}:
+            pending_source = PendingSpeechSourceResponse(
+                speech_id=source.id,
+                speaker_kind=cast(Any, source.speaker_kind),
+                side=source.side,
+                seat_no=source.seat_no,
+                status=cast(Any, source.status),
+            )
+    return {"context_version": int(context_version or 0), "pending_source": pending_source}
+
+
 def _event_response(event: MatchEvent, *, can_view_team: bool = True) -> MatchEventResponse:
     sensitive = event.type in {
         "hand.raised",
@@ -299,6 +326,7 @@ def _event_response(event: MatchEvent, *, can_view_team: bool = True) -> MatchEv
         "free.opportunity_opened",
         "free.opportunity_invalidated",
         "free.human_wait_started",
+        "free.model_wait_started",
     }
     if sensitive and not can_view_team:
         return MatchEventResponse(
@@ -474,44 +502,12 @@ async def _match_page_permissions(
     )
 
 
-async def _resume_reasons(session: AsyncSession, room_id: UUID) -> list[str]:
-    members = list(
-        (
-            await session.execute(
-                select(RoomMember, User.real_name)
-                .join(User, User.id == RoomMember.user_id)
-                .where(
-                    RoomMember.room_id == room_id,
-                    RoomMember.member_role == "DEBATER",
-                    RoomMember.left_at.is_(None),
-                )
-            )
-        ).all()
-    )
-    reasons: list[str] = []
-    for member, real_name in members:
-        speaker_label = f"辩手 {real_name}"
-        if not member.online:
-            reasons.append(f"{speaker_label} 当前离线")
-        connection = await session.scalar(
-            select(RoomConnectionLease).where(
-                RoomConnectionLease.user_id == member.user_id,
-                RoomConnectionLease.room_id == room_id,
-            )
-        )
-        if connection is None:
-            reasons.append(f"{speaker_label} 尚未连接比赛")
-        latest = await session.scalar(
-            select(DeviceCheck)
-            .where(DeviceCheck.room_id == room_id, DeviceCheck.user_id == member.user_id)
-            .order_by(DeviceCheck.checked_at.desc())
-            .limit(1)
-        )
-        # A check is performed when entering the room. It remains valid for the
-        # match lifetime; explicit device invalidation handles hardware changes.
-        if latest is None or latest.status == "FAIL":
-            reasons.append(f"{speaker_label} 的麦克风或扬声器检测已失效")
-    return reasons
+async def _resume_reasons(
+    session: AsyncSession, room_id: UUID, state: MatchRuntimeState | None = None
+) -> list[str]:
+    from .resume import required_resume_reasons
+
+    return await required_resume_reasons(session, room_id, state)
 
 
 async def _set_member_online(
@@ -562,6 +558,7 @@ async def start_match_runtime(
         viewer_user_id=context.user_id,
         member_role=member.member_role,
         admin_control=context.role == "ADMIN",
+        **(await _snapshot_text_metadata(session, view)),
     )
 
 
@@ -597,6 +594,7 @@ async def prepare_match(
         viewer_user_id=context.user_id,
         member_role=member.member_role,
         admin_control=context.role == "ADMIN",
+        **(await _snapshot_text_metadata(session, view)),
     )
 
 
@@ -619,7 +617,7 @@ async def get_match_snapshot(
     except AuthError as error:
         _raise(error.code)
     resume_reasons = (
-        await _resume_reasons(session, room_id)
+        await _resume_reasons(session, room_id, view.state)
         if view.state.status in {"PAUSED", "SYSTEM_RECOVERY", "ERROR"}
         else []
     )
@@ -630,6 +628,7 @@ async def get_match_snapshot(
         member_role=member.member_role,
         admin_control=context.role == "ADMIN",
         resume_reasons=resume_reasons,
+        **(await _snapshot_text_metadata(session, view)),
     )
 
 
@@ -816,7 +815,7 @@ async def submit_match_command(
             member_role=member.member_role,
         )
         resume_reasons = (
-            await _resume_reasons(session, room.id) if payload.type == "match.resume" else []
+            await _resume_reasons(session, room.id, state) if payload.type == "match.resume" else []
         )
         result = await manager.submit(
             match_id,
@@ -841,6 +840,7 @@ async def submit_match_command(
         viewer_user_id=context.user_id,
         member_role=member.member_role,
         admin_control=context.role == "ADMIN",
+        **(await _snapshot_text_metadata(session, view)),
     )
 
 
@@ -1051,12 +1051,13 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
         queue = await manager.subscribe(match_id)
         async with factory() as snapshot_session:
             view = await manager.snapshot_view(snapshot_session, match.id)
+            snapshot_text_metadata = await _snapshot_text_metadata(snapshot_session, view)
         # Do not reuse the session from the previous context.  A WebSocket can
         # remain open for hours; querying a closed AsyncSession here reopens a
         # transaction without a surrounding context and leaks a pool connection.
         if view.state.status in {"PAUSED", "SYSTEM_RECOVERY", "ERROR"}:
             async with factory() as resume_session:
-                resume_reasons = await _resume_reasons(resume_session, room.id)
+                resume_reasons = await _resume_reasons(resume_session, room.id, view.state)
         else:
             resume_reasons = []
     except BaseException:
@@ -1129,6 +1130,7 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
                     member_role=member.member_role,
                     admin_control=context.role == "ADMIN",
                     resume_reasons=resume_reasons,
+                    **snapshot_text_metadata,
                 ).model_dump(mode="json", exclude_none=True),
             }
         )
@@ -1204,7 +1206,9 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
                         member_role=member.member_role,
                     )
                     if payload.type == "match.resume":
-                        resume_reasons = await _resume_reasons(command_session, room.id)
+                        resume_reasons = await _resume_reasons(
+                            command_session, room.id, current.state
+                        )
                 result = await manager.submit(
                     match_id,
                     MatchCommand(
@@ -1224,6 +1228,9 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
                 )
                 async with factory() as snapshot_session:
                     committed_view = await manager.snapshot_view(snapshot_session, match_id)
+                    committed_text_metadata = await _snapshot_text_metadata(
+                        snapshot_session, committed_view
+                    )
                 await sender_boundary.send_json(
                     {
                         "type": "command.ack",
@@ -1236,6 +1243,7 @@ async def match_events(websocket: WebSocket, match_id: UUID) -> None:
                             viewer_user_id=context.user_id,
                             member_role=member.member_role,
                             admin_control=context.role == "ADMIN",
+                            **committed_text_metadata,
                         ).model_dump(mode="json", exclude_none=True),
                     }
                 )

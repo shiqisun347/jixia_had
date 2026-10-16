@@ -104,7 +104,7 @@ def test_empty_schema_upgrade_matches_new_model_columns(migration_probe: Migrati
         )
     with migration_probe.engine.connect() as connection:
         assert connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-            "0047_speech_origin"
+            "0048_model_wait_phase"
         )
 
 

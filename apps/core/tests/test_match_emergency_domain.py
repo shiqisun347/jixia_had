@@ -253,6 +253,14 @@ async def test_multisegment_human_keeps_identity_and_settles_only_active_time(of
                     payload={"connection_epoch": 1},
                 )
             )
+            await actor.submit(
+                MatchCommand(
+                    "speech.media_ready",
+                    "reconnected-input-ready",
+                    actor_user_id=human,
+                    payload={"speech_id": str(speech_id), "connection_epoch": 1},
+                )
+            )
         else:
             await actor.submit(
                 MatchCommand(

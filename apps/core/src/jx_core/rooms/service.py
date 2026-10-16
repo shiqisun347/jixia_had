@@ -46,6 +46,7 @@ from ..models import (
     VoiceProfile,
 )
 from ..rules.readiness import eligible_agent_ids, inspect_rule
+from .roster import default_agent_assignments
 from .schemas import (
     DeviceCheckRequest,
     RoleChangeRequest,
@@ -499,7 +500,12 @@ class RoomService:
         eligible_ids = set(await self.available_agent_ids(database_session, rule_id=room.rule_id))
         if agent_id not in frozen_ids or agent_id not in eligible_ids or agent_id in used_agent_ids:
             agent_id = None
-        if agent_id is None and room.auto_fill_agents:
+        reserved_human_seat = (
+            bool((room.format_snapshot or {}).get("conference_roster"))
+            and not room.is_all_agent
+            and seat.seat_no in {1, 3}
+        )
+        if agent_id is None and room.auto_fill_agents and not reserved_human_seat:
             candidates = await self.available_agent_ids(
                 database_session,
                 rule_id=room.rule_id,
@@ -916,20 +922,16 @@ class RoomService:
                 raise AuthError("agent_capacity_insufficient")
             if not payload.auto_fill_agents:
                 available_agent_ids = []
-            else:
-                available_agent_ids = secrets.SystemRandom().sample(
-                    available_agent_ids, min(len(available_agent_ids), required_agent_count)
-                )
-            assignments: dict[tuple[str, int], UUID] = {}
-            next_agent = 0
-            for side in ("AFFIRMATIVE", "NEGATIVE"):
-                for seat_no in range(1, rule.side_size + 1):
-                    key = (side, seat_no)
-                    if key in assignments:
-                        continue
-                    if next_agent < len(available_agent_ids):
-                        assignments[key] = available_agent_ids[next_agent]
-                        next_agent += 1
+            conference = bool(
+                payload.conference_roster and payload.auto_fill_agents and not payload.is_all_agent
+            )
+            assignments = default_agent_assignments(
+                format_snapshot.get("agents", []),
+                available_agent_ids,
+                conference=conference,
+                all_agent=payload.is_all_agent,
+            )
+            format_snapshot["conference_roster"] = conference
             code = _room_code()
             for _ in range(5):
                 if await database_session.scalar(select(Room.id).where(Room.code == code)) is None:

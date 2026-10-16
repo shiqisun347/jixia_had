@@ -29,7 +29,7 @@ const schema = z
     title: z.string().trim().min(1, '请输入比赛名称').max(200),
     label: z.string().trim().min(1).max(32),
     ruleId: z.string().uuid('请选择赛制'),
-    composition: z.enum(['MIXED', 'HUMAN_ONLY', 'AGENT_ONLY']),
+    composition: z.enum(['CONFERENCE', 'MIXED', 'HUMAN_ONLY', 'AGENT_ONLY']),
     topicSource: z.enum(['LIBRARY', 'CUSTOM']),
     topicId: z.string().optional(),
     customTitle: z.string().trim().max(500).optional(),
@@ -73,7 +73,7 @@ export function CreateRoomPage() {
       title: '',
       label: '训练赛',
       ruleId: '',
-      composition: 'MIXED',
+      composition: 'CONFERENCE',
       topicSource: 'LIBRARY',
       topicId: '',
       customTitle: '',
@@ -117,6 +117,7 @@ export function CreateRoomPage() {
         rule_id: values.ruleId,
         is_all_agent: values.composition === 'AGENT_ONLY',
         auto_fill_agents: values.composition !== 'HUMAN_ONLY',
+        conference_roster: values.composition === 'CONFERENCE',
         topic_id: values.topicSource === 'LIBRARY' ? values.topicId : null,
         custom_topic_title: values.topicSource === 'CUSTOM' ? values.customTitle : null,
         affirmative_text: values.topicSource === 'CUSTOM' ? values.affirmativeText : null,
@@ -163,7 +164,7 @@ export function CreateRoomPage() {
               创建一场辩论
             </h1>
             <p className="mt-3 text-sm leading-6 text-slate-600">
-              先确定赛制和辩题。系统会填满空席，创建后再选择你的辩手席位。
+              先确定赛制和辩题。会议阵容预留双方一、三辩真人席，二、四辩为指定 Agent。
             </p>
 
             <form className="mt-8 space-y-7" onSubmit={submit}>
@@ -221,7 +222,19 @@ export function CreateRoomPage() {
               </label>
               <fieldset>
                 <legend className="text-sm font-bold text-slate-700">成员组成</legend>
-                <div className="mt-2 grid gap-2 sm:grid-cols-3">
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  <label className="rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm font-bold">
+                    <input
+                      className="mr-2"
+                      type="radio"
+                      value="CONFERENCE"
+                      {...form.register('composition')}
+                    />
+                    会议阵容 · 每队两真人、两 Agent
+                    <span className="mt-1 block text-xs font-normal text-slate-600">
+                      真人进入一、三辩席；指定 Agent 固定二、四辩席
+                    </span>
+                  </label>
                   <label className="rounded-xl border border-blue-100 bg-blue-50 px-4 py-3 text-sm font-bold">
                     <input
                       className="mr-2"

@@ -6,7 +6,7 @@ import asyncio
 from dataclasses import replace
 from typing import Any
 from unittest.mock import AsyncMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
@@ -90,10 +90,18 @@ async def prepare(probe: AgentFaultProbe, *, fixed: bool = False) -> tuple[Any, 
     media = AsyncMock()
     envelopes = {}
 
-    async def start(_match_id, speech_id, _user_id, envelope):
+    async def start(_match_id, speech_id, _user_id, envelope, **_kwargs):
         envelopes[speech_id] = envelope
 
     media.start_speech.side_effect = start
+    media.speech_callback_envelope = lambda _match_id, speech_id: envelopes.get(speech_id)
+    media.recovery_source_envelope = lambda _match_id, speech_id: envelopes.get(speech_id)
+    media.recovery_source_available = lambda _match_id, speech_id: speech_id in envelopes
+    media.commit_speech_start = lambda _match_id, _speech_id, **_kwargs: None
+    media.fence_speech_input = lambda _match_id, _speech_id: None
+    media.finalization_callback_is_current = lambda *, envelope: (
+        envelopes.get(envelope.speech_id) is envelope
+    )
     probe.manager.set_speech_runtime(media)
     probe.manager.set_agent_runtime(media)
     for kind in ("runtime.start", "countdown.elapsed"):
@@ -103,7 +111,7 @@ async def prepare(probe: AgentFaultProbe, *, fixed: bool = False) -> tuple[Any, 
     return now, first, second, envelopes
 
 
-async def start_human(probe, user, *, free=True):
+async def start_human(probe: AgentFaultProbe, user: UUID, *, free: bool = True) -> UUID | None:
     actor, manager = probe.actor, probe.manager
     if free:
         await manager.submit(
@@ -278,12 +286,44 @@ async def test_late_asr_failure_is_fenced_and_settles_only_original_speaker(agen
         async with probe.factory() as session:
             assert (await session.get(Speech, old)).status == "FINALIZING"
     await probe.manager.handle_asr_failure(envelope=envelope, code="asr_task_failed")
-    assert probe.actor.state == before
+    assert probe.actor.state.status == "ERROR"
+    assert probe.actor.state.action_state == "RECOVERY_REQUIRED"
+    assert probe.actor.state.asr_failed_speech_id == old
+    assert probe.actor.state.current_speaker_user_id == second
+    assert probe.actor.view().free_affirmative_remaining_ms == 50_000
     async with probe.factory() as session:
         original = await session.get(Speech, old)
         assert original.status == "FAILED" and original.asr_error_code == "asr_task_failed"
         assert original.user_id == first and original.display_text is None
         assert (await session.get(Match, match_id)).context_version == envelope.context_version
+    with pytest.raises(MatchDomainError, match="match_not_running"):
+        await probe.manager.submit(
+            match_id,
+            MatchCommand(type="speech.start", message_id="blocked-next", actor_user_id=second),
+        )
+    failed_state = probe.actor.state
+    await probe.manager.handle_asr_failure(envelope=envelope, code="asr_stream_failed")
+    assert probe.actor.state == failed_state
+
+    async def replay(_match, _speech, captured, *, deadline_mono):
+        assert captured is envelope and deadline_mono > asyncio.get_running_loop().time()
+        envelopes[old] = replace(captured)
+        await finalize(probe.manager, envelopes[old])
+
+    media = probe.manager._speech_runtime
+    media.retry_from_recording.side_effect = replay
+    await probe.manager.submit(
+        match_id,
+        MatchCommand(
+            "asr.retry.begin",
+            "explicit-source-retry",
+            payload=operator_payload(probe.actor, context_version=envelope.context_version),
+        ),
+    )
+    async with asyncio.timeout(2):
+        while probe.actor.state.action_state != "RESUME_COUNTDOWN":
+            await asyncio.sleep(0.005)
+    await probe.manager.submit(match_id, MatchCommand("resume.elapsed", "retry-resumed"))
     await probe.manager.submit(
         match_id, MatchCommand(type="speech.start", message_id="next-start", actor_user_id=second)
     )
@@ -292,7 +332,9 @@ async def test_late_asr_failure_is_fenced_and_settles_only_original_speaker(agen
     assert probe.actor.state == current and current.current_speech_id != old
     assert probe.actor.view().free_affirmative_remaining_ms == 50_000
     async with probe.factory() as session:
-        assert (await session.get(Speech, old)).asr_error_code == "asr_task_failed"
+        source = await session.get(Speech, old)
+        assert source.status == "FINALIZED" and source.asr_error_code is None
+        assert source.user_id == first and source.attempt_no == envelope.attempt_no
 
 
 @pytest.mark.asyncio
@@ -367,9 +409,7 @@ async def test_admin_agent_reset_stays_paused_until_real_resume_countdown(
     assert probe.provider_calls == 1
     started = monotonic()
     async with probe.factory() as session:
-        await control_match(
-            match_id, MatchControlRequest(action="resume"), request, auth, session
-        )
+        await control_match(match_id, MatchControlRequest(action="resume"), request, auth, session)
     assert actor.state.status == "PAUSED" and actor.state.action_state == "RESUME_COUNTDOWN"
     await asyncio.sleep(2.5)
     assert probe.provider_calls == 1
@@ -381,7 +421,9 @@ async def test_admin_agent_reset_stays_paused_until_real_resume_countdown(
 
 
 @pytest.mark.asyncio
-async def test_failed_final_at_zero_budget_retries_once_then_requires_recovery(agent_fault_probe):
+async def test_failed_final_at_zero_budget_requires_explicit_reset_before_new_attempt(
+    agent_fault_probe,
+):
     probe = agent_fault_probe
     now, first, _, envelopes = await prepare(probe)
     match_id = probe.actor.state.match_id
@@ -399,11 +441,40 @@ async def test_failed_final_at_zero_budget_retries_once_then_requires_recovery(a
     )
     assert probe.actor.state.action_state == "SPEECH_FINALIZING"
     await probe.manager.handle_asr_failure(envelope=envelopes[old], code="asr_task_failed")
-    assert (
-        probe.actor.state.status == "RUNNING"
-        and probe.actor.state.action_state == "HUMAN_READY_TO_START"
+    assert probe.actor.state.status == "ERROR"
+    assert probe.actor.state.action_state == "RECOVERY_REQUIRED"
+    assert probe.actor.state.current_speech_id == old
+    assert probe.actor.state.asr_failed_speech_id == old
+    assert probe.actor.view().free_affirmative_remaining_ms == 0
+    await probe.manager.submit(
+        match_id,
+        MatchCommand(
+            "match.resume",
+            "ordinary-resume-is-not-asr-recovery",
+            payload={"privileged": True, "reasons": []},
+        ),
     )
+    assert probe.actor.state.status == "ERROR" and probe.actor.state.current_speech_id == old
+    async with probe.factory() as session:
+        context_before_reset = (await session.get(Match, match_id)).context_version
+    await probe.manager.submit(
+        match_id,
+        MatchCommand(
+            "speech.reset",
+            "explicit-first-reset",
+            actor_user_id=first,
+            payload=operator_payload(probe.actor, context_version=context_before_reset),
+        ),
+    )
+    assert probe.actor.state.status == "PAUSED" and probe.actor.state.current_speech_id is None
     assert probe.actor.view().free_affirmative_remaining_ms == 10_000
+    await probe.manager.submit(
+        match_id,
+        MatchCommand(
+            "match.resume", "resume-explicit-reset", payload={"privileged": True, "reasons": []}
+        ),
+    )
+    await probe.manager.submit(match_id, MatchCommand("resume.elapsed", "explicit-reset-resumed"))
     await probe.manager.submit(
         match_id, MatchCommand(type="speech.start", message_id="retry", actor_user_id=first)
     )
@@ -423,7 +494,8 @@ async def test_failed_final_at_zero_budget_retries_once_then_requires_recovery(a
         and probe.actor.state.action_state == "RECOVERY_REQUIRED"
     )
     async with probe.factory() as session:
-        assert (await session.get(Speech, old)).status == "FAILED"
+        original = await session.get(Speech, old)
+        assert original.status == "RESET" and original.asr_error_code == "asr_task_failed"
         assert (await session.get(Speech, retry)).status == "FAILED"
         context = (await session.get(Match, match_id)).context_version
         assert not list(
@@ -440,6 +512,7 @@ async def test_failed_final_at_zero_budget_retries_once_then_requires_recovery(a
     from starlette.requests import Request
 
     from jx_core.admin_routes import MatchControlRequest, control_match, match_control_target
+
     request = Request(
         {
             "type": "http",
@@ -817,7 +890,54 @@ async def test_restart_cancels_pending_skip_and_preserves_recoverable_budget(age
             ),
         )
         await manager.submit(match_id, MatchCommand(type="resume.elapsed", message_id="resumed"))
+        # A fresh real Manager enforces the shared necessary-person checks;
+        # this old fixture has no connected/checked participant yet.
+        assert actor.state.status == "PAUSED" and actor.state.action_state == "RECOVERY_REQUIRED"
+        assert actor.view().free_affirmative_remaining_ms == 56_000
+        from datetime import UTC, datetime, timedelta
+
+        from jx_core.models import DeviceCheck, RoomConnectionLease, RoomMember
+
+        async with probe.factory() as session:
+            async with session.begin():
+                match = await session.get(Match, match_id)
+                session.add(
+                    RoomMember(
+                        room_id=match.room_id,
+                        user_id=first,
+                        member_role="DEBATER",
+                        online=True,
+                        ready=True,
+                    )
+                )
+                session.add(
+                    RoomConnectionLease(
+                        room_id=match.room_id,
+                        user_id=first,
+                        connection_id=uuid4(),
+                        connection_epoch=1,
+                    )
+                )
+                session.add(
+                    DeviceCheck(
+                        room_id=match.room_id,
+                        user_id=first,
+                        check_version=1,
+                        status="PASS",
+                        valid_until=datetime.now(UTC) + timedelta(hours=1),
+                    )
+                )
+        await manager.submit(
+            match_id,
+            MatchCommand(
+                "match.resume", "resume-ready-human", payload={"privileged": True, "reasons": []}
+            ),
+        )
+        assert actor.state.action_state == "RESUME_COUNTDOWN"
+        await manager.submit(match_id, MatchCommand("resume.elapsed", "ready-human-resumed"))
         assert actor.state.action_state == "HUMAN_READY_TO_START"
+        assert actor.state.current_speaker_user_id == first
+        assert actor.view().free_affirmative_remaining_ms == 56_000
     finally:
         await coordinator.close()
         await manager.close()

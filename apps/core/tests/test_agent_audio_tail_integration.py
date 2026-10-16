@@ -17,6 +17,7 @@ from jx_core.admin_routes import MatchControlRequest, control_match, match_contr
 from jx_core.agent.llm import LlmStreamResult
 from jx_core.agent.runtime import AgentRun
 from jx_core.agent.tts import TtsStreamResult
+from jx_core.asr.protocol import FunAsrConnection
 from jx_core.asr.runtime import AsrRuntime, MatchAudioReceiver
 from jx_core.matches.domain import MatchCommand, MatchDomainError
 from jx_core.models import (
@@ -33,6 +34,8 @@ from test_agent_runtime_fault_integration import (
     agent_fault_database_url as agent_fault_database_url,
 )
 from test_agent_runtime_fault_integration import agent_fault_probe as agent_fault_probe
+from test_asr import FakeSocket
+from test_asr_queue_recovery import OwnedStream
 from test_match_handoff_recovery_integration import (
     admin_auth,  # pyright: ignore[reportUnknownVariableType]
     finalize,  # pyright: ignore[reportUnknownVariableType]
@@ -99,7 +102,7 @@ def install_edges(
     edges = TailEdges()
 
     async def stream_chat(**values: Any) -> LlmStreamResult:
-        if values["max_tokens"] == 32:
+        if "自由辩论快速决策" in values["messages"][-1]["content"]:
             value = "true" if edges.decision_should_speak else "false"
             return LlmStreamResult(
                 '{"should_speak":' + value + ',"decision_reason":"受控候选"}', 1, 2, 8
@@ -446,20 +449,41 @@ async def test_free_tail_crosses_selection_window_preserving_final_source_and_ne
             )
             asr = AsrRuntime(settings=settings, callbacks=probe.manager)
             receiver = MatchAudioReceiver(
-                match_id=match_id, settings=settings, callbacks=probe.manager
+                match_id=match_id,
+                settings=settings,
+                callbacks=probe.manager,
+                input_clock=lambda: probe.actor._clock(),
             )
 
             async def close() -> None:
                 return None
 
-            async def held_provider(*_: Any) -> None:
-                await asyncio.Event().wait()
+            stream, socket = OwnedStream(), FakeSocket()
 
-            # Only the connected RTC/provider boundary is synthetic. The real
-            # receiver start/session admission and manager transaction remain.
-            receiver._room = cast(Any, SimpleNamespace(disconnect=close))
-            receiver._connection = cast(Any, SimpleNamespace(close=close))
-            monkeypatch.setattr(receiver, "_run_speech", held_provider)
+            async def socket_factory(_url: str, _headers: dict[str, str]) -> FakeSocket:
+                return socket
+
+            def audio_stream(*_args: Any, **_kwargs: Any) -> OwnedStream:
+                return stream
+
+            # Real Session/Protocol task-started and reader readiness are part
+            # of admission. Only the SDK stream and provider socket are owned fakes.
+            receiver._connection = FunAsrConnection(
+                url="wss://owned.invalid", api_key="synthetic", socket_factory=socket_factory
+            )
+            track: Any = SimpleNamespace(kind=runtime_module.rtc.TrackKind.KIND_AUDIO)
+            publication: Any = SimpleNamespace(sid="owned-human-admission", track=track)
+            epoch = dict(probe.actor.state.connection_epochs).get(first, 1)
+            participant: Any = SimpleNamespace(
+                identity=f"jx-human-{match_id}-{first}-{epoch}-owned",
+                track_publications={publication.sid: publication},
+            )
+            room: Any = SimpleNamespace(
+                remote_participants={participant.identity: participant}, disconnect=close
+            )
+            receiver._room = room
+            monkeypatch.setattr(runtime_module.rtc, "AudioStream", audio_stream)
+            receiver._on_track_subscribed(room, track, publication, participant)
             asr._receivers[match_id] = receiver
             probe.manager.set_speech_runtime(asr)
             assert receiver._speech is None

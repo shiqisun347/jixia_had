@@ -194,6 +194,17 @@ export const runtimeErrorLabel = (code: string | null | undefined, t?: Translato
         t?.('errors.ttsInterrupted') ?? '语音合成连续失败，比赛已暂停，请申请恢复。',
       asr_stream_interrupted:
         t?.('errors.asrInterrupted') ?? '语音识别连续失败，比赛已暂停，请申请恢复。',
+      asr_recovery_required:
+        t?.('errors.asrRecoveryRequired') ??
+        '本次录音和已确认文字已保留。请管理员重试识别、显式重置或安全跳过。',
+      asr_finalization_timeout:
+        t?.('errors.asrFinalizationTimeout') ??
+        '语音整理与保存未在 20 秒内完成。已有记录保留，请管理员重试识别、重置或安全跳过。',
+      asr_not_ready:
+        t?.('errors.asrNotReady') ??
+        '麦克风或识别服务尚未就绪，请检查设备后再试，尚未开始正式收音。',
+      asr_audio_missing:
+        t?.('errors.asrAudioMissing') ?? '没有可恢复录音，请管理员重置本次发言或安全跳过。',
       llm_stream_interrupted:
         t?.('errors.llmInterrupted') ?? 'Agent 文本生成连续失败，比赛已暂停，请申请恢复。',
       llm_output_too_large:
@@ -281,6 +292,19 @@ function transcriptText(
 function initials(label: string | null | undefined) {
   const value = label?.trim() || '空';
   return value.slice(0, 1);
+}
+
+function debaterPosition(
+  side: string,
+  seat: number | null | undefined,
+  t: Translator,
+  locale: string,
+) {
+  const label =
+    locale === 'en'
+      ? String(seat ?? '')
+      : (['一', '二', '三', '四'][(seat ?? 0) - 1] ?? String(seat ?? ''));
+  return t('debaterPosition', { side: sideLabel(side, t), seat: label });
 }
 
 function SpeakerMark({
@@ -420,6 +444,7 @@ function SeatCard({
   online?: boolean;
 }) {
   const t = useAppTranslations('Debate');
+  const { locale } = useAppLocale();
   const tone = sideTone(seat.side);
   return (
     <article
@@ -433,12 +458,12 @@ function SeatCard({
     >
       <SpeakerMark seat={seat} active={active} online={online} />
       <div className="min-w-0 flex-1">
-        <div className="flex items-center gap-2">
+        <div className="debate-seat-identity flex items-center gap-2">
           <strong className="truncate text-base font-black leading-tight text-slate-950 xl:text-lg">
             {seat.occupant_name ?? t('emptySeat')}
           </strong>
           <span
-            className={`shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-black leading-none ${seat.occupant_type === 'AGENT' ? 'bg-blue-100 text-blue-800' : 'bg-red-100 text-red-800'}`}
+            className={`debate-seat-kind shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-black leading-none ${seat.occupant_type === 'AGENT' ? 'bg-blue-100 text-blue-800' : 'bg-red-100 text-red-800'}`}
           >
             {seat.occupant_type === 'AGENT' ? t('ai') : t('human')}
           </span>
@@ -446,7 +471,7 @@ function SeatCard({
         <p
           className={`mt-1 text-sm font-black ${tone === 'red' ? 'text-red-700' : 'text-blue-700'}`}
         >
-          {sideLabel(seat.side, t)} {seat.seat_no}
+          {debaterPosition(seat.side, seat.seat_no, t, locale)}
         </p>
         {handOrder > 0 ? (
           <span
@@ -495,7 +520,11 @@ function SeatCard({
           </span>
         ) : null}
       </div>
-      {active ? <Waveform tone={tone === 'red' ? 'red' : 'blue'} compact /> : null}
+      {active ? (
+        <span className="debate-seat-activity">
+          <Waveform compact />
+        </span>
+      ) : null}
     </article>
   );
 }
@@ -612,6 +641,32 @@ function FreeDebateClock({ snapshot }: { snapshot: MatchSnapshot }) {
   );
 }
 
+export function transcriptPendingSource(
+  snapshot: MatchSnapshot,
+): NonNullable<MatchSnapshot['pending_source']> | null {
+  if (snapshot.pending_source) return snapshot.pending_source;
+  const kind =
+    snapshot.action_state === 'AGENT_FINALIZING'
+      ? 'AGENT'
+      : snapshot.action_state === 'SPEECH_FINALIZING'
+        ? 'HUMAN'
+        : null;
+  if (
+    !kind ||
+    !snapshot.current_speech_id ||
+    !snapshot.current_speaker_side ||
+    !snapshot.current_speaker_seat_no
+  )
+    return null;
+  return {
+    speech_id: snapshot.current_speech_id,
+    speaker_kind: kind,
+    side: snapshot.current_speaker_side,
+    seat_no: snapshot.current_speaker_seat_no,
+    status: 'FINALIZING',
+  };
+}
+
 function TranscriptFeed({
   transcript,
   runtime,
@@ -648,6 +703,12 @@ function TranscriptFeed({
 >) {
   const t = useAppTranslations('Debate');
   const { locale } = useAppLocale();
+  const pendingSource = transcriptPendingSource(snapshot);
+  const pendingSeat = pendingSource
+    ? room.seats.find(
+        (seat) => seat.side === pendingSource.side && seat.seat_no === pendingSource.seat_no,
+      )
+    : undefined;
   const [copyState, setCopyState] = useState<'idle' | 'success' | 'error'>('idle');
   const copyTranscript = async () => {
     try {
@@ -680,6 +741,22 @@ function TranscriptFeed({
           <RefreshCcw className="size-4 animate-spin" /> {t('syncingTranscript')}
         </div>
       ) : null}
+      {pendingSource ? (
+        <article
+          className={`rounded-xl border p-3 text-sm ${pendingSource.status === 'FAILED' ? 'border-amber-200 bg-amber-50 text-amber-950' : 'border-slate-200 bg-slate-50 text-slate-700'}`}
+          data-testid="transcript-pending-source"
+          data-speech-id={pendingSource.speech_id}
+          role="status"
+        >
+          <strong>
+            {debaterPosition(pendingSource.side, pendingSource.seat_no, t, locale)}
+            {pendingSeat?.occupant_name ? ` · ${pendingSeat.occupant_name}` : ''}
+          </strong>
+          <p className="mt-1 leading-6">
+            {pendingSource.status === 'FAILED' ? t('sourceSaveFailed') : t('sourceFinalizing')}
+          </p>
+        </article>
+      ) : null}
       {transcript?.speeches.length ? (
         transcript.speeches.map((speech) => {
           const isPlaceholder = 'origin' in speech && speech.origin === 'ADMIN_PLACEHOLDER';
@@ -698,7 +775,16 @@ function TranscriptFeed({
                 </span>
                 <span className="text-slate-300">·</span>
                 <span className={speech.side === 'AFFIRMATIVE' ? 'text-red-600' : 'text-blue-600'}>
-                  {sideLabel(speech.side, t)} {speech.seat_no}
+                  {debaterPosition(speech.side, speech.seat_no, t, locale)}
+                </span>
+                <span className="text-slate-600">
+                  {room.seats.find((seat) =>
+                    speech.user_id
+                      ? seat.user_id === speech.user_id
+                      : speech.agent_profile_id
+                        ? seat.agent_profile_id === speech.agent_profile_id
+                        : seat.side === speech.side && seat.seat_no === speech.seat_no,
+                  )?.occupant_name ?? (speech.speaker_kind === 'AGENT' ? t('ai') : t('human'))}
                 </span>
                 {isPlaceholder ? (
                   <span className="rounded-full bg-amber-50 px-2 py-1 text-amber-800">
@@ -743,7 +829,7 @@ function TranscriptFeed({
             </article>
           );
         })
-      ) : !transcriptLoading && !transcriptError ? (
+      ) : !transcriptLoading && !transcriptError && !pendingSource && !runtime.interimText ? (
         <p className="py-12 text-center text-sm text-slate-500">{t('noSpeeches')}</p>
       ) : null}
       {runtime.interimText ? (
@@ -751,11 +837,15 @@ function TranscriptFeed({
           <div className="flex items-center justify-between gap-3 text-xs font-bold text-slate-600">
             <span>
               {t('detail.currentLive')} ·{' '}
-              {sideLabel(currentSeat?.side ?? snapshot.current_speaker_side ?? '', t)}{' '}
-              {currentSeat?.seat_no ?? snapshot.current_speaker_seat_no ?? ''}
+              {debaterPosition(
+                currentSeat?.side ?? snapshot.current_speaker_side ?? '',
+                currentSeat?.seat_no ?? snapshot.current_speaker_seat_no,
+                t,
+                locale,
+              )}
             </span>
             <span className="rounded-full bg-[#dffb72] px-2 py-1 text-[10px] text-[#4b6300]">
-              {snapshot.action_state === 'AGENT_SPEAKING' ? t('liveAgentText') : t('liveAsrText')}
+              {currentSeat?.occupant_type === 'AGENT' ? t('liveAgentText') : t('liveAsrText')}
             </span>
           </div>
           <Waveform compact />
@@ -841,6 +931,7 @@ function CenterContent({
   handoffPending: boolean;
 }>) {
   const t = useAppTranslations('Debate');
+  const { locale } = useAppLocale();
   const hint = (text: string) => <p className="mt-2 text-sm leading-6 text-slate-600">{text}</p>;
   if (mode === 'finished' || mode === 'terminated') {
     return (
@@ -954,7 +1045,13 @@ function CenterContent({
         }
         testId="free-selection-stage"
       >
-        {hint(t('center.selectionHint'))}
+        {hint(
+          t(
+            snapshot.experiment_team_state?.selection_phase === 'MODEL_WAIT'
+              ? 'center.modelWaitHint'
+              : 'center.selectionHint',
+          ),
+        )}
       </CenterStatusCard>
     );
   }
@@ -995,7 +1092,7 @@ function CenterContent({
           <p
             className={`mt-1 text-sm font-bold ${currentSeat.side === 'AFFIRMATIVE' ? 'text-red-600' : 'text-blue-700'}`}
           >
-            {sideLabel(currentSeat.side, t)} · {currentSeat.seat_no}
+            {debaterPosition(currentSeat.side, currentSeat.seat_no, t, locale)}
           </p>
         ) : null}
         {mode === 'speaking' ? (
@@ -1157,7 +1254,7 @@ export function DebatePageLayout({
             >
               <div className="rounded-lg border border-blue-100 bg-[#f7fbff] px-2.5 py-1.5">
                 {presentationMode ? (
-                  <JixiaLogo compact />
+                  <JixiaLogo className="debate-presentation-brand" />
                 ) : (
                   <>
                     <p className="text-[10px] font-black tracking-[0.14em] text-slate-600">
@@ -1175,7 +1272,10 @@ export function DebatePageLayout({
               </div>
               <div className="min-w-0 px-1 sm:px-3">
                 <p className="text-xs font-black tracking-[0.16em] text-blue-600">{t('topic')}</p>
-                <h1 className="truncate text-lg font-black tracking-[-0.04em] text-slate-950 xl:text-xl">
+                <h1
+                  className={`debate-topic-title text-lg font-black tracking-[-0.04em] text-slate-950 xl:text-xl ${presentationMode ? '' : 'truncate'}`}
+                  data-long-topic={String(room.topic.title ?? '').length > 48 ? 'true' : 'false'}
+                >
                   {String(room.topic.title ?? '')}
                 </h1>
               </div>
@@ -1226,7 +1326,7 @@ export function DebatePageLayout({
                         <Flag className="size-5 fill-current" /> {sideLabel(side, t)}
                       </div>
                       <span
-                        className={`text-[10px] font-black tracking-[0.18em] ${side === 'AFFIRMATIVE' ? 'text-red-500' : 'text-blue-500'}`}
+                        className={`text-[10px] font-black tracking-[0.18em] ${side === 'AFFIRMATIVE' ? 'text-red-700' : 'text-blue-700'}`}
                       >
                         {t('detail.teamPosition')}
                       </span>

@@ -3,7 +3,7 @@
 import { useQuery, useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import type { MatchCommand, MatchSnapshot } from '@/lib/matches-api';
+import type { MatchCommand, MatchSnapshot, MatchTranscript } from '@/lib/matches-api';
 import { matchesApi } from '@/lib/matches-api';
 import { useAppTranslations } from '@/i18n';
 
@@ -17,6 +17,7 @@ declare global {
 export type MatchSocketStatus = 'connecting' | 'open' | 'closed' | 'error';
 
 type MatchSocketEvent = {
+  match_id?: string;
   type?: string;
   sequence?: number;
   connection_epoch?: number;
@@ -24,7 +25,7 @@ type MatchSocketEvent = {
   duplicate?: boolean;
   code?: string;
   message?: string;
-  payload?: { text?: string; reasons?: string[] };
+  payload?: { text?: string; speech_id?: string; reasons?: string[] };
   snapshot?: MatchSnapshot;
 };
 
@@ -56,7 +57,20 @@ export function newestMatchSnapshot(
   current: MatchSnapshot | undefined,
   incoming: MatchSnapshot,
 ): MatchSnapshot {
-  return !current || incoming.sequence >= current.sequence ? incoming : current;
+  if (current && incoming.sequence < current.sequence) return current;
+  // A compatibility snapshot may omit transient text. Preserve it only for
+  // the same speech; never carry a previous speaker's draft into the next turn.
+  if (
+    !Object.prototype.hasOwnProperty.call(incoming, 'interim_text') &&
+    current?.interim_text &&
+    current.current_speech_id === incoming.current_speech_id
+  ) {
+    return {
+      ...incoming,
+      interim_text: current.interim_text,
+    };
+  }
+  return incoming;
 }
 
 function websocketUrl(matchId: string): string {
@@ -82,9 +96,19 @@ export function useMatchRuntime(matchId: string) {
   const t = useAppTranslations('Match');
   const tRef = useRef(t);
   const queryClient = useQueryClient();
+  const readSnapshot = useCallback(async () => {
+    const key = ['matches', matchId, 'snapshot'];
+    const before = queryClient.getQueryData<MatchSnapshot>(key);
+    const incoming = await matchesApi.snapshot(matchId);
+    const current = queryClient.getQueryData<MatchSnapshot>(key);
+    // A WS snapshot or subtitle can arrive while HTTP is in flight, including
+    // multiple subtitle revisions at the same authoritative sequence.
+    if (current && current !== before && incoming.sequence <= current.sequence) return current;
+    return newestMatchSnapshot(current, incoming);
+  }, [matchId, queryClient]);
   const query = useQuery({
     queryKey: ['matches', matchId, 'snapshot'],
-    queryFn: () => matchesApi.snapshot(matchId),
+    queryFn: readSnapshot,
     staleTime: Number.POSITIVE_INFINITY,
     retry: 1,
   });
@@ -104,7 +128,7 @@ export function useMatchRuntime(matchId: string) {
   const [commandErrorCode, setCommandErrorCode] = useState<string | null>(null);
   const commandErrorRef = useRef<string | null>(null);
   const [resumeReasons, setResumeReasons] = useState<string[]>(query.data?.resume_reasons ?? []);
-  const [interimText, setInterimText] = useState(() => query.data?.interim_text ?? '');
+  const interimText = query.data?.interim_text ?? '';
   const hasInitialSnapshot = Boolean(query.data);
 
   useEffect(() => {
@@ -119,11 +143,43 @@ export function useMatchRuntime(matchId: string) {
   }, [query.data?.sequence]);
 
   useEffect(() => {
+    if (query.data?.context_version === undefined) return;
+    const transcriptKey = ['matches', matchId, 'transcript'];
+    const transcript = queryClient.getQueryData<MatchTranscript>(transcriptKey);
+    if (transcript && transcript.context_version < query.data.context_version) {
+      void queryClient.invalidateQueries({ queryKey: transcriptKey });
+    }
+  }, [matchId, query.data?.context_version, queryClient]);
+
+  useEffect(() => {
     if (!hasInitialSnapshot) return;
     let disposed = false;
     let reconnectAttempt = 0;
     let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
     const pending = pendingRef.current;
+    const snapshotKey = ['matches', matchId, 'snapshot'];
+    let transcriptRefreshQueued = false;
+    const refreshTranscript = () => {
+      if (transcriptRefreshQueued) return;
+      transcriptRefreshQueued = true;
+      queueMicrotask(() => {
+        transcriptRefreshQueued = false;
+        if (!disposed) {
+          // A completion may arrive during an older request. Supersede that
+          // read instead of accepting its pre-commit text as the final result.
+          void queryClient.invalidateQueries({ queryKey: ['matches', matchId, 'transcript'] });
+        }
+      });
+    };
+    const updateInterim = (speechId: string | undefined, text: string, sequence?: number) => {
+      if (!speechId) return;
+      queryClient.setQueryData<MatchSnapshot>(snapshotKey, (current) =>
+        current?.current_speech_id === speechId &&
+        (sequence === undefined || sequence >= current.sequence)
+          ? { ...current, interim_text: text }
+          : current,
+      );
+    };
     const settlePendingCommands = () => {
       for (const item of pending.values()) {
         clearTimeout(item.timeout);
@@ -134,24 +190,27 @@ export function useMatchRuntime(matchId: string) {
     const onMessage = (message: MessageEvent) => {
       try {
         const event = JSON.parse(String(message.data)) as MatchSocketEvent;
+        if (event.match_id && event.match_id !== matchId) return;
         const observeSequence = (sequence: number | undefined) => {
           if (sequence === undefined || sequence <= latestSequenceRef.current) return;
           latestSequenceRef.current = sequence;
           setLatestSequence(sequence);
         };
-        observeSequence(event.sequence);
-        if (event.connection_epoch) {
-          connectionEpochRef.current = event.connection_epoch;
-          setConnectionEpoch(event.connection_epoch);
-        }
+        if (event.type !== 'match.snapshot') observeSequence(event.sequence);
         if (event.type === 'match.snapshot') {
           const snapshot = (event as unknown as { payload: MatchSnapshot }).payload;
-          observeSequence(snapshot.sequence);
-          // Older Core/client snapshots may omit the transient field. Do not
-          // erase a live subtitle merely because a compatibility snapshot lacks it.
-          if (Object.prototype.hasOwnProperty.call(snapshot, 'interim_text')) {
-            setInterimText(snapshot.interim_text ?? '');
+          const current = queryClient.getQueryData<MatchSnapshot>(snapshotKey);
+          if (!snapshot || !Number.isSafeInteger(snapshot.sequence)) {
+            setSocketError(tRef.current('runtime.eventInvalid'));
+            return;
           }
+          if (snapshot.sequence < Math.max(current?.sequence ?? 0, latestSequenceRef.current))
+            return;
+          if (event.connection_epoch) {
+            connectionEpochRef.current = event.connection_epoch;
+            setConnectionEpoch(event.connection_epoch);
+          }
+          observeSequence(snapshot.sequence);
           queryClient.setQueryData<MatchSnapshot>(['matches', matchId, 'snapshot'], (current) =>
             newestMatchSnapshot(current, snapshot),
           );
@@ -162,6 +221,7 @@ export function useMatchRuntime(matchId: string) {
               : null,
           );
           if (snapshot.action_state !== 'RECOVERY_REQUIRED') setResumeReasons([]);
+          refreshTranscript();
           void queryClient.invalidateQueries({
             queryKey: ['rooms', snapshot.room_id, 'snapshot'],
           });
@@ -170,11 +230,14 @@ export function useMatchRuntime(matchId: string) {
           if (event.snapshot) {
             const acknowledged = event.snapshot;
             observeSequence(acknowledged.sequence);
+            const current = queryClient.getQueryData<MatchSnapshot>(snapshotKey);
             queryClient.setQueryData<MatchSnapshot>(['matches', matchId, 'snapshot'], (current) =>
               newestMatchSnapshot(current, acknowledged),
             );
-            setResumeReasons([]);
-            setSocketError(null);
+            if (acknowledged.sequence >= (current?.sequence ?? 0)) {
+              setResumeReasons(acknowledged.resume_reasons ?? []);
+              setSocketError(null);
+            }
           }
           const pending = pendingRef.current.get(event.message_id);
           if (pending) {
@@ -204,21 +267,31 @@ export function useMatchRuntime(matchId: string) {
           setResumeReasons([]);
           setSocketError(null);
         } else if (event.type === 'asr.interim' || event.type === 'agent.subtitle') {
-          setInterimText(event.payload?.text ?? '');
+          const current = queryClient.getQueryData<MatchSnapshot>(snapshotKey);
+          if (event.sequence !== undefined && event.sequence < (current?.sequence ?? 0)) return;
+          updateInterim(event.payload?.speech_id, event.payload?.text ?? '', event.sequence);
         } else if (
           event.type === 'transcript.updated' ||
           event.type === 'speech.finished' ||
-          event.type === 'agent.finalized'
+          event.type === 'agent.finalized' ||
+          event.type === 'speech.skipped' ||
+          event.type === 'stage.reset' ||
+          event.type === 'speech.reset' ||
+          event.type === 'match.finished' ||
+          event.type === 'match.terminated'
         ) {
-          setInterimText('');
-          void queryClient.invalidateQueries({ queryKey: ['matches', matchId, 'transcript'] });
+          updateInterim(event.payload?.speech_id, '', event.sequence);
+          refreshTranscript();
           void queryClient.invalidateQueries({ queryKey: ['matches', matchId, 'snapshot'] });
         } else if (
           event.type === 'asr.segment_final' ||
           event.type === 'asr.retry_required' ||
           event.type === 'agent.retrying'
         ) {
-          if (event.type !== 'asr.segment_final') setInterimText('');
+          if (event.type !== 'asr.segment_final')
+            updateInterim(event.payload?.speech_id, '', event.sequence);
+        } else if (event.type === 'agent.text_delta' || event.type === 'agent.text_generated') {
+          // Unplayed model tokens are diagnostic input, never playback captions.
         } else if (event.type === 'match.online' || event.type === 'match.offline') {
           const snapshot = queryClient.getQueryData<MatchSnapshot>([
             'matches',
@@ -275,6 +348,7 @@ export function useMatchRuntime(matchId: string) {
             : current,
         );
         void queryClient.invalidateQueries({ queryKey: ['matches', matchId, 'snapshot'] });
+        refreshTranscript();
       });
       socket.addEventListener('error', () => {
         if (disposed || socketRef.current !== socket) return;
@@ -288,7 +362,10 @@ export function useMatchRuntime(matchId: string) {
         settlePendingCommands();
         scheduleReconnect();
       });
-      socket.addEventListener('message', onMessage);
+      socket.addEventListener('message', (message) => {
+        if (disposed || socketRef.current !== socket) return;
+        onMessage(message);
+      });
     }
     connect();
     return () => {
@@ -303,7 +380,10 @@ export function useMatchRuntime(matchId: string) {
   }, [hasInitialSnapshot, matchId, queryClient]);
 
   const sendCommand = useCallback(
-    async (command: Omit<MatchCommand, 'expected_sequence' | 'connection_epoch'>) => {
+    async (
+      command: Omit<MatchCommand, 'expected_sequence' | 'connection_epoch'>,
+      isStillCurrent?: () => boolean,
+    ) => {
       commandErrorRef.current = null;
       setCommandErrorCode(null);
       const queryKey = ['matches', matchId, 'snapshot'] as const;
@@ -317,7 +397,7 @@ export function useMatchRuntime(matchId: string) {
         try {
           snapshot = await queryClient.fetchQuery({
             queryKey,
-            queryFn: () => matchesApi.snapshot(matchId),
+            queryFn: readSnapshot,
             staleTime: 0,
           });
         } catch {
@@ -333,6 +413,7 @@ export function useMatchRuntime(matchId: string) {
         socket.readyState !== WebSocket.OPEN ||
         !snapshot ||
         connectionEpoch === null ||
+        (isStillCurrent && !isStillCurrent()) ||
         snapshot.sequence < latestSequenceRef.current
       ) {
         return false;
@@ -357,7 +438,15 @@ export function useMatchRuntime(matchId: string) {
         }
       });
     },
-    [matchId, queryClient],
+    [matchId, queryClient, readSnapshot],
+  );
+
+  const isCurrentConnection = useCallback(
+    (epoch: number | null) =>
+      epoch !== null &&
+      connectionEpochRef.current === epoch &&
+      socketRef.current?.readyState === WebSocket.OPEN,
+    [],
   );
 
   return useMemo(
@@ -376,6 +465,7 @@ export function useMatchRuntime(matchId: string) {
         connectionEpoch !== null &&
         Boolean(query.data && query.data.sequence >= latestSequence),
       sendCommand,
+      isCurrentConnection,
       commandFailureMessage: () => commandErrorRef.current,
     }),
     [
@@ -384,6 +474,7 @@ export function useMatchRuntime(matchId: string) {
       query.error,
       query.isPending,
       sendCommand,
+      isCurrentConnection,
       resumeReasons,
       socketError,
       commandErrorCode,

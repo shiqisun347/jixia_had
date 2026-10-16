@@ -65,6 +65,10 @@ ERROR_DEFINITIONS: dict[str, tuple[int, str]] = {
     "topic_unavailable": (409, "辩题不存在或已停用"),
     "agent_unavailable": (409, "Agent 不存在、已停用或其模型/音色不可用"),
     "agent_capacity_insufficient": (409, "当前成员组成所需的可用 Agent 数量不足"),
+    "conference_agents_unavailable": (
+        409,
+        "会议阵容尚未就绪，请管理员启用并校准执锋、博闻、睿断、明辨的指定音色，或选择自由入席",
+    ),
     "format_not_published": (409, "请先为该赛制发布可用版本，再创建或启动实验房间"),
     "agent_duplicate_in_room": (409, "同一个 Agent 不能在同一场比赛中占用多个席位"),
     "room_unavailable": (409, "房间不存在或当前不能加入"),

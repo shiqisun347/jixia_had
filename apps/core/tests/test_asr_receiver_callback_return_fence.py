@@ -110,7 +110,10 @@ async def test_stale_start_callback_return_cannot_reenter_retired_provider(
         old_session.feed_pcm(b"\x01" * PCM_FRAME_BYTES)
         await old_session.finish()
         await asyncio.wait_for(callback_entered.wait(), timeout=1)
-        assert old_task_id is not None and not factory_calls_by_connection and not run_task_ids
+        assert old_task_id is not None
+        # Spec307 prepares the provider before committing the business start.
+        assert factory_calls_by_connection == {0: 1}
+        assert run_task_ids == [str(old_task_id)]
         await receiver.abort_speech()
         assert callback_cancellations >= 1 and not old_task.done()
         await receiver.start_speech(speech_id, user_id, same_envelope)
@@ -121,7 +124,7 @@ async def test_stale_start_callback_return_cannot_reenter_retired_provider(
         new_session.feed_pcm(new_pcm)
         await receiver.finish_speech(speech_id)
         assert new_task.done() and not new_task.cancelled()
-        assert len(run_task_ids) == 1 and str(old_task_id) not in run_task_ids
+        assert len(run_task_ids) == 2 and run_task_ids.count(str(old_task_id)) == 1
         final = callbacks.finalize_asr_speech.await_args
         assert final is not None and final.kwargs["envelope"] == same_envelope
         storage = Path(final.kwargs["audio_storage_path"])
@@ -144,7 +147,7 @@ async def test_stale_start_callback_return_cannot_reenter_retired_provider(
             "guard": dict(external_guard),
         }
         print("callback_return_fence_product_observations=" + json.dumps(snapshot, sort_keys=True))
-        assert str(old_task_id) not in run_task_ids and len(run_task_ids) == 1, snapshot
+        assert run_task_ids.count(str(old_task_id)) == 1 and len(run_task_ids) == 2, snapshot
         assert factory_calls_by_connection == before_calls, snapshot
         assert callbacks.finalize_asr_speech.await_count == before_final_count == 1, snapshot
         assert storage.read_bytes() == new_pcm and not external_guard, snapshot

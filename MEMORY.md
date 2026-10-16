@@ -3747,3 +3747,244 @@ mixed-installed-01/。最终文档同步GitHub后交付。
 最终权威FINISHED1/owners0通过，不把每条中间操作均记正常返回。FINAL_DELIVERY.json
 已绑定完整发布/安装/尾音/混合赛/闭房/normalWS及最终RO原件SHA，当前状态已发布并
 完成复验（适用范围及遗留限制保留）；最终报告release/RELEASE_REPORT.md。
+
+## 2026-10-16 — Spec307 真人混合赛 P0 修复与验收
+
+最终交付（2026-10-16）：
+
+- 已完成实施、完整复验与受保护生产发布：`20261016-spec307-e290fab2`，数据库 `0048_model_wait_phase`，SDK `1.1.20`，正式 Web `P1A8IqaVq1AGlk851WnO9`。
+- 最终同源候选发布前三场、安装后三场均自然完赛。每场双方各2真人＋2Agent；真人由真实TTS音源经LiveKit送入ASR，保持正式120/90秒时长。安装后normal302/24正式、weaknet306/24正式、recovery289/22正式及3条已退役RESET；归档34/34/31源样本差均0，六类场内资源与最终pending/native/子进程均0。
+- 安装后第三场实际完成暂停、重置和AI占位自动继续，再完成真人三辩465字/90000ms及其后完整流程；两浏览器正式ID/textSHA与独立只读QA数据库一致。浏览器为两SPECTATOR；真实辩手浏览器首次开麦另以positive03两轮120秒专项验证，不冒充全场浏览器辩手或物理设备。
+- 同源long09两次180秒及识别断流恢复通过；后端1742唯一测试、标准纯2206分别通过且有重叠，不相加。当前构建、类型、lint、契约、Storybook和浏览器证据的源适用桥均保留。
+- 实际已装125源、49份migration及alembic.ini、immutable4和109个实际加载模块均核验；4次源快照一致，前两场发言与事件在第三场后保持。发布后5分钟11点健康及06:15UTC再次只读复核均通过：原三PID/0重启，历史112房间/95比赛/1336发言与冻结快照保持，备份SHA已核实。
+- 安装后V8失败及V9中断原件均保留；用户明确确认V9本次连接中断由本人关网造成，不计新系统异常，未完成的场次不计通过。V10未改业务/模型/赛制/20秒文字收敛和45秒见证门槛；752个旁路2秒探针中727次200、25次无状态，不能写成全链网络零错误。实际浏览器三场均0页面/控制台错误。
+- 真实调用审计中的失败、应急退役和1条旧ASR STARTED行保留；最终owner/task为0，不宣称所有API调用均成功。当前YXH冻结规则未启用裁判，完整赛标记不适用；实际启用的裁判另场验证，不改生产启用状态。
+- 证据：`profile_output/spec307/release/RELEASE_REPORT.md`；安装后完整复算79af62fe、独立SQL复算6a3a64a6、源归属复算26adafc9。物理麦克风/会场音箱、五场并发、50路持续LLM和11音色盲听未验收；未知提交确认与永久不可写仍按规格失败关闭。
+
+以下保留本规格实施过程与当时状态；最终状态以上述交付记录为准。
+
+新目标覆盖用户指定两场 ac3b050b…/8bf0469d…：真人自动重置、ASR长期整理、文字栏
+异常、四Agent固定2/4席男女声、Agent低频、弱网暂停、占位/重置安全继续、每队2H2A
+真实TTS长语音多场完赛及品牌大屏。保留任意组成与历史；Spec306独立站点不动。
+
+生产只读时间线确证首段31.72秒queuefull；五次真人无ASRcall，四次有RTC首帧；一段
+固定发言整理约157分钟直到此前授权终止。没有本窗口429证据，不冒认限流或假定无音频。
+实际ASR设置3.1，ExternalCall旧硬编码fun-asr模型名不可靠；事故发生于305发布前。
+Session仅1秒缓冲，25–30秒轮换串行等待final/capture/DB，原方法控制复现溢出；首次
+失败按旧规则reset。另复现presence错误信封、收尾重连epoch拒绝与Agent绝对截止不一致，
+这些机制未全部绑定为本次线上根因。tie-break已有round混合，不成立整场seed饥饿猜想。
+
+实际Web hook8控制（6缺口+2阳控）复现重连不补拉、旧HTTP覆盖新WS、旧字幕串席、
+其他端stage.reset/占位完成未刷新；缓存503保留旧数据及ASR累计拼接为阳控。
+新房当前随机Agent；执锋longhua女/博闻yunhuanhuan女/睿断yuxiaoyun女（YXH停用）/
+明辨xiaxiaochen女（未校准）。官方男女声表已核，307拟博闻anmingyuan男、睿断huozhuoshi男，
+其余保留并校准；当前P0明确男女声要求适用于原系统，独立站点旧取消男声待办不替代它。
+
+Spec307已创建并异步请求批准，明确覆盖旧PRD首次ASR整段reset、216三秒模型截止、
+304占位后手动resume，含完整范围/180秒与多场验收/回滚。未获批准前无业务修改。
+真实同源3.1/3.0WS长音频基线、独立ownedPG强控制及QA工具边界仍在进行。
+旧短QA12秒且改decision prompt/人为留Agent轮次，不能作为自然发言率/180秒通过。
+证据profile_output/spec307/{asr-audit/,BACKEND_AUDIT.*,WEB_AUDIT_AND_PRESENTATION_PLAN.md,
+WEB_REVIEW.json,ROLE_VOICE_RO.json}。生成缓存/凭据不提交，原失败保留。
+
+用户随后明确批准Spec307，实施/完整测试/上线均已授权，不再重复请求。原规则差异和20秒
+唯一收尾截止、超过30秒后显式重试新恢复轮次已纳规格；保留265纯Agent全false随机例外。
+三代理分工：F=asr三文件/重放与录音retry；A=service/domain/presence/resume/admin应急；
+C=Web文字同步/大屏/retry识别按钮；Root=公开source契约、rooms会议默认/Agent预算和QA。
+全量/多场/发布尚未通过，不可交付完成。并行306/.claude仍保留，不混入提交。
+
+真实基线4ASR+1TTS已终态：当前3.1与显式3.0同源120.05s单task均全1201帧、final693/
+408ms、无429/关闭错误；但959字TTS音源疑似未含后半，两个尾30秒短ASR只读到5–7段，
+FFmpeg/PyAV解码逐byte一致。仅证明长task传输终态，不证明全文质量或180s，不据此换3.0。
+后续必须先核实分批TTS源完整性再做90/180s正式混合赛；当前仍保留3.1配置。
+
+PG02/03各2强控制原缺陷复现成功（非修复）：admin绕过检查、真实receiver轮换queuefull
+导致Speech FAILED/Actor ready/旧ASR STARTED；owned容器精确清理。另CONSUMER_EPOCH_HANDOFF
+原法确证新epoch首帧遇旧session退出consumer，同publication去重不重建，真正新publication
+可恢复；这不是现场5个无call的确定共同根因。新修复专项正在分片红绿，不是完整验收。
+
+307首轮业务已实施并冻结：F ASR runtime c313ebd9/protocol eecddb22/session76c2f98d，
+166专项；A BACKEND_IMPLEMENTATION_FREEZE eb241a11，实际Receiver/skip PG9项和重启
+持久恢复PG11项通过，另185相关pure。C Web V3 fff5a18b，289unit/96Storybook，
+此前V2四project40浏览器；700前景色增量由真实axe验证。全仓标准首轮2062+Story96，
+含Core1349，后续新增ASR/QA helper需最终复验；不冒算数据库marker排除项。
+
+Root会议默认显式conference_roster=true，旧API遗漏flag仍任意组成，纯人/Agent保留。
+固定2/4 Agent按实际provider_voice与新名严格映射；正常校准/资源更新尚未生产执行。
+历史Room.name/avatar及MatchParticipant取frozen快照，避免全局改名污染旧比赛。
+追加0048_model_wait_phase，仅扩约束；降级若仍MODEL_WAIT则拒绝，不重写历史。
+HTTP恢复提示漏state已补，ASR模型诊断新行记录实际runtime.model_id，旧行不改。
+
+QA基础设施已实际server smoke：隔离nativeOwnedPG0048+精确YXH35 catalog/10主持资产
+只读复制+真实create_app lifespan/healthready+独立同版本LiveKit签名webhook，0blockers，
+finally已清理PG/LK。源素材密钥仅服务器settings内存/加密表，未导出本地；factory、
+loopback、DB名等所有权校验；catalog历史FK用户仅USER，真正唯一ADMIN另正常注册后
+ownedfixture提升。最早两轮setup失败（judge误要求启用/相对资源路径cwd）原日志保留。
+YXH35确实AI裁判disabled，不能声称正式三场已评分；保持生产配置，AI评分另独立验证。
+
+正式三场尚未启动/发布尚未执行。A写server_spec307_app_match_probe，C写本地SSH
+cookie私有PIPE→双SPECTATOR浏览器见证broker；Root基础helpers/48k独特分批TTS素材
+准备，CORE_API_ORIGIN8027仓库build已过。计划实际正常/弱网+真实ASRsocket中断/
+pause-resume-skip-reset三场原时长，至少两场180秒连续输入，不能用短loop替代。
+
+307最终业务完整回归已通过：Core1369/Web289/QA339/Node50/Jobs61，标准合计2108；
+独立新库完整Core261+Jobs5=266（0fail/error/skip），before/after332源码相同，ownedPG删除。
+final-db-02/FINAL_SUMMARY SHA576844ec…；旧9红通过真实Receiver就绪/307新语义修复重验，
+原失败保留。必要设备valid_until过期与interim异步边界已加控制，未简化旧owner断言。
+
+真实三场于2026-10-16约02:14启动，候选1b5939ed651a（243成员）独立App/PG/LiveKit，
+首场f566201d…已完成首段正式真人计时（后经只读核验确认为120秒）并自动推进、两段正式文字双DOM哈希一致；
+完整质量/完赛/弱网与恢复两场仍未通过，不以进行中投影替代验收。短smoke04真实6.41秒
+ASR/4normalpreview已过，但退出14个SDK destructor错误；新增broker终局stderr只计数，
+发现此类错误硬拒资格。真实SDK对照证明lateGC/atexit清理可达，不抑制断言。
+生产仍305/0047未改；307Linux构建首次Colima3GiB OOMKilled，0活动容器后按旧受控方式
+临时6GiB重试，构建后需恢复3GiB。另同一新public分批TTS素材180秒3.1/3.0比较进行中；
+现模型保留3.1。所有真实Provider secret仅服务器内存，未读api.md/.env或导出凭据。
+
+验收事实更正：实际RO的YXH35及8bf源房冻结一辩都是120s（180s是FREE阶段），首场
+120秒输入不能称180秒；此前Spec/记录该前提错误已明确纠正并告知用户。正式三场保持
+120/90原时长，另列2个180秒真实App/RTC/ASR长输入fixture，不改生产计时。full01被
+见证旧revision计时误拒、full02被Playwright递归收集before备份误拒；原件保留，工具
+红绿修复后full03候选1734e9de3fc9已启动。full02失败精确normalterminate清理后
+pending0/nativeexit0/PG、LK、Core均closed，不能把full01的pending9写成0。
+180s同源Provider3.1/3.0已全1800帧5760000byte、实际墙钟183.11/182.95s、final482/454ms，
+合成已完成8块覆盖全过，prefix CER诊断2.55%/0.75%，不是现场真人CER；无充分统计依据
+换模型，保留3.1。40真实决策机会38及时true+2最终格式技术失败，46attempt中8格式红；
+95%在8s内。独立明确enabled Judge原新国辩prompt+同model真实1call/8评分范围通过，
+YXH默认disabled仍不变。模型两个独占PG已清，实际47call及原红保留。
+Linux产物noG9kjAaCcjfjR8SJ1s6F/8100路由已仓库pnpm build成功，2246成员SHA校验、
+真实UID1000缓存写删+HTTP静态SHA+3认证UI受控案例+7正式浏览器项含7尺寸均绿；
+Colima内存已恢复3GiB且其他配置/容器/images/volumes不变，所有自有容器清理。
+生产terminal lease是1条（epoch144），144条是owned资源工具的保留压力测试数量，
+不得混同。生产仍idle305，307尚未发布。
+
+307长输入实测 actual02 自然到时后暴露真实持久化缺陷：HUMAN final 会将已保存的
+TIME_LIMIT和输入停止时间覆盖为空原因/识别完成时间。service两字段修复d6df6d1e，
+4实际PG控制原红后绿；完整backend03 Core pure1369/Jobs pure61/Core DB265/Jobs DB5，
+共1700唯一、0fail/error/skip，333后端source前后相同，独占PG精确清理。该实测未完成
+质量/清理验收，不称两次180输入通过；下一新候选仍须真实重跑。
+full03首场实际FINISHED283、23正式speech及双DOM一致、archive33源sample diff0、
+owners/pending/nativeexit均0；整组原failed保留。最后FREE窗口14708ms，录音14.8s，
+非空ASR但尚未完整发送首个约20s参考块，reference0/CERnull无法判断漏字。独审确认
+原评分器超出适用域；仅在严格正常短FREE边界允许三态not_evaluable、passed=None，
+单列不计质量通过，固定90/120和独立180输入、完整块覆盖/CER门槛不松。新三场待跑。
+
+上一候选f4fc38a1200c（243成员，manifest be5ad8e4，driver49e17）正式full04与独立
+long actual03实际启动后又红，未发布：long首run实际180353.358ms/录音180000ms，
+stored TIME_LIMIT/身份attempt1/8完整块/CER0.75%通过；第二约45秒ASR socket abort附近
+因qa_long_input_short退出，缺失败前snapshot/calls/fault/sent证据，现场归因未知。
+long最终App/PG/LK关闭、pending/native0、源同；不能记两次180输入通过。
+full04正常赛第二真人start146305ms到terminate266400ms，约120095ms，seq18到ERROR20，
+随后正常安全terminate21。失败前DB诊断未保存；只观察到接近120秒边界，尚未证明根因。
+full04原remote RESULT scenarios[]/pending7，分别recognize、Connection.close两条、
+keepalive、FunAsrConnection.close、_run_speech、_close_retired_asr_provider；Core/PG/LK
+closed及native0不能冒称pending0。broker提前result被严格协议拒绝，remote_result为空，
+原件与取回的remote-result.json均保留。C正补清理前白名单脱敏诊断和原异常保留。
+实际Session+Protocol零网络强控确证recv真实ConnectionClosedError1006仅1socket/
+retry0，受控FunAsrError则2socket/retry1成功且两组pending0；这是代码恢复缺口，不把它
+直接反填为actual03已独占归因。A负责protocol最小归一化及取消/退役强控，F查音频预算
+到时边界和清理，当前全量1700只适用于此前d6df冻结，新增业务修复后需重新完整门禁。
+
+后续真实Receiver/Session/Protocol/Manager/Actor/PG强控制证明：正常到时提交前仍可能
+收到PCM并越过有界历史上限。修复以已提交Core绝对截止封闭输入，正常最终提交仍由Actor
+驱动；D+20唯一watchdog退役旧识别，当前timer失败窄分支保留录音并进入既有asr.failed。
+未知提交ACK不覆盖已提交FINALIZING，持续不可写不伪造可恢复成功；未宣称自动对账。
+protocol真实recv错误归一化到原一次重试，取消和旧epoch仍丢弃。五份业务源已独审冻结。
+新候选e86a24f032f9/manifest1c8bd776，driver0c9e；final-backend-05实际Core1386pure+
+271DB、Jobs61pure+5DB，共1723唯一、0fail/error/skip，336源前后同、schema48及ownedPG清理。
+两fixture之后只作类型标注/等义函数补充，所有断言及归一AST同、两强PG回归与静态0；
+不将重复2项加到1723。原full04一次Core首进程5s未ready原因未知，原阈值未改，单跑及
+完整05原测试均绿；原红保留。全仓标准2160由Node50+QA374+Web289+Core1386+Jobs61组成，
+不同实际suite与Web原源桥明确记录，不冒充一次运行或真实Provider验收。
+main05被见证broker的protocol局部变量作用域错误阻断，原件保留；远端收到EOF后
+qa_witness_ack_missing并正常closed Core/PG/LK、pending0/source243同。Node因finally同错
+遗留3h timer，正常SIGINT后已无子进程，仅终止该ownedNode并删私有输入；完整native退出
+扫描未知，不能填0。C修测试工具，主比赛须新记录重跑；独立long actual04已启动。
+生产仍305/schema47，本规格尚未发布。
+
+独立long actual04已真实两次180s全绿并由C独审dcc6f72a：输入墙钟180340.204/180118.605ms，
+录音179700/179600ms（原≥179s门槛），stored/event TIME_LIMIT、正式文本、同speech/attempt1、
+8完整块全覆盖。第二45052ms真transport.abort后实际ASR FAILED(asr_stream_failed)→SUCCEEDED，
+仍attempt1；合成源prefix CER5/667和15/667，不冒称现场真人质量。source243同manifest1c8b、
+所有ownedclosed、pending/native0、SSH0及stderr完整EOF。原RESULT84ef384c、独立投影393f1afa，
+投影只保守floor墙钟整数并保留原float，不改原件。主full06重新开始，当前首场仍RUNNING。
+完整05后保留原5s启动断言又做5次独立ownedPG复查均绿，只记未复现/原因未知，不重复加
+标准计数；原失败保留。标准/完整DB/type-only桥及四文件组件适用性另获C独审fbb3c7d9。
+
+main06首normal实际passed（normal.json1a552444）：FINISHED287/23formal、两SPECTATOR DOM
+一致、双方四辩/末主持、33archive源samplediff0、6段human strict全绿/N_A0、6项场内资源0。
+第二weaknet随后ERROR17/asr_pcm_queue_full，未执行第三；整组失败并保留原件。新白名单
+weaknet-failure.json d9831d39在任何清理前实留：重连session新预算88889ms/max2844448B，
+history2841600B=88800ms、剩2ms；真实ASR单次自动重试已发生。下一100ms帧跨容量边界
+是正在强控验证的假设，不将算术直接写成现场已独占归因。243source同，App/PG/LKclosed，
+initialpending7经自然退役观测收敛final0，nativeEOF完整0/localchildren0。生产仍305/schema47。
+新fresh独审7a97533e/c4fa4577另抓角色缺口：现有双browser是管理员观众＋普通观众，不能
+冒充Spec§4实际辩手DOM。C统筹participant-browser独立补验；A真实fake-file麦/WAV控制，
+F薄server协调器暂转weaknet边界复现。目标human从未native连接，由实际网页独占WS/RTC，
+禁止预置publisher掩盖首开麦；原UI先等speech.start ACK再开麦而Core先等reader的潜在互等
+也在强控核实，尚不称实际浏览器已复现。当前没有307发布或提交。
+
+307后续容量切片：实际Receiver/Session/Protocol/Actor/PG证明D前2ms整帧越过非整帧
+重连预算会误报queue_full；Session仅ceil到完整100ms PCM块，Core D及D+20不变。
+11新红绿及既有6截止控制共17绿、全ASR191绿；完整backend06实际1734唯一、零失败/
+错误/跳过，338源前后同、schema48、ownedPG清理，fresh独审e9bee119通过。新候选
+fd3fba66ad6b（manifest203d1f75，243成员）已stage；新标准工具50+374、Web309、
+Storybook96、lint/type/contracts均绿，但新完整赛、角色和180秒实测仍待跑。
+实际旧帧字节数未采集，不把可达强控算成现场唯一归因。旧e86真实结果保留历史。
+原首次发言函数与actual runtime held-refresh均强红绿；55b5 Web首修复独审抓ACK前
+unmute会让观众提前听到未计时声音，暂不合格；C改静音发布准备轨、Core确认后开声。
+Linux02构建成功仅中间产物，不算最终适用；旧Mac3100 bundle仍保留作真实负控。
+participant server15本地控制、Root独跑及默认noIO通过，仅2工具stage，无实际新角色
+执行；目标浏览器不得由native WS/publisher替代。新角色两正式回合可与三场双观众
+完整赛分解验收，明确区分范围。生产305/schema47未改，307尚未提交或发布。
+
+最终Web静音切片V2 d5f68fe2/owner helper ae1aebd8经fresh独审3a23清除已知阻断，
+新全Web323、68相关、原40受控browser、Linux04构建/UID1000/7尺寸均绿，P1A8IqaVq1AGlk851WnO9
+四件包已备、297源=current；Colima已恢复3GiB/容器0。旧Web实际negative01命中
+command.error/asr_not_ready、0speech.started/0audioaddTrack，双真role；原failed保留，
+6owner0/native0但finalpending1未知。新positive01首段120s录音119600ms、TIME_LIMIT/
+正式文字双DOM/严格质量已过，第二段45s真实ASR中断与终态正在验；不提前计整组通过。
+主full07已启动fd3候选，尚在正常场。long05启动OSError未确因（裸bind/TIME_WAIT仅相容），
+long06已Core ready后runtime-start HTTP500、DB START_PENDING_RUNTIME seq8、无ASR或speech。
+新透明ASGI诊断helper1ee58161仅安全异常类型与代码位置，9本地强控绿，尚未实际执行。
+另真实Manager.runtime-start与Actor.member.online/原commit独立PG锁后barrier强控确证
+Room→Match / Match→Room逆序触发40P01 DeadlockDetected，串行同入口绿；338源同、PG清理、
+Provider0。证据LOCK_INVERSION_REVIEW13bd4d6c；不反填为long06历史500确定原因。
+Spec307§3.3补最小统一Match→Room锁序，原权限/状态/计时/重试不改；Root继续授权其
+红绿修复与全量回归。此修复后旧fd3真实结果不得冒充新最终候选，307未发布或提交。
+
+锁序最小修复service5aa88886已完成：仅Match FORUPDATE三行前移，room缺失/forbidden/
+match状态判定字节顺序不变。正式旧源1红2绿、新3绿、339源前后同；实际pg_blocking_pids
+证明同Match正确阻塞，fresh独审23852d04/C1453b6d7均clear。full-backend07四套正在跑，
+不沿用1734；新候选fccd03e3a2b7/manifest108cf9d1（243）已stage。Root主full08和长输入
+actual08（透明ASGI诊断helper1ee）已开始同新候选实测，当前长输入首段正常计时。
+旧FD3 positive01完整两turn实际passed并独审60c7f373：UI首120s/录音119600ms、第二native
+120s/录音120000ms/45272ms真实ASRabort后FAILED→SUCCEEDED，5次双DOM同步、终态刷新
+保两段，6owner/pending/native0。不替代FCCD重跑；positive02已stage待long08清理后运行。
+旧主07为已知锁缺口而主动中止，原failed/BrokenPipe保留；remote最终Core/PG/LKclosed、
+initialpending8自然1s内→0/source243同，后来RO进程0/端口不达/自有容器0。SSH计数0不
+冒充中断后Python最终destructor完整扫描。Web最终Linux04 P1A8IqaVq1AGlk851WnO9及Mac16
+ezt5qRxZ65cBuaTaZASQK不受Core锁修复影响，V5四件包/validation可用于新V6输入清单。
+当前操作性接续记录profile_output/spec307/CURRENT_HANDOFF.json；生产仍305/schema47，
+307未发布/提交。现场物理设备和更大并发仍未验收。
+
+2026-10-16 06:13 CST 接续：最终FCCD backend07完整1737（Core1394+277、Jobs61+5）通过，339源前后/当前同，独占PG清理。标准pure2202与1737有重叠，不合并相加。longactual08两段180258.575/180248.470ms/录音179600ms，第二段实际断流后恢复，owners/pending/native0、source243同；独审c1b79874与V6收据d8164263。最终positive02两轮120s亦自然通过，AFF1真实浏览器独占媒体/命令，NEG1native在45666ms断流后恢复；双DOM/终态刷新2正式文本、清理/source全绿，Fresh角色独审中。full08仍正常首场RUNNING，三个完整赛尚未完成。上述专项不是整场或物理设备验收；生产305未发布307，未git stage/commit/push。
+
+2026-10-16 06:47 CST：FCCD main08前两场原时长完整赛自然passed。normal FINISHED301/24formal/ASR9/34archive diff0/7strict+2短FREE N/A/6owners0，独审45c6f11d；weaknet FINISHED310/24formal/ASR11/34archive diff0/9strict N/A0/6owners0，独审6d013d66，真实WS断2s、RTC重发384ms、ASR transport.abort均same speech。弱网故障发生首真人且当时无正式历史，已有记录在故障中保留另由positive02/f3bfd独审证明。第三recovery比赛1e83e782-39f7-4863-8f3b-11001b5d77bf正在跑，已观测故意应急PAUSED后RUNNING44；尚缺最终recovery/全局after/清理/完整EOF，不能发布。long08/c1b7+d816及rolepositive02/f3bfd均最终候选实测已通过。22:15UTC纯RO生产预检566eda90：122source/48历史migration/schema47/旧Web/SDK/config/PID不变、非终态0/0/0、free11.91GiB，发布前需再查。生产305仍未变、无307备份/apply/git提交。发布执行清单e3884971已就绪，Fresh最终依赖清单e5b7bb5f尚pending，不存在通过版QUALIFICATION_REVIEW。
+
+2026-10-16后续：主08第三recovery失败，原件recovery-failure.json SHA dd953aa0…/globalRESULT已保存。三应急操作实际完成且自动继续，但AFF3 speech c46e9573…于22:46:53UTC开始、22:48:23自然90s TIME_LIMIT后永久SPEECH_FINALIZING45/context4；F22:56纯RO验证。最终全场3600s超时，receiver仍有原envelope但无speech task/session、当前ASR调用行0/正式字0。全组fail，前两场通过不构成资格；owned Core/PG/LK闭、pending4自然101ms→0/native完整EOF0/source243同。Root发现可验证机制：reset/skip递增全局opportunity_generation，即使固定发言opportunity_id=None；_speech_callback_envelope仍把这个计数带入ASR，持久身份校验要求无机会时代次None，可能使所有合法回调被误拒。尚待实际红绿证据，不反推唯一现场根因。Spec307§3.3明确成对机会身份；只修构造不放宽校验。三个副Agent均遇模型usage limit，Root工具可用继续。生产305/schema47仍未改、无307发布/提交，V6计划不得发布。
+
+Root已通过实际链强控核实固定ASR机会身份缺陷：精确旧service5aa的最终相同PG测试超时，当前f56同测试完成ASR登记/正式文本/进入下一人且拒旧回调；pure4中旧2红2绿、新4绿。只改_speech_callback_envelope，机会ID空则代次None；所有其他AST/validator/计时/全局counter不变。未保存现场该字段，不声称唯一历史归因。完整backend08 1742唯一（1398pure+278DB/61pure+5DB）、341源运行前后同、独占PG清理，当前仅新增测试未类型化旧helper导入加ignore注释，AST/全部assert等价并strict静态0；runtime/migration源全同。新候选e290fabe026f/manifest2e0a5f5e（243），main09 session72637/remote/tmp/jx-spec307-qa-e290fabe026f09原三场运行中，long09 session65957/remote/tmp/jx-spec307-longinput-d8d703f828eb48d88d840d46afe651d8首180206.213ms通过、第二恢复段运行。positive03已stage待long09关闭同8029端口后启动。V7标准2206/后端1742/决策尾音源码适用桥已生成，不冒充真实整场通过。Linux04 P1/WebV5包和Mac16九源/2216bundle已重哈仍同，生产305/schema47未改。副Agent全部usage limit，Root仍推进，新的独立审核尚需实际完成，不能复用旧通过SHA自我批准。
+
+01:21UTC接续：最新e290 long09/role03均实际通过，详见V7报告和CURRENT_HANDOFF。long投影4e1565f9、Root独立算法复算01dc76f3（CER16/667、17/667；16/15锚点精确、全原门槛内；319stderr未分类、EOFnative0），role03复算V2 3421fdb7（119500/119900ms、45239msabort、22观测、DOM终态21一致；非完整赛）。新slice另经已配置qwen3.7-flash-2026-07-15干净上下文审查4154e3df通过，仅审函数差异。前三次取证脚本失败/别名与JSON解析问题均保留，不算有效审核；不把Root复算冒充新Codex副审。main09 normal首场FINISHED298/24formal/ASR7/34archive diff0/5strict+2短FREE N/A/6owner0，原件c178f318。当前第二weaknet比赛ea1746c9-ae42-4c16-85a2-6b67e8719a7a RUNNING，最后一次根句柄72637确认为live，第三及globalEOF未完成。V7九证据依赖c52050d6仅broker缺失，尚无QUALIFICATION_REVIEW_V7、生产包、发布或提交。
+
+- 最终e290 full09三场全部自然完赛：normal298/24formal、weaknet293/23formal、recovery316/24formal及3RESET旧尝试；原120/90秒真人、双方四辩、末主持、唯一FINISHED、双SPECTATOR正式DOM与只读SQL ID/textSHA一致，归档34/33/33源样本差0。所有owned/pending/native0、243源前后同、进程EOF完整。独立角色positive03与long09另列，不能冒充全程浏览器辩手或物理设备。
+- 最终九证据审核17b9e566通过，含新的configured-Qwen clean-context审查与Root实际SHA/DOM/独立只读QA SQL复算；最初范围异议和澄清原件均保留。后台1742、标准纯2206有重叠，不相加。生产check-only最初拒绝自生字节码和错误cwd，纠正wrapper后17180594通过；未改变业务工具。受保护发布已启动，安装后原三场/源码125与49migration/五分钟健康仍待实际完成，不计已发布验收。
+
+- Spec307现已实际发布20261016-spec307-e290fab2/schema48：manifest3d2dc1af、原始server report c0e977c0；历史112房间/95比赛/1336发言及冻结快照保持。完整125源/49migration/immutable4、SDK1.1.20/LinuxWebP1、原配置、备份SHA只读核验通过4d0d772f。首次V7失败在停服/数据库写入前；Root修正部署工具实际账号UID996与Next依赖Sharp路径，保留wrongroot/missingnative拒绝，132控制及真实同机红绿/独审通过。新工具db16af09，业务候选243与Web tar未变。安装后隔离原三场21328和五分钟健康22900仍运行，待自然完赛/attestation/EOF后才完成任务；未提交Git。
+
+- Spec307发布后健康完成：11点/302.229秒，生产三PID保持594912/594914/595325、重启0、HTTP200/schema48/SDK1.1.20/WebP1；收据90af2c2f，逐点复算027d643f。安装后隔离原三场仍运行（首场已到正方四辩），不是全部完成。
+
+- 安装后V8前两场通过（normal286/23formal；weaknet307/24formal、WS2秒/RTC392ms/ASR断流均sameSpeech、archive diff0/owners0）。第三场在真实三辩460字/90000ms、代次4成功后，自由辩论时浏览器见证出现长更新间隔、WS重连及20秒收敛超时；整组失败保留，不能计通过。远端5次真人ASR均SUCCEEDED、已进seq93FREE_SELECTING，收尾Core/PG/LK与pending/native0；随后旧SSH隧道退出255。生产原PID/0重启/ready200/无OOM。暂不把测试连接与预期快照滞后推断写成唯一归因。追加仅QA的64条脱敏状态码/传输/可见性/预期ID+SHA观测，44控制/单测试收集/逆移除旧字节恢复/独立审查通过；严格比对及20/45秒门槛未变，业务243、已发布Web和179adapter均不变。V9以新SSH和临时防休眠正在完整重跑原三场，安装后验收与Git提交仍未完成。
+
+- 用户确认本次测试连接中断由本人关闭网络造成，按外部测试中断记录，不计新系统异常。V9正常场已FINISHED289/23formal并复算；弱网场中断，不能计通过；最终Core/PG/LiveKit均关闭、pending/native0。V10在网络恢复后以同一已发布代码、同一179adapter和原三场/全部门槛重跑，仅保留既有旁路观测与本次防休眠。05:16UTC生产三服务原PID保持、0重启、ready200；没有重新发布、切模型或修改业务代码。安装后完整验收和Git提交仍待完成。

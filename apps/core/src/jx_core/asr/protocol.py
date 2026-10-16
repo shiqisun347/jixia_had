@@ -111,6 +111,10 @@ class FunAsrConnection:
     def take_capture(self, task_id: UUID) -> ProviderCallCapture | None:
         return self._captures.pop(task_id, None)
 
+    @property
+    def model_id(self) -> str:
+        return self._model
+
     async def close(self) -> None:
         self._retirement_epoch += 1
         socket, self._socket = self._socket, None
@@ -150,6 +154,12 @@ class FunAsrConnection:
         self._require_owner(owner_epoch)
         try:
             raw = await socket.recv()
+        except FunAsrError:
+            self._require_owner(owner_epoch)
+            raise
+        except Exception as error:
+            self._require_owner(owner_epoch)
+            raise FunAsrError("asr_stream_failed") from error
         except BaseException:
             self._require_owner(owner_epoch)
             raise
@@ -163,7 +173,11 @@ class FunAsrConnection:
         on_sentence: SentenceCallback,
         on_started: StartedCallback | None = None,
         task_id: UUID | None = None,
+        task_timeout_seconds: float | None = None,
+        final_deadline: Callable[[], float | None] | None = None,
     ) -> SegmentResult:
+        if task_timeout_seconds is not None and task_timeout_seconds <= 0:
+            raise ValueError("ASR task timeout must be positive")
         owner_epoch = self._retirement_epoch
         async with self._lock:
             self._require_owner(owner_epoch)
@@ -183,7 +197,14 @@ class FunAsrConnection:
             audio_frames = 0
             audio_bytes = 0
             loop = asyncio.get_running_loop()
-            task_deadline = loop.time() + self._task_timeout_seconds
+            task_deadline = loop.time() + (
+                self._task_timeout_seconds if task_timeout_seconds is None else task_timeout_seconds
+            )
+
+            def effective_deadline() -> float:
+                closing = final_deadline() if final_deadline is not None else None
+                return min(task_deadline, closing) if closing is not None else task_deadline
+
             socket: WebSocketLike | None = None
             sender: asyncio.Task[None] | None = None
             receive_task: asyncio.Task[str | bytes] | None = None
@@ -192,14 +213,17 @@ class FunAsrConnection:
                     socket = await asyncio.wait_for(
                         self._ensure_socket(owner_epoch),
                         timeout=min(
-                            self._start_timeout_seconds, max(0.0, task_deadline - loop.time())
+                            self._start_timeout_seconds,
+                            max(0.0, effective_deadline() - loop.time()),
                         ),
                     )
                 except TimeoutError as error:
                     self._require_owner(owner_epoch)
                     raise FunAsrError("asr_start_timeout") from error
                 self._require_owner(owner_epoch)
-                start_deadline = min(task_deadline, loop.time() + self._start_timeout_seconds)
+                start_deadline = min(
+                    effective_deadline(), loop.time() + self._start_timeout_seconds
+                )
                 await self._send_with_timeout(
                     socket,
                     json.dumps(run_task, ensure_ascii=False),
@@ -230,7 +254,7 @@ class FunAsrConnection:
                                 socket,
                                 chunk,
                                 owner_epoch=owner_epoch,
-                                timeout_seconds=max(0.0, task_deadline - loop.time()),
+                                timeout_seconds=max(0.0, effective_deadline() - loop.time()),
                                 timeout_code="asr_audio_timeout",
                             )
                         self._require_owner(owner_epoch)
@@ -247,7 +271,7 @@ class FunAsrConnection:
                             socket,
                             json.dumps(finish_event),
                             owner_epoch=owner_epoch,
-                            timeout_seconds=max(0.0, task_deadline - loop.time()),
+                            timeout_seconds=max(0.0, effective_deadline() - loop.time()),
                             timeout_code="asr_audio_timeout",
                         )
                         finish_sent_at = loop.time()
@@ -270,10 +294,12 @@ class FunAsrConnection:
                             raise sender_error
                     now = loop.time()
                     if finish_sent_at is not None:
-                        deadline = min(task_deadline, finish_sent_at + self._final_timeout_seconds)
+                        deadline = min(
+                            effective_deadline(), finish_sent_at + self._final_timeout_seconds
+                        )
                         code = "asr_final_timeout"
                     else:
-                        deadline = task_deadline
+                        deadline = effective_deadline()
                         code = "asr_audio_timeout"
                     timeout = deadline - now
                     if timeout <= 0:
@@ -335,7 +361,7 @@ class FunAsrConnection:
                                 == "result-generated"
                             ):
                                 received_events[-1] = message
-                        callback_timeout = task_deadline - loop.time()
+                        callback_timeout = effective_deadline() - loop.time()
                         if callback_timeout <= 0:
                             raise FunAsrError("asr_callback_timeout")
                         try:

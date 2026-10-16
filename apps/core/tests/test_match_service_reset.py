@@ -27,13 +27,9 @@ from jx_core.runtime_identity import CallbackEnvelope
 
 
 def test_late_opportunity_lookup_is_source_bounded() -> None:
-    statement = _active_opportunity_for_source_query(
-        match_id=uuid4(), source_speech_id=uuid4()
-    )
+    statement = _active_opportunity_for_source_query(match_id=uuid4(), source_speech_id=uuid4())
     sql = str(
-        statement.compile(
-            dialect=postgresql_dialect(), compile_kwargs={"literal_binds": True}
-        )
+        statement.compile(dialect=postgresql_dialect(), compile_kwargs={"literal_binds": True})
     )
 
     assert "LIMIT 1" in sql
@@ -58,7 +54,6 @@ class ResetRecorder:
         self.calls.append(("decision", match_id))
 
 
-
 class PresenceSpeechRecorder(ResetRecorder):
     def __init__(self) -> None:
         super().__init__()
@@ -71,7 +66,13 @@ class PresenceSpeechRecorder(ResetRecorder):
         await self.allow_pause.wait()
 
     async def start_speech(
-        self, match_id: object, speech_id: object, user_id: object, envelope: object
+        self,
+        match_id: object,
+        speech_id: object,
+        user_id: object,
+        envelope: object,
+        *,
+        max_audio_duration_ms: int = 180_000,
     ) -> None:
         self.calls.append(("start", match_id, speech_id, user_id, envelope))
 
@@ -87,7 +88,13 @@ class StartSpeechRecorder(ResetRecorder):
         self.block = False
 
     async def start_speech(
-        self, match_id: object, speech_id: object, user_id: object, envelope: object
+        self,
+        match_id: object,
+        speech_id: object,
+        user_id: object,
+        envelope: object,
+        *,
+        max_audio_duration_ms: int = 180_000,
     ) -> None:
         self.starts.append((match_id, speech_id, user_id, envelope))
         if self.error is not None:
@@ -95,7 +102,9 @@ class StartSpeechRecorder(ResetRecorder):
         if self.block:
             await asyncio.Event().wait()
 
-    async def finish_speech(self, match_id: object, speech_id: object) -> None:
+    async def finish_speech(
+        self, match_id: object, speech_id: object, *, deadline_mono: float | None = None
+    ) -> None:
         return
 
     async def pause_speech(self, match_id: object, speech_id: object) -> None:
@@ -150,9 +159,7 @@ async def test_manager_starts_asr_once_after_actor_idempotency_check() -> None:
     actor = _human_ready_actor(manager, match_id, speaker_id)
     await actor.start()
     manager._actors[match_id] = actor
-    command = MatchCommand(
-        type="speech.start", message_id="start-once", actor_user_id=speaker_id
-    )
+    command = MatchCommand(type="speech.start", message_id="start-once", actor_user_id=speaker_id)
     try:
         first = await manager.submit(match_id, command)
         duplicate = await manager.submit(match_id, command)
@@ -221,9 +228,7 @@ async def test_manager_keeps_human_ready_when_asr_start_fails_then_allows_retry(
         runtime.error = None
         retried = await manager.submit(
             match_id,
-            MatchCommand(
-                type="speech.start", message_id="start-retry", actor_user_id=speaker_id
-            ),
+            MatchCommand(type="speech.start", message_id="start-retry", actor_user_id=speaker_id),
         )
         assert retried.state.action_state == "HUMAN_SPEAKING"
         assert len(runtime.starts) == 2
@@ -461,24 +466,33 @@ def test_terminal_room_end_time_uses_match_boundary_and_is_idempotent() -> None:
     match_end = datetime(2026, 10, 13, 1, 2, 3, tzinfo=UTC)
     fallback = datetime(2026, 10, 13, 1, 2, 4, tzinfo=UTC)
 
-    assert _terminal_room_end_at(
-        match_status="FINISHED",
-        current_room_end=None,
-        match_end=match_end,
-        now=fallback,
-    ) == match_end
-    assert _terminal_room_end_at(
-        match_status="TERMINATED",
-        current_room_end=match_end,
-        match_end=fallback,
-        now=fallback,
-    ) == match_end
-    assert _terminal_room_end_at(
-        match_status="RUNNING",
-        current_room_end=None,
-        match_end=match_end,
-        now=fallback,
-    ) is None
+    assert (
+        _terminal_room_end_at(
+            match_status="FINISHED",
+            current_room_end=None,
+            match_end=match_end,
+            now=fallback,
+        )
+        == match_end
+    )
+    assert (
+        _terminal_room_end_at(
+            match_status="TERMINATED",
+            current_room_end=match_end,
+            match_end=fallback,
+            now=fallback,
+        )
+        == match_end
+    )
+    assert (
+        _terminal_room_end_at(
+            match_status="RUNNING",
+            current_room_end=None,
+            match_end=match_end,
+            now=fallback,
+        )
+        is None
+    )
 
 
 def test_late_experiment_round_fence_is_bounded_and_match_scoped() -> None:
@@ -568,7 +582,10 @@ async def test_manager_evicts_terminal_actor_after_retention_window(
 
 
 @pytest.mark.asyncio
-async def test_manager_serializes_current_speaker_asr_pause_before_rapid_resume() -> None:
+async def test_manager_serializes_current_speaker_asr_pause_before_rapid_resume(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("jx_core.matches.service.SPEECH_MEDIA_RECOVERY_GRACE_SECONDS", 0)
     match_id = uuid4()
     speaker_id = uuid4()
     speech_id = uuid4()
@@ -620,7 +637,10 @@ async def test_manager_serializes_current_speaker_asr_pause_before_rapid_resume(
 
 
 @pytest.mark.asyncio
-async def test_manager_does_not_pause_asr_twice_for_higher_epoch_offline() -> None:
+async def test_manager_does_not_pause_asr_twice_for_higher_epoch_offline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("jx_core.matches.service.SPEECH_MEDIA_RECOVERY_GRACE_SECONDS", 0)
     match_id = uuid4()
     speaker_id = uuid4()
     speech_id = uuid4()
@@ -715,6 +735,9 @@ async def test_manager_ignores_late_asr_failure_for_offline_current_speaker() ->
     speaker_id = uuid4()
     speech_id = uuid4()
     manager = MatchRuntimeManager(cast(Any, None))
+    # The disconnected input owner has been retired; offline status alone is
+    # no longer permission to discard a current finalizer failure (Spec307).
+    manager._asr_callback_is_current = AsyncMock(return_value=False)
     actor = MatchActor(
         MatchRuntimeState(
             match_id=match_id,
@@ -750,7 +773,7 @@ async def test_manager_ignores_late_asr_failure_for_offline_current_speaker() ->
 
 
 @pytest.mark.asyncio
-async def test_manager_does_not_reset_finished_free_turn_on_late_asr_failure() -> None:
+async def test_manager_free_turn_exhausted_asr_failure_preserves_source_for_recovery() -> None:
     match_id = uuid4()
     speaker_id = uuid4()
     speech_id = uuid4()
@@ -811,9 +834,13 @@ async def test_manager_does_not_reset_finished_free_turn_on_late_asr_failure() -
             ),
             code="asr_stream_failed",
         )
-        assert speech.status == "FAILED"
-        assert actor.state.action_state == "SPEECH_FINALIZING"
+        # This fixture has no database commit hook. Durable FAILED persistence
+        # is covered by the real-PG recovery controls, while the actual Actor
+        # must stop rather than silently proceed with missing source text.
+        assert actor.state.status == "ERROR"
+        assert actor.state.action_state == "RECOVERY_REQUIRED"
         assert actor.state.current_speech_id == speech_id
+        assert actor.state.asr_failed_speech_id == speech_id
     finally:
         await manager.close()
 

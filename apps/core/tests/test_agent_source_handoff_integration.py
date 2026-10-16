@@ -38,7 +38,7 @@ pytestmark = pytest.mark.integration
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("source_terminal", ["FINALIZED", "FAILED"])
-async def test_held_source_then_actual_agent_finishes_with_committed_context(
+async def test_held_source_success_releases_agent_and_failure_requires_recovery(
     agent_fault_probe: AgentFaultProbe,
     monkeypatch: pytest.MonkeyPatch,
     source_terminal: str,
@@ -55,7 +55,7 @@ async def test_held_source_then_actual_agent_finishes_with_committed_context(
     sources: list[RecoverySource] = []
 
     async def stream_chat(**values: Any) -> LlmStreamResult:
-        if values["max_tokens"] == 32:
+        if "自由辩论快速决策" in values["messages"][-1]["content"]:
             return LlmStreamResult('{"should_speak":false,"decision_reason":"已有回应"}', 1, 2, 8)
         body_requests.append(json.loads(values["messages"][-1]["content"]))
         await values["on_delta"]("这是依据已完成对方发言的合成回应。")
@@ -172,6 +172,31 @@ async def test_held_source_then_actual_agent_finishes_with_committed_context(
         await probe.manager.handle_asr_failure(
             envelope=envelopes[source_id], code="asr_task_failed"
         )
+        assert probe.actor.state.status == "ERROR"
+        assert probe.actor.state.action_state == "RECOVERY_REQUIRED"
+        assert probe.actor.state.asr_failed_speech_id == source_id
+        await probe.manager.submit(
+            match_id,
+            MatchCommand(
+                "match.resume",
+                "cannot-bypass-missing-source",
+                payload={"privileged": True, "reasons": []},
+            ),
+        )
+        assert probe.actor.state.status == "ERROR"
+        await asyncio.sleep(0.05)
+        assert not body_requests and not sources and match_id not in probe.runtime._runs
+        async with probe.factory() as session:
+            source = await session.get(Speech, source_id)
+            match = await session.get(Match, match_id)
+            assert source is not None and source.status == "FAILED" and source.user_id == first
+            assert match is not None and match.context_version == context_before
+            assert not (
+                await session.scalars(
+                    select(AgentGeneration).where(AgentGeneration.match_id == match_id)
+                )
+            ).all()
+        return  # Only an explicit bounded ASR retry/reset may release the next body.
     await wait_for_condition(lambda: bool(sources and sources[0].closed), timeout=3)
     await wait_for_condition(lambda: match_id not in probe.runtime._runs, timeout=3)
     expected_context = context_before + (source_terminal == "FINALIZED")
@@ -185,9 +210,7 @@ async def test_held_source_then_actual_agent_finishes_with_committed_context(
         )
     else:
         assert body_requests[0]["source_speech"] is None
-        assert all(
-            item["speech_id"] != str(source_id) for item in body_requests[0]["history"]
-        )
+        assert all(item["speech_id"] != str(source_id) for item in body_requests[0]["history"])
     assert sources[0].frames
     assert probe.actor.state.status == "RUNNING"
     assert probe.actor.state.action_state == "FREE_SELECTING"

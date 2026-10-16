@@ -4008,7 +4008,7 @@ export interface components {
             /** Opportunity Id */
             opportunity_id: string | null;
             /** Selection Phase */
-            selection_phase: ("COMPETING" | "HUMAN_ONLY_WAIT" | "ALLOCATED") | null;
+            selection_phase: ("COMPETING" | "MODEL_WAIT" | "HUMAN_ONLY_WAIT" | "ALLOCATED") | null;
             /** Selection Remaining Ms */
             selection_remaining_ms: number | null;
         };
@@ -4437,7 +4437,7 @@ export interface components {
              * Action
              * @enum {string}
              */
-            action: "pause" | "terminate" | "resume" | "recover" | "reset_speech" | "reset_stage" | "skip_speech" | "cancel_skip";
+            action: "pause" | "terminate" | "resume" | "recover" | "reset_speech" | "reset_stage" | "skip_speech" | "cancel_skip" | "retry_asr";
             /** Expected Action Key */
             expected_action_key?: string | null;
             /** Expected Context Version */
@@ -4461,6 +4461,11 @@ export interface components {
             can_reset_speech: boolean;
             /** Can Reset Stage */
             can_reset_stage: boolean;
+            /**
+             * Can Retry Asr
+             * @default false
+             */
+            can_retry_asr: boolean;
             /** Can Skip Speech */
             can_skip_speech: boolean;
             /** Context Version */
@@ -4523,6 +4528,11 @@ export interface components {
             agent_hand_queue: string[];
             /** Agent Selection Mode */
             agent_selection_mode: ("VOLUNTEER" | "FALLBACK" | "ALL_AGENT_SKIP_RANDOM") | null;
+            /**
+             * Context Version
+             * @default 0
+             */
+            context_version: number;
             /** Countdown Remaining Ms */
             countdown_remaining_ms: number | null;
             current_action: components["schemas"]["MatchActionResponse"] | null;
@@ -4574,6 +4584,7 @@ export interface components {
             offline_user_id: string | null;
             /** Pause Initiator User Id */
             pause_initiator_user_id: string | null;
+            pending_source?: components["schemas"]["PendingSpeechSourceResponse"] | null;
             /** Resume Reasons */
             resume_reasons?: string[];
             /**
@@ -4896,6 +4907,28 @@ export interface components {
             /** Side */
             side: string;
         };
+        /** PendingSpeechSourceResponse */
+        PendingSpeechSourceResponse: {
+            /** Seat No */
+            seat_no: number;
+            /** Side */
+            side: string;
+            /**
+             * Speaker Kind
+             * @enum {string}
+             */
+            speaker_kind: "HUMAN" | "AGENT";
+            /**
+             * Speech Id
+             * Format: uuid
+             */
+            speech_id: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "STARTED" | "FINALIZING" | "FAILED";
+        };
         /** PermanentFilesUpdate */
         PermanentFilesUpdate: {
             /** Permanent */
@@ -5039,6 +5072,11 @@ export interface components {
              * @default true
              */
             auto_fill_agents: boolean;
+            /**
+             * Conference Roster
+             * @default false
+             */
+            conference_roster: boolean;
             /** Custom Topic Title */
             custom_topic_title?: string | null;
             /** Human Participation Terms Version */

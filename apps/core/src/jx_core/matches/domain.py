@@ -166,11 +166,16 @@ class MatchRuntimeState:
     opportunity_id: UUID | None = None
     allocated_opportunity_id: UUID | None = None
     opportunity_generation: int = 0
-    selection_phase: Literal["COMPETING", "HUMAN_ONLY_WAIT", "ALLOCATED"] | None = None
+    selection_phase: Literal["COMPETING", "MODEL_WAIT", "HUMAN_ONLY_WAIT", "ALLOCATED"] | None = (
+        None
+    )
     agent_effective_status: (
         Literal["WAITING", "DECIDING", "RAISE", "SKIP", "TECHNICAL_MISSING"] | None
     ) = None
     selection_deadline_mono: float | None = None
+    source_ended_mono: float | None = None
+    decision_context_ready_mono: float | None = None
+    agent_decision_deadline_mono: float | None = None
     selection_remaining_ms: int | None = None
     human_wait_deadline_mono: float | None = None
     human_wait_remaining_ms: int | None = None
@@ -181,6 +186,7 @@ class MatchRuntimeState:
     offline_since_ms: tuple[tuple[UUID, int], ...] = ()
     connection_epochs: tuple[tuple[UUID, int], ...] = ()
     error_code: str | None = None
+    asr_failed_speech_id: UUID | None = None
 
     @property
     def free_competition_enabled(self) -> bool:
@@ -216,6 +222,9 @@ class MatchCommand:
     host_guard_id: UUID | None = field(default=None, repr=False)
     agent_callback_envelope: CallbackEnvelope | None = field(default=None, repr=False)
     agent_logical_call_id: UUID | None = field(default=None, repr=False)
+    asr_callback_envelope: CallbackEnvelope | None = field(default=None, repr=False)
+    asr_deadline_mono: float | None = field(default=None, repr=False)
+    asr_recording_recovery: bool = field(default=False, repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +254,8 @@ CommitHook = Callable[
     Awaitable[None],
 ]
 PublishHook = Callable[[MatchRuntimeState, tuple[MatchEvent, ...]], Awaitable[None]]
+CommandPrepareHook = Callable[[MatchRuntimeState, MatchCommand], Awaitable[MatchCommand]]
+
 PreCommitHook = Callable[
     [MatchRuntimeState, MatchRuntimeState, tuple[MatchEvent, ...], MatchCommand],
     Awaitable[None],
@@ -454,6 +465,7 @@ class MatchActor:
         commit: CommitHook | None = None,
         publish: PublishHook | None = None,
         pre_commit: PreCommitHook | None = None,
+        prepare_command: CommandPrepareHook | None = None,
         idempotency_size: int = 256,
     ) -> None:
         self.state: MatchRuntimeState = state
@@ -464,6 +476,7 @@ class MatchActor:
         self._commit = commit
         self._publish = publish
         self._pre_commit = pre_commit
+        self._prepare_command = prepare_command
         self._idempotency_size = idempotency_size
         self._idempotency: OrderedDict[str, MatchCommandResult] = OrderedDict()
         self._runner: asyncio.Task[None] | None = None
@@ -532,6 +545,10 @@ class MatchActor:
             raise MatchDomainError("match_actor_busy") from error
         return await future
 
+    def agent_decision_remaining_seconds(self, state: MatchRuntimeState | None = None) -> float:
+        deadline = (state or self.state).agent_decision_deadline_mono
+        return max(0.0, deadline - self._clock()) if deadline is not None else 30.0
+
     def view(self) -> MatchRuntimeView:
         """Return effective display timing without mutating runtime state."""
 
@@ -595,13 +612,21 @@ class MatchActor:
             ),
         )
 
-    async def set_interim_text(self, text: str, *, speech_id: UUID) -> bool:
+    async def set_interim_text(
+        self,
+        text: str,
+        *,
+        speech_id: UUID,
+        owner_is_current: Callable[[], bool] | None = None,
+    ) -> bool:
         """Update transient ASR/agent text without advancing match state."""
         # A command may currently be awaiting its database commit. Updating
         # state during that window would be overwritten by candidate_state
         # when the commit completes. Wait for the Actor transaction boundary.
         while self._processing:
             await asyncio.sleep(0)
+        if owner_is_current is not None and not owner_is_current():
+            return False
         if (
             self.state.status != "RUNNING"
             or self.state.action_state
@@ -641,8 +666,15 @@ class MatchActor:
                 "stage.reset",
                 "speech.reset",
                 "speech.skip.begin",
+                "asr.retry.begin",
             }:
-                kind = "speech.skip" if command.type == "speech.skip.begin" else command.type
+                kind = (
+                    "speech.skip"
+                    if command.type == "speech.skip.begin"
+                    else "asr.retry"
+                    if command.type == "asr.retry.begin"
+                    else command.type
+                )
                 _, duplicate = self._emergency_target(command, kind)
                 if not duplicate:
                     raise MatchDomainError("stale_callback")
@@ -656,6 +688,10 @@ class MatchActor:
             "speech.skip.complete",
             "speech.skip.fail",
             "speech.skip.cancel",
+            "asr.retry.begin",
+            "asr.failed",
+            "asr.finalized",
+            "asr.retry.failed",
         }
         operator_reset = command.type == "speech.reset" and bool(
             command.payload.get("operation_id")
@@ -668,7 +704,12 @@ class MatchActor:
                 "speech.skip.complete",
                 "speech.skip.fail",
                 "speech.skip.cancel",
+                "asr.failed",
+                "asr.finalized",
+                "asr.retry.failed",
+                "match.pause",
                 "match.terminate",
+                "system.recover",
             }
             and not (
                 command.type == "speech.skip.begin"
@@ -682,6 +723,8 @@ class MatchActor:
             not in (
                 "match.terminate",
                 "match.resume",
+                "match.pause",
+                "system.recover",
             )
             and command.type not in emergency_commands
             and not operator_reset
@@ -692,17 +735,24 @@ class MatchActor:
             and command.type
             not in (
                 "match.resume",
+                "match.pause",
                 "resume.elapsed",
                 "match.terminate",
                 "member.online",
+                "system.recover",
             )
             and command.type not in emergency_commands
             and not operator_reset
         ):
             raise MatchDomainError("match_not_running")
+        if self._prepare_command is not None:
+            command = await self._prepare_command(self.state, command)
         handlers = {
             "system.recover": self._system_recover,
             "system.error": self._system_error,
+            "asr.failed": self._asr_failed,
+            "asr.retry.begin": self._asr_retry_begin,
+            "asr.retry.failed": self._asr_retry_failed,
             "runtime.start": self._runtime_start,
             "countdown.elapsed": self._countdown_elapsed,
             "host.elapsed": self._host_elapsed,
@@ -710,6 +760,7 @@ class MatchActor:
             "preparation.elapsed": self._preparation_elapsed,
             "human.start_timeout": self._human_start_timeout,
             "speech.start": self._speech_start,
+            "speech.media_ready": self._speech_media_ready,
             "speech.finish": self._speech_finish,
             "speech.deadline": self._speech_deadline,
             "asr.finalized": self._asr_finalized,
@@ -1229,6 +1280,16 @@ class MatchActor:
         )
         self.state = replace(
             self.state,
+            source_ended_mono=self._clock() if start_deadline else self.state.source_ended_mono,
+            decision_context_ready_mono=self._clock(),
+            agent_decision_deadline_mono=(
+                max(
+                    self.state.source_ended_mono + 3.0,
+                    min(self._clock() + 8.0, self.state.source_ended_mono + 30.0),
+                )
+                if self.state.source_ended_mono is not None and not start_deadline
+                else self._clock() + 8.0
+            ),
             agent_decision_round_id=round_id,
             agent_decisions=decisions,
             agent_hand_queue=(),
@@ -1248,7 +1309,9 @@ class MatchActor:
                 else self.state.opportunity_generation
             ),
             selection_phase=(
-                "COMPETING" if self.state.free_competition_enabled else self.state.selection_phase
+                ("MODEL_WAIT" if self.state.selection_phase == "MODEL_WAIT" else "COMPETING")
+                if self.state.free_competition_enabled
+                else self.state.selection_phase
             ),
             agent_effective_status=(
                 "DECIDING"
@@ -1304,6 +1367,9 @@ class MatchActor:
         self.state = replace(
             self.state,
             free_source_speech_id=source_speech_id,
+            source_ended_mono=None,
+            decision_context_ready_mono=None,
+            agent_decision_deadline_mono=None,
             free_holder_side=side,
             opportunity_id=opportunity_id,
             opportunity_generation=self.state.opportunity_generation + 1,
@@ -1337,7 +1403,7 @@ class MatchActor:
     def _free_agent_decision_start(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
         if (
             not self.state.free_competition_enabled
-            or self.state.selection_phase != "COMPETING"
+            or self.state.selection_phase not in {"COMPETING", "MODEL_WAIT"}
             or self.state.opportunity_id is None
             or str(command.payload.get("opportunity_id")) != str(self.state.opportunity_id)
             or int(command.payload.get("opportunity_generation", -1))
@@ -1349,17 +1415,21 @@ class MatchActor:
         side = self.state.free_holder_side
         if side is None:
             raise MatchDomainError("match_state_conflict")
-        return (
-            self._start_free_agent_decisions(
-                side,
-                trigger_kind=cast(
-                    Literal["HUMAN_SPEECH", "AGENT_SPEECH", "SAME_SIDE_CONTINUATION"],
-                    command.payload.get("trigger_kind", "HUMAN_SPEECH"),
-                ),
-                source_speech_id=(_payload_uuid(command.payload.get("source_speech_id"))),
-                start_deadline=False,
+        cap = self.state.source_ended_mono
+        if cap is not None and self._clock() >= cap + 30.0:
+            raise MatchDomainError("stale_callback")
+        event = self._start_free_agent_decisions(
+            side,
+            trigger_kind=cast(
+                Literal["HUMAN_SPEECH", "AGENT_SPEECH", "SAME_SIDE_CONTINUATION"],
+                command.payload.get("trigger_kind", "HUMAN_SPEECH"),
             ),
+            source_speech_id=_payload_uuid(command.payload.get("source_speech_id")),
+            start_deadline=False,
         )
+        if self.state.selection_phase == "MODEL_WAIT":
+            return event, self._enter_model_wait()
+        return (event,)
 
     def _agent_tie_break(self, agent_profile_id: UUID) -> int:
         """Return a round-specific stable pseudo-random tie-break value.
@@ -1452,7 +1522,10 @@ class MatchActor:
             ),
             self._queue_snapshot_event("HUMAN_RAISED"),
         )
-        if self.state.free_competition_enabled and self.state.selection_phase == "HUMAN_ONLY_WAIT":
+        if self.state.free_competition_enabled and self.state.selection_phase in {
+            "HUMAN_ONLY_WAIT",
+            "MODEL_WAIT",
+        }:
             return (*events, *self._select_free_human(command.actor_user_id, side))
         return events
 
@@ -1473,6 +1546,40 @@ class MatchActor:
                 },
             ),
             self._queue_snapshot_event("HUMAN_CANCELLED"),
+        )
+
+    def _enter_model_wait(self) -> MatchEvent:
+        end = self.state.source_ended_mono
+        deadline = self.state.agent_decision_deadline_mono
+        if end is None:
+            end = (self.state.selection_deadline_mono or self._clock()) - 3.0
+        if deadline is None:
+            deadline = (
+                min(self.state.decision_context_ready_mono + 8.0, end + 30.0)
+                if self.state.decision_context_ready_mono is not None
+                else end + 30.0
+            )
+        remaining = max(0.0, deadline - self._clock())
+        self.state = replace(
+            self.state,
+            selection_phase="MODEL_WAIT",
+            hand_window_open=True,
+            source_ended_mono=end,
+            agent_decision_deadline_mono=deadline,
+            selection_deadline_mono=deadline,
+            selection_remaining_ms=round(remaining * 1000),
+        )
+        self._schedule_internal(
+            remaining,
+            "hand.window_closed",
+            f"internal:model-wait:{self.state.opportunity_id}:{self.state.agent_decision_round_id}",
+        )
+        return self._event(
+            "free.model_wait_started",
+            {
+                "opportunity_id": _uuid_text(self.state.opportunity_id),
+                "duration_ms": round(remaining * 1000),
+            },
         )
 
     def _hand_window_closed(self, _: MatchCommand) -> tuple[MatchEvent, ...]:
@@ -1510,6 +1617,15 @@ class MatchActor:
             if self.state.action_state != "FREE_SELECTING":
                 return released
         if self.state.free_competition_enabled:
+            if self.state.hand_queue:
+                side = str(self.state.free_holder_side)
+                return (*released, *self._select_free_human(self.state.hand_queue[0], side))
+            pending = any(item.status == "DECIDING" for item in self.state.agent_decisions) or (
+                not self.state.agent_decisions and self.state.agent_effective_status == "WAITING"
+            )
+            deadline = self.state.agent_decision_deadline_mono
+            if pending and (deadline is None or self._clock() < deadline):
+                return (*released, self._enter_model_wait())
             timed_out = any(item.status == "DECIDING" for item in self.state.agent_decisions) or (
                 not self.state.agent_decisions and self.state.agent_effective_status == "WAITING"
             )
@@ -1536,7 +1652,7 @@ class MatchActor:
     def _free_agent_decision_result(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
         if self.state.action_state != "FREE_SELECTING" and not (
             self.state.free_competition_enabled
-            and self.state.selection_phase == "COMPETING"
+            and self.state.selection_phase in {"COMPETING", "MODEL_WAIT"}
             and self.state.action_state
             in {
                 "HOST_ANNOUNCING",
@@ -1546,6 +1662,12 @@ class MatchActor:
                 "AGENT_SPEAKING",
                 "AGENT_FINALIZING",
             }
+        ):
+            raise MatchDomainError("stale_callback")
+        if (
+            self.state.free_competition_enabled
+            and self.state.agent_decision_deadline_mono is not None
+            and self._clock() >= self.state.agent_decision_deadline_mono
         ):
             raise MatchDomainError("stale_callback")
         action = self.state.current_action
@@ -1642,6 +1764,10 @@ class MatchActor:
             },
         )
         reordered = self._queue_snapshot_event("AGENT_DECISION_COMPLETED")
+        if self.state.selection_phase == "MODEL_WAIT" and not any(
+            item.status == "DECIDING" for item in updated
+        ):
+            self.state = replace(self.state, hand_window_open=False)
         return (progress, reordered, *self._lock_free_selection_if_ready())
 
     def _lock_free_selection_if_ready(self) -> tuple[MatchEvent, ...]:
@@ -2312,6 +2438,15 @@ class MatchActor:
             self.state = replace(
                 self.state,
                 selection_deadline_mono=self._clock() + 3.0,
+                source_ended_mono=self._clock(),
+                agent_decision_deadline_mono=(
+                    max(
+                        self._clock() + 3.0,
+                        min(self.state.decision_context_ready_mono + 8.0, self._clock() + 30.0),
+                    )
+                    if self.state.decision_context_ready_mono is not None
+                    else self._clock() + 30.0
+                ),
                 selection_remaining_ms=3_000,
             )
             self._schedule_internal(
@@ -2365,6 +2500,15 @@ class MatchActor:
             self.state = replace(
                 self.state,
                 selection_deadline_mono=self._clock() + 3.0,
+                source_ended_mono=self._clock(),
+                agent_decision_deadline_mono=(
+                    max(
+                        self._clock() + 3.0,
+                        min(self.state.decision_context_ready_mono + 8.0, self._clock() + 30.0),
+                    )
+                    if self.state.decision_context_ready_mono is not None
+                    else self._clock() + 30.0
+                ),
                 selection_remaining_ms=3_000,
             )
             self._schedule_internal(
@@ -2382,6 +2526,46 @@ class MatchActor:
         return (event,)
 
     def _asr_finalized(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
+        operation = self.state.emergency_operation
+        if (
+            operation
+            and operation.get("kind") == "asr.retry"
+            and operation.get("status") == "PENDING"
+        ):
+            speech_id = self.state.asr_failed_speech_id
+            if speech_id is None or str(command.payload.get("speech_id")) != str(speech_id):
+                raise MatchDomainError("stale_callback")
+            operation = {**operation, "status": "SUCCEEDED"}
+            was_current = self.state.current_speech_id == speech_id
+            restored = self.state.paused_from_action_state or "HUMAN_READY_TO_START"
+            self.state = replace(
+                self.state, asr_failed_speech_id=None, emergency_operation=operation
+            )
+            if was_current:
+                self.state = replace(self.state, status="RUNNING", action_state="SPEECH_FINALIZING")
+                action = self.state.current_action
+                events = (
+                    self._finish_free_turn("speech.finished", dict(command.payload))
+                    if action is not None and action.action_kind == "FREE_DEBATE"
+                    else self._advance_action("speech.finished", dict(command.payload))
+                )
+                if self.state.status not in {"FINISHED", "TERMINATED"}:
+                    self._paused_recovery(self.state.action_state)
+            else:
+                self.state = replace(
+                    self.state,
+                    status="PAUSED",
+                    action_state="RECOVERY_REQUIRED",
+                    paused_from_action_state=restored,
+                )
+                events = (self._event("speech.finished", dict(command.payload)),)
+            return (
+                *events,
+                self._event(
+                    "asr.retry.completed",
+                    {"speech_id": str(speech_id), "operation_id": operation["id"]},
+                ),
+            )
         if self.state.action_state != "SPEECH_FINALIZING":
             raise MatchDomainError("match_state_conflict")
         speech_id = self.state.current_speech_id
@@ -2591,6 +2775,7 @@ class MatchActor:
             "context_version": int(command.payload["expected_context_version"]) + 1,
             "target_context_version": command.payload["expected_context_version"],
             "target_sequence": command.payload["expected_sequence"],
+            "auto_continue": self.state.status == "RUNNING" or kind == "asr.retry",
             "speaker_kind": "AGENT" if self.state.current_agent_profile_id else "HUMAN",
             "user_id": str(self.state.current_speaker_user_id)
             if self.state.current_speaker_user_id
@@ -2665,6 +2850,7 @@ class MatchActor:
             stage_checkpoint={**checkpoint, "generation": generation},
             emergency_operation=operation,
             free_source_speech_id=None,
+            asr_failed_speech_id=None,
             free_affirmative_remaining_ms=checkpoint.get("affirmative_budget_ms"),
             free_negative_remaining_ms=checkpoint.get("negative_budget_ms"),
             current_speaker_user_id=None,
@@ -2748,6 +2934,7 @@ class MatchActor:
             "source_speech_id": operation["speech_id"],
             "final_text": text.strip(),
             "origin": "ADMIN_PLACEHOLDER",
+            "operation_id": operation["id"],
         }
         operation.update(status="SUCCEEDED")
         index = self.state.current_action_index
@@ -2770,6 +2957,10 @@ class MatchActor:
             self.state,
             current_action_index=index,
             emergency_operation=operation,
+            asr_failed_speech_id=None,
+            free_source_speech_id=UUID(str(payload["speech_id"]))
+            if action.action_kind == "FREE_DEBATE"
+            else None,
             free_holder_side=holder,
             opportunity_id=None,
             allocated_opportunity_id=None,
@@ -2961,7 +3152,9 @@ class MatchActor:
         )
         if operation is not None:
             operation.update(status="SUCCEEDED")
-            self.state = replace(self.state, emergency_operation=operation)
+            self.state = replace(
+                self.state, emergency_operation=operation, asr_failed_speech_id=None
+            )
             self._paused_recovery("AGENT_PREPARING" if agent_action else "HUMAN_READY_TO_START")
             ready = replace(ready, type="speech.reset")
         if invalidated is not None:
@@ -3008,6 +3201,37 @@ class MatchActor:
         return (self._event("match.terminated", {}),)
 
     def _match_pause(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
+        operation = self.state.emergency_operation
+        if (
+            self.state.status == "ERROR"
+            and command.payload.get("authorized")
+            and operation
+            and operation.get("kind") == "asr.retry"
+            and operation.get("status") == "PENDING"
+        ):
+            self.state = replace(
+                self.state,
+                emergency_operation={**operation, "status": "CANCELLED", "auto_continue": False},
+            )
+            return (
+                self._event(
+                    "match.paused",
+                    {
+                        "reason": "ASR_RETRY_CANCELLED",
+                        "speech_id": _uuid_text(self.state.asr_failed_speech_id),
+                    },
+                ),
+            )
+        if self.state.status == "PAUSED" and command.payload.get("authorized") and operation:
+            self.state = replace(
+                self.state, emergency_operation={**operation, "auto_continue": False}
+            )
+            return (
+                self._event(
+                    "match.paused",
+                    {"reason": "MANUAL", "initiator_user_id": _uuid_text(command.actor_user_id)},
+                ),
+            )
         if self.state.status != "RUNNING" or not bool(command.payload.get("authorized")):
             raise MatchDomainError("forbidden")
         self._freeze_speech_budget()
@@ -3102,6 +3326,16 @@ class MatchActor:
     def _match_resume(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
         if self.state.status not in ("PAUSED", "SYSTEM_RECOVERY", "ERROR"):
             raise MatchDomainError("match_state_conflict")
+        completed_operation_id = command.payload.get("completed_operation_id")
+        if completed_operation_id is not None:
+            operation = self.state.emergency_operation
+            if (
+                not operation
+                or operation.get("id") != completed_operation_id
+                or operation.get("status") != "SUCCEEDED"
+                or not operation.get("auto_continue")
+            ):
+                raise MatchDomainError("stale_callback")
         can_resume = bool(command.payload.get("privileged")) or (
             command.actor_user_id is not None
             and command.actor_user_id == self.state.pause_initiator_user_id
@@ -3112,6 +3346,8 @@ class MatchActor:
         reasons: list[Any] = (
             cast(list[Any], reasons_value) if isinstance(reasons_value, list) else []
         )
+        if self.state.asr_failed_speech_id is not None:
+            reasons.append("识别尚未保存，请重试识别、重置发言或使用 AI 占位")
         if reasons:
             return (
                 self._event(
@@ -3130,9 +3366,13 @@ class MatchActor:
         self._schedule_internal(3.0, "resume.elapsed", f"internal:resume:{self.state.sequence}")
         return (event,)
 
-    def _resume_elapsed(self, _: MatchCommand) -> tuple[MatchEvent, ...]:
+    def _resume_elapsed(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
         if self.state.status != "PAUSED" or self.state.action_state != "RESUME_COUNTDOWN":
             return ()
+        reasons = command.payload.get("reasons")
+        if isinstance(reasons, list) and reasons:
+            self.state = replace(self.state, action_state="RECOVERY_REQUIRED")
+            return (self._event("match.resume_check_failed", {"reasons": reasons}),)
         restored = self.state.paused_from_action_state or "HUMAN_READY_TO_START"
         was_agent = restored in ("AGENT_SPEAKING", "AGENT_FINALIZING", "AGENT_PREPARING")
         if (
@@ -3220,6 +3460,50 @@ class MatchActor:
             return (resumed,)
         if restored == "FREE_SELECTING" and action is not None:
             if self.state.free_competition_enabled:
+                operation = self.state.emergency_operation
+                needs_recovery_round = self.state.opportunity_id is None or bool(
+                    operation
+                    and operation.get("kind") == "asr.retry"
+                    and operation.get("status") == "SUCCEEDED"
+                )
+                if needs_recovery_round:
+                    previous_opportunity = self.state.opportunity_id
+                    source = self.state.free_source_speech_id
+                    side = str(self.state.free_holder_side or action.free_starting_side)
+                    events: list[MatchEvent] = [resumed]
+                    if previous_opportunity is not None:
+                        events.append(
+                            self._event(
+                                "free.opportunity_invalidated",
+                                {
+                                    "opportunity_id": str(previous_opportunity),
+                                    "reason": "EXPLICIT_ASR_RECOVERY",
+                                },
+                            )
+                        )
+                    if source is not None:
+                        events.append(
+                            self._open_experiment_opportunity(
+                                side=side,
+                                trigger_kind="SAME_SIDE_CONTINUATION",
+                                source_speech_id=source,
+                            )
+                        )
+                    else:
+                        self.state = replace(self.state, opportunity_id=None)
+                    events.append(self._start_free_agent_decisions(side, source_speech_id=source))
+                    self._schedule_internal(
+                        3.0,
+                        "hand.window_closed",
+                        f"internal:recovery-round:{self.state.opportunity_id}",
+                    )
+                    events.append(
+                        self._event(
+                            "hand.window_opened",
+                            {"side": side, "duration_ms": 3000, "resumed": True},
+                        )
+                    )
+                    return tuple(events)
                 if self.state.selection_phase == "HUMAN_ONLY_WAIT":
                     self.state = replace(
                         self.state,
@@ -3383,6 +3667,7 @@ class MatchActor:
 
     def _member_online(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
         user_id = command.actor_user_id
+        previous_epoch = dict(self.state.connection_epochs).get(user_id, 1) if user_id else 1
         if user_id is None:
             raise MatchDomainError("forbidden")
         epoch_value = command.payload.get("connection_epoch")
@@ -3402,6 +3687,19 @@ class MatchActor:
                     sorted(self._connection_epochs.items(), key=lambda item: str(item[0]))
                 ),
             )
+            if (
+                self.state.status == "RUNNING"
+                and self.state.action_state == "HUMAN_SPEAKING"
+                and self.state.current_speaker_user_id == user_id
+                and self._connection_epochs.get(user_id, 1) > previous_epoch
+            ):
+                self._freeze_speech_budget()
+                remaining = self.view().speech_remaining_ms
+                self._cancel_timer()
+                self.state = replace(
+                    self.state, speech_deadline_mono=None, speech_remaining_ms=remaining
+                )
+                return (self._event("match.online", {"user_id": str(user_id)}),)
             return ()
         remaining_offline = self._offline_users - {user_id}
         offline_since = dict(self.state.offline_since_ms)
@@ -3414,23 +3712,36 @@ class MatchActor:
                 sorted(self._connection_epochs.items(), key=lambda item: str(item[0]))
             ),
         )
-        if (
-            self.state.status == "RUNNING"
-            and self.state.action_state == "HUMAN_SPEAKING"
-            and self.state.current_speaker_user_id == user_id
-            and self.state.speech_remaining_ms is not None
-        ):
-            remaining_seconds = max(0.0, self.state.speech_remaining_ms / 1000)
-            self.state = replace(
-                self.state,
-                speech_deadline_mono=self._clock() + remaining_seconds,
-            )
-            self._schedule_internal(
-                remaining_seconds,
-                "speech.deadline",
-                f"internal:speech-reconnected:{self.state.current_speech_id}",
-            )
         return (self._event("match.online", {"user_id": str(user_id)}),)
+
+    def _speech_media_ready(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
+        user = command.actor_user_id
+        if (
+            self.state.status != "RUNNING"
+            or self.state.action_state != "HUMAN_SPEAKING"
+            or user is None
+            or user != self.state.current_speaker_user_id
+            or str(command.payload.get("speech_id")) != str(self.state.current_speech_id)
+            or command.payload.get("connection_epoch") != self._connection_epochs.get(user, 1)
+            or user in self._offline_users
+        ):
+            raise MatchDomainError("stale_callback")
+        if self.state.speech_deadline_mono is not None:
+            return ()
+        remaining = max(0, int(self.state.speech_remaining_ms or 0))
+        self.state = replace(self.state, speech_deadline_mono=self._clock() + remaining / 1000)
+        self._schedule_internal(
+            remaining / 1000,
+            "speech.deadline",
+            f"internal:media-ready:{self.state.current_speech_id}:{self.state.sequence}",
+            payload={
+                "speech_id": str(self.state.current_speech_id),
+                "start_sequence": self.state.speech_start_sequence,
+            },
+        )
+        return (
+            self._event("speech.media_ready", {"speech_id": str(self.state.current_speech_id)}),
+        )
 
     def _offline_expired(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
         user_id_value = command.payload.get("user_id")
@@ -3444,6 +3755,11 @@ class MatchActor:
         if elapsed_ms is not None and elapsed_ms < 60_000:
             remaining_seconds = max(0.01, 60 - elapsed_ms / 1000)
             self._schedule_offline_expiry(user_id, remaining_seconds)
+            return ()
+        if user_id != self.state.current_speaker_user_id or self.state.action_state not in {
+            "HUMAN_SPEAKING",
+            "HUMAN_READY_TO_START",
+        }:
             return ()
         current_view = self.view()
         self._cancel_timer()
@@ -3479,6 +3795,24 @@ class MatchActor:
     def _system_recover(self, _: MatchCommand) -> tuple[MatchEvent, ...]:
         current_view = self.view()
         self._cancel_timer()
+        if self.state.asr_failed_speech_id is not None:
+            operation = self.state.emergency_operation
+            self.state = replace(
+                self.state,
+                status="ERROR",
+                action_state="RECOVERY_REQUIRED",
+                speech_deadline_mono=None,
+                human_start_deadline_mono=None,
+                selection_deadline_mono=None,
+                human_wait_deadline_mono=None,
+                hand_window_open=False,
+                emergency_operation=(
+                    {**operation, "status": "FAILED", "error_code": "system_recovery"}
+                    if operation and operation.get("status") == "PENDING"
+                    else operation
+                ),
+            )
+            return (self._event("match.system_recovery", {"preserve_failed": True}),)
         current = self.state.current_action
         restart_action_state = self.state.action_state
         # FREE_SELECTING is a queue window, not an in-progress human turn.
@@ -3546,6 +3880,91 @@ class MatchActor:
             paused_from_action_state=restart_action_state,
         )
         return (self._event("match.system_recovery", {}),)
+
+    def _asr_retry_failed(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
+        operation = self.state.emergency_operation
+        if (
+            not operation
+            or operation.get("kind") != "asr.retry"
+            or operation.get("status") != "PENDING"
+            or operation.get("id") != command.payload.get("operation_id")
+            or operation.get("generation") != command.payload.get("operation_generation")
+            or operation.get("context_version") != command.payload.get("context_version")
+            or _uuid_text(self.state.asr_failed_speech_id) != command.payload.get("speech_id")
+        ):
+            raise MatchDomainError("stale_callback")
+        return self._asr_failed(command)
+
+    def _asr_retry_begin(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
+        operation, duplicate = self._emergency_target(command, "asr.retry")
+        if duplicate:
+            return ()
+        if self.state.asr_failed_speech_id is None or self.state.status != "ERROR":
+            raise MatchDomainError("match_state_conflict")
+        operation.update(
+            context_version=operation["target_context_version"],
+            source_speech_id=str(self.state.asr_failed_speech_id),
+        )
+        self.state = replace(self.state, emergency_operation=operation)
+        return (
+            self._event(
+                "asr.retry.started",
+                {
+                    "speech_id": str(self.state.asr_failed_speech_id),
+                    "operation_id": operation["id"],
+                },
+            ),
+        )
+
+    def _asr_failed(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
+        speech_id = _payload_uuid(command.payload.get("speech_id"), required=True)
+        retry = self.state.emergency_operation
+        retrying = bool(
+            retry and retry.get("kind") == "asr.retry" and retry.get("status") == "PENDING"
+        )
+        if (
+            self.state.status != "RUNNING"
+            and not retrying
+            and not (command.asr_recording_recovery and self.state.status == "PAUSED")
+        ) or speech_id not in {
+            self.state.current_speech_id,
+            self.state.free_source_speech_id,
+        }:
+            raise MatchDomainError("stale_callback")
+        # Exhausted recognition recovery must not grant a fresh speaking budget,
+        # discard confirmed text, or silently ask the human to repeat the turn.
+        previous_action = (
+            self.state.paused_from_action_state or self.state.action_state
+            if retrying or command.asr_recording_recovery and self.state.status == "PAUSED"
+            else self.state.action_state
+        )
+        self._freeze_speech_budget()
+        view = self.view()
+        self._cancel_timer()
+        self.state = replace(
+            self.state,
+            status="ERROR",
+            action_state="RECOVERY_REQUIRED",
+            paused_from_status="RUNNING",
+            paused_from_action_state=previous_action,
+            asr_failed_speech_id=speech_id,
+            emergency_operation={**retry, "status": "FAILED"} if retrying and retry else retry,
+            speech_deadline_mono=None,
+            human_start_deadline_mono=None,
+            speech_remaining_ms=view.speech_remaining_ms,
+            free_affirmative_remaining_ms=view.free_affirmative_remaining_ms,
+            free_negative_remaining_ms=view.free_negative_remaining_ms,
+            selection_deadline_mono=None,
+            human_wait_deadline_mono=None,
+            hand_window_open=False,
+            error_code=str(command.payload.get("error_code", "asr_task_failed")),
+        )
+        failure = {
+            key: command.payload[key]
+            for key in ("speech_id", "error_code", "asr_failure_class")
+            if key in command.payload
+        }
+        return (self._event("asr.failed", failure), self._event("match.error", failure))
 
     def _system_error(self, command: MatchCommand) -> tuple[MatchEvent, ...]:
         source_wait_owner = command.payload.get("source_wait_owner")

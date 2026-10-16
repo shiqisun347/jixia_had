@@ -282,28 +282,56 @@ a.bg-slate-950 {
 }
 
 .debate-page--presentation {
-  padding: clamp(8px, 1.2dvh, 24px) clamp(8px, 1vw, 32px);
+  padding: clamp(12px, 1.5dvh, 32px) clamp(12px, 1.65vw, 48px);
 }
 
 .debate-page--presentation .debate-topic {
-  grid-template-columns: minmax(13rem, 0.7fr) minmax(0, 2fr) auto;
+  grid-template-columns: minmax(0, 1.1fr) minmax(0, 3fr) auto;
+  gap: clamp(12px, 1vw, 32px);
+  padding: clamp(12px, 1.2dvh, 24px) clamp(12px, 1vw, 32px);
+  background: var(--jx-surface-solid);
+  border-color: var(--jx-line);
 }
 
-.debate-page--presentation .debate-topic h1 {
-  font-size: clamp(1.1rem, min(2.2vw, 3.2dvh), 3.2rem);
+.debate-page--presentation .debate-topic > div:first-child {
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+
+.debate-page--presentation .debate-topic-title {
+  font-size: clamp(28px, 2.5vw, 88px);
+  line-height: 1.3;
+  letter-spacing: -0.02em;
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+  text-wrap: balance;
+}
+
+.debate-page--presentation .debate-topic-title[data-long-topic='true'] {
+  font-size: clamp(24px, 1.65vw, 64px);
+}
+
+.debate-page--presentation .debate-presentation-brand {
+  gap: clamp(12px, 0.85vw, 32px);
 }
 
 .debate-page--presentation .jx-brand__mark {
-  width: clamp(36px, min(4vw, 7dvh), 108px);
-  height: clamp(36px, min(4vw, 7dvh), 108px);
+  width: clamp(72px, calc(5vw + 8px), 192px);
+  height: clamp(72px, calc(5vw + 8px), 192px);
 }
 
 .debate-page--presentation .jx-brand__copy strong {
-  font-size: clamp(1rem, min(2vw, 3.2dvh), 3rem);
+  font-size: clamp(30px, calc(1.875vw + 6px), 78px);
+  line-height: 1.2;
 }
 
 .debate-page--presentation .jx-brand__copy small {
-  font-size: clamp(0.6rem, min(1vw, 1.6dvh), 1.5rem);
+  font-size: clamp(11px, 0.875vw, 28px);
+  line-height: 1.4;
+  letter-spacing: 0;
 }
 
 .debate-page--presentation .debate-arena > aside > div:first-child > div:first-child > div {
@@ -316,15 +344,22 @@ a.bg-slate-950 {
 }
 
 .debate-page--presentation .debate-arena {
-  grid-template-columns: minmax(0, 1fr) minmax(0, 1.55fr) minmax(0, 1fr);
+  grid-template-columns: minmax(0, 1fr) minmax(0, 2fr) minmax(0, 1fr);
+  background: var(--jx-surface-solid);
 }
 
 .debate-page--presentation .debate-stage-title {
-  font-size: clamp(1.3rem, min(2.7vw, 4.3dvh), 4.8rem);
+  font-size: clamp(28px, min(3.1vw, 5.6dvh), 96px);
+  color: var(--jx-ink);
+}
+
+.debate-page--presentation .debate-center-stage > .pointer-events-none {
+  display: none;
 }
 
 .debate-page--presentation [data-testid='current-debate-stage'] {
   font-size: clamp(0.8rem, min(1.3vw, 2.6dvh), 2rem);
+  color: var(--jx-muted);
 }
 
 .debate-page--presentation .debate-center-speaker h3 {
@@ -337,7 +372,8 @@ a.bg-slate-950 {
 }
 
 .debate-page--presentation .debate-center-time {
-  font-size: clamp(2rem, min(4vw, 7dvh), 7rem);
+  font-size: clamp(64px, min(5.5vw, 10.5dvh), 196px);
+  font-variant-numeric: tabular-nums;
 }
 
 .debate-page--presentation .debate-center-card {
@@ -366,10 +402,28 @@ a.bg-slate-950 {
 
 .debate-page--presentation .debate-seat-card {
   padding: clamp(6px, 1.4dvh, 28px) clamp(6px, 1vw, 32px);
+  background: var(--jx-surface-solid);
 }
 
 .debate-page--presentation .debate-seat-card strong {
-  font-size: clamp(0.9rem, min(1.3vw, 2.5dvh), 2.3rem);
+  min-width: 0;
+  font-size: clamp(20px, 1.5625vw, 56px);
+  white-space: normal;
+  overflow: visible;
+  overflow-wrap: anywhere;
+  text-overflow: clip;
+}
+
+.debate-page--presentation .debate-seat-activity {
+  position: absolute;
+  right: 8px;
+  bottom: 4px;
+  pointer-events: none;
+}
+
+.debate-page--presentation .debate-seat-activity > div {
+  width: 28px;
+  height: 12px;
 }
 
 .debate-page--presentation .debate-seat-card p {
@@ -392,6 +446,9 @@ a.bg-slate-950 {
 }
 
 @media (max-height: 800px) {
+  .debate-page--presentation .debate-seat-card strong {
+    font-size: clamp(16px, 1.25vw, 22px);
+  }
   .debate-center-card {
     margin-top: 0.5rem;
     padding: 0.75rem;
@@ -417,6 +474,20 @@ a.bg-slate-950 {
 }
 
 @media (max-width: 700px) {
+  .debate-page--presentation .debate-seat-card strong {
+    font-size: clamp(10px, 2.8vw, 14px);
+    line-height: 1.25;
+  }
+  .debate-page--presentation .debate-seat-identity {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 2px;
+  }
+  .debate-page--presentation .debate-seat-card .debate-seat-kind {
+    display: inline-flex;
+    padding: 2px 3px;
+    font-size: 9px;
+  }
   .debate-arena,
   .debate-page--presentation .debate-arena {
     grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.4fr) minmax(0, 0.8fr);

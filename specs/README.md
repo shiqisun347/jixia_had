@@ -1,5 +1,12 @@
 # v2.x 规格入口
 
+- `307-mixed-human-reliability-and-conference-presentation.md`：已实施、完整测试并上线
+  20261016-spec307-e290fab2/schema48。真人ASR连续收音/有界恢复、文字同步、弱网容错、
+  应急安全自动继续、固定四Agent席位/男女声及赛事大屏均完成。最终同源发布前三场＋
+  安装后三场原时长2真人＋2Agent混合赛自然完赛，两次180秒和实际辩手浏览器专项通过；
+  后端1742/标准纯2206分别通过且有重叠。125安装源/49migration、五分钟健康及历史保持
+  复核通过；人工断网中断与历史失败保留，物理设备和更大并发未冒称验收。
+
 v2.0 的产品与架构事实来源只有根目录的 PRD、TechDesign 和实时语音 Spike。
 
 - `271-tts-voice-compatibility-recovery.md`：修复百炼 3.1 TTS 历史错误音色导致 Agent

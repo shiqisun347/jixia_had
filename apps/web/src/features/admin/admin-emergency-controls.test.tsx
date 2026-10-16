@@ -47,6 +47,40 @@ afterEach(() => {
 });
 
 describe('administrator emergency controls', () => {
+  it('submits a frozen ASR retry target and never submits a resume command', async () => {
+    mount({ ...target, status: 'ERROR', can_retry_asr: true });
+    const retry = await screen.findByRole('button', { name: '重试上一段语音识别' });
+    await waitFor(() => expect(retry).toBeEnabled());
+    fireEvent.click(retry);
+    expect(screen.getByRole('alertdialog')).toHaveTextContent('保留原发言和已确认文字');
+    const next = { ...target, sequence: 11, speech_id: 'next-speech' };
+    act(() => client.setQueryData(['admin', 'match-control-target', 'match-304'], next));
+    vi.mocked(adminApi.matchControlTarget).mockResolvedValue(next);
+    vi.mocked(adminApi.emergencyControlMatch).mockResolvedValue({ status: 'PENDING' } as never);
+    fireEvent.click(screen.getByRole('button', { name: '确认执行' }));
+    await waitFor(() => expect(adminApi.emergencyControlMatch).toHaveBeenCalledTimes(1));
+    expect(vi.mocked(adminApi.emergencyControlMatch).mock.calls[0][1]).toMatchObject({
+      action: 'retry_asr',
+      expected_sequence: 10,
+      expected_action_key: '1:1',
+      expected_stage_generation: 2,
+      expected_speech_id: 'old-speech',
+      expected_context_version: 3,
+    });
+  });
+
+  it('uses the Core retry capability and distinguishes ASR work from an AI placeholder', async () => {
+    mount({
+      ...target,
+      can_retry_asr: false,
+      operation: { id: 'retry-owned', kind: 'asr.retry', status: 'PENDING' },
+    } as MatchControlTarget);
+    expect(await screen.findByRole('button', { name: '重试上一段语音识别' })).toBeDisabled();
+    expect(await screen.findByText('正在重试原录音识别，麦克风保持关闭。')).toBeVisible();
+    expect(screen.queryByRole('button', { name: '取消生成' })).not.toBeInTheDocument();
+    expect(screen.queryByText('AI占位正在生成，比赛已暂停。')).not.toBeInTheDocument();
+  });
+
   it('keeps the confirmed target frozen when a refresh selects another stage', async () => {
     mount();
     await waitFor(() =>

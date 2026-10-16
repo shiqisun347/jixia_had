@@ -7,7 +7,7 @@ from dataclasses import replace
 from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 from sqlalchemy import select
@@ -228,7 +228,20 @@ async def test_human_normal_pause_resume_keeps_same_durable_speech(
             match = await session.get(Match, match_id, with_for_update=True)
             assert match is not None
             match.runtime_snapshot = state_snapshot(probe.actor.state)
-    probe.manager.set_speech_runtime(AsyncMock())
+    media = AsyncMock()
+
+    # These Runtime projections/fences are synchronous; an untyped AsyncMock
+    # invents coroutines which this real Manager correctly does not await.
+    def absent_projection(_match: UUID, _speech: UUID) -> None:
+        return None
+
+    def committed_input(_match: UUID, _speech: UUID, **_kwargs: object) -> None:
+        return None
+
+    media.speech_callback_envelope = absent_projection
+    media.commit_speech_start = committed_input
+    media.fence_speech_input = absent_projection
+    probe.manager.set_speech_runtime(media)
     await probe.manager.submit(
         match_id,
         MatchCommand(type="speech.start", message_id=str(uuid4()), actor_user_id=user_id),

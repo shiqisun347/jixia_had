@@ -64,6 +64,11 @@ class OwnedResource:
 
 @dataclass
 class LateSession:
+    pending_provider_tasks = ()
+
+    def discard_audio(self) -> None:
+        pass
+
     speech_id: UUID
     entered: asyncio.Event = field(default_factory=asyncio.Event)
     cancelled: asyncio.Event = field(default_factory=asyncio.Event)
