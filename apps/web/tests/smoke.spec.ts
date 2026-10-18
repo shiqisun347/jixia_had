@@ -181,18 +181,14 @@ test('page toasts stay below the two-row narrow header', async ({ page }) => {
 
 test('home never flashes prototype matches while runtime data is loading', async ({ page }) => {
   await stubAuthenticatedUser(page);
-  let releaseRooms: () => void = () => undefined;
-  let releaseRankings: () => void = () => undefined;
+  const roomsResponse = Promise.withResolvers<void>();
+  const rankingsResponse = Promise.withResolvers<void>();
   await page.route('**/api/lobby/rooms', async (route) => {
-    await new Promise<void>((resolve) => {
-      releaseRooms = resolve;
-    });
+    await roomsResponse.promise;
     await route.fulfill({ json: [] });
   });
   await page.route('**/api/leaderboards', async (route) => {
-    await new Promise<void>((resolve) => {
-      releaseRankings = resolve;
-    });
+    await rankingsResponse.promise;
     await route.fulfill({ json: { generated_at: null, human: [], agent: [] } });
   });
 
@@ -202,8 +198,8 @@ test('home never flashes prototype matches while runtime data is loading', async
   await expect(page.getByText('公平与效率之辩')).toHaveCount(0);
   await expect(page.getByRole('heading', { name: '目前没有进行中的比赛' })).toHaveCount(0);
 
-  releaseRooms();
-  releaseRankings();
+  roomsResponse.resolve();
+  rankingsResponse.resolve();
   await expect(page.getByRole('heading', { name: '目前没有进行中的比赛' })).toBeVisible();
 });
 

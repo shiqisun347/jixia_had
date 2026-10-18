@@ -661,7 +661,7 @@
     "apps/web/tests/profile-dialog.spec.ts": "7edd5cb3324288a3d405f258078fecc233861b2d3858ddbeabc7ad740543d208",
     "apps/web/tests/register-avatar.spec.ts": "d0c31c79f26796e88ed1701a6a642e3df9294819c5b8ad65f4ad10aa41f7670d",
     "apps/web/tests/rooms.spec.ts": "daf8cc1ee5102077b5197500687f70866a157ee2641b5d43270c74574c08b47b",
-    "apps/web/tests/smoke.spec.ts": "b16e5491a36325ee223acb5aabe1e9605441e3c8506b667e5ed41c2c7655f4e6",
+    "apps/web/tests/smoke.spec.ts": "ae6db8a3ba575d4a46c6d2daf8b00c74bf2d894be09e973acedc18ae60f00c68",
     "apps/web/tsconfig.json": "5cd587103ad3b325363070c5883c5a398a25ed9cbc88aa262c49ad4e66c7f912",
     "apps/web/vitest.config.ts": "04e75bdf68fd83b4f132da1f50519cee5e9b66a5f35762b83bd15e4eaf5d31a0",
     "apps/web/vitest.setup.ts": "91a3c8962a0edcb956206a501d943fe99e1c78c6d4d8b5c9a948a3362c75978c",
