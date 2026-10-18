@@ -1,0 +1,34 @@
+[Unit]
+Description=Jixia independent conference showcase
+After=network.target
+
+[Service]
+Type=simple
+User=jx-showcase
+Group=jx-showcase
+WorkingDirectory=/opt/jixia-showcase/current
+EnvironmentFile=/etc/jixia-showcase/environment
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/jixia-showcase/venv/bin/python /opt/jixia-showcase/current/app.py
+Restart=on-failure
+RestartSec=3
+StateDirectory=jixia-showcase
+StateDirectoryMode=0700
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+InaccessiblePaths=-/opt/jixia-debate -/opt/jixia-web
+ReadWritePaths=/var/lib/jixia-showcase
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+MemoryMax=192M
+CPUQuota=30%
+TasksMax=32
+LimitNOFILE=2048
+
+[Install]
+WantedBy=multi-user.target

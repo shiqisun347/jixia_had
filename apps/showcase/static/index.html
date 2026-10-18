@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="theme-color" content="#f4f8ff" />
+    <title>稷下 · 现场争鸣</title>
+    <link rel="icon" href="/assets/brand.jpeg" />
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="/static/screen.js" type="module"></script>
+  </head>
+  <body class="screen-body">
+    <main id="app" aria-live="polite">
+      <div class="waiting">正在连接现场…</div>
+    </main>
+    <div id="connection" class="connection" role="status" hidden>连接暂时中断，正在重新连接…</div>
+    <button id="fullscreen" class="fullscreen" aria-label="进入全屏展示" title="全屏 · F">⛶</button>
+    <div id="toast" role="status" hidden></div>
+  </body>
+</html>

@@ -214,6 +214,59 @@ test('public lobby shows live server-shaped room data', async ({ page }) => {
   );
 });
 
+for (const locale of ['zh-CN', 'en']) {
+  for (const surface of ['lobby', 'finished-room']) {
+    test(`finished ${surface} offers the exact audience voting navigation (${locale})`, async ({
+      page,
+    }) => {
+      await page.addInitScript((value) => localStorage.setItem('jx.locale.v1', value), locale);
+      await installCommonRoutes(page);
+      await page.route('**/api/lobby/rooms', (route) =>
+        route.fulfill({
+          json: [
+            {
+              id: roomId,
+              code: 'JX8K2M',
+              title: '已结束的辩论',
+              label: '训练赛',
+              status: 'FINISHED',
+              topic_title: topic.title,
+              rule_name: formal4v4Rule.name,
+              side_size: 4,
+              occupied_seats: 8,
+              spectator_remaining: 10,
+              spectator_capacity_full: false,
+              match_id: 'finished-match',
+              viewer_membership_state: 'NONE',
+            },
+          ],
+        }),
+      );
+      await page.route(`**/api/rooms/${roomId}/snapshot`, (route) =>
+        route.fulfill({
+          json: { ...roomSnapshot(), status: 'FINISHED', match_id: 'finished-match' },
+        }),
+      );
+      await page.route('https://showcase.vsagents.online/', (route) => {
+        expect(route.request().method()).toBe('GET');
+        expect(route.request().postData()).toBeNull();
+        return route.fulfill({
+          contentType: 'text/html',
+          body: '<title>Owned voting navigation</title>',
+        });
+      });
+      await page.goto(surface === 'lobby' ? '/lobby' : `/rooms/${roomId}?recheck=1`);
+      const vote = page.getByRole('link', {
+        name: locale === 'en' ? 'Audience voting' : '观众投票',
+      });
+      await expect(vote).toHaveAttribute('href', 'https://showcase.vsagents.online/');
+      await expect(vote).not.toHaveAttribute('target', '_blank');
+      await vote.click();
+      await expect(page).toHaveURL('https://showcase.vsagents.online/');
+    });
+  }
+}
+
 test('room code input normalizes the code and opens the room', async ({ page }) => {
   await installCommonRoutes(page);
   await page.route('**/api/lobby/rooms', (route) => route.fulfill({ json: [] }));

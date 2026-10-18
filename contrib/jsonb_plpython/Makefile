@@ -1,1 +1,0 @@
-/tmp/jx-pg-build.WjURYf/postgresql-16.10/contrib/jsonb_plpython/Makefile

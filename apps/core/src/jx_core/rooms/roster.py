@@ -9,7 +9,7 @@ from uuid import UUID
 from ..auth.errors import AuthError
 
 CONFERENCE_ROLES = (
-    ("AFFIRMATIVE", 2, "执锋 Agent", "longhua_v3.1"),
+    ("AFFIRMATIVE", 2, "执锋 Agent", "longwan_v3.1"),
     ("AFFIRMATIVE", 4, "博闻 Agent", "anmingyuan_v3.1"),
     ("NEGATIVE", 2, "睿断 Agent", "huozhuoshi_v3.1"),
     ("NEGATIVE", 4, "明辨 Agent", "xiaxiaochen_v3.1"),

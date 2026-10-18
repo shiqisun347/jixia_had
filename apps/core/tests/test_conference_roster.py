@@ -9,7 +9,7 @@ from jx_core.rooms.roster import default_agent_assignments
 def _pool() -> tuple[list[dict[str, object]], list[UUID]]:
     voices = (
         ("huozhuoshi_v3.1", "睿断 Agent"),
-        ("longhua_v3.1", "执锋 Agent"),
+        ("longwan_v3.1", "执锋 Agent"),
         ("xiaxiaochen_v3.1", "明辨 Agent"),
         ("anmingyuan_v3.1", "博闻 Agent"),
         *((f"spare-{index}", f"备用{index}") for index in range(4)),
@@ -32,13 +32,15 @@ def test_conference_seats_follow_actual_voice_identity_not_pool_order() -> None:
     }
 
 
-@pytest.mark.parametrize("defect", ["disabled", "wrong_voice", "wrong_name"])
+@pytest.mark.parametrize("defect", ["disabled", "wrong_voice", "wrong_name", "old_zhifeng_voice"])
 def test_conference_does_not_silently_substitute_an_unavailable_identity(defect: str) -> None:
     agents, ids = _pool()
     if defect == "disabled":
         ids = ids[1:]
     elif defect == "wrong_voice":
         agents[0]["voice"] = {"provider_voice": "yuxiaoyun_v3.1"}
+    elif defect == "old_zhifeng_voice":
+        agents[1]["voice"] = {"provider_voice": "longhua_v3.1"}
     else:
         agents[0]["name"] = "另一个人设"
     with pytest.raises(AuthError) as raised:

@@ -8,4 +8,6 @@
 
 发现本文件与 PRD 不一致时，以 PRD 为准并删除本文件中的过期表述。
 
-2026-10-15 用户明确批准 Spec304：管理员阶段重置与受控暂停中的 LLM 占位为该规格限定的产品例外；范围、验收、审计和回滚以 [Spec304](../specs/304-match-handoff-context-and-conference-recovery.md) 为准，架构语义已同步 TechDesign §9.3/15.2。原 PRD 工作树删除状态保留，读取历史需求使用 Git HEAD，不擅自恢复或改写旧文件。
+2026-10-15 用户明确批准 Spec304：管理员阶段重置与受控暂停中的 LLM 占位为该规格限定的产品例外；范围、验收、审计和回滚以 [Spec304](../specs/304-match-handoff-context-and-conference-recovery.md) 为准，架构语义已同步 TechDesign §9.3/15.2。
+
+2026-10-18 按 Spec328 恢复根目录 PRD 的历史基线。后续已批准且实际发布的规格对相应条款作限定覆盖；先读 PRD 开头的恢复说明，再核对 [规格入口](../specs/README.md) 和 [当前交付基线](../docs/v2-reproduction.md)。未发布候选不能作为现行需求或实现依据。

@@ -288,10 +288,10 @@ test('human start publishes a muted microphone before commit and unmutes only af
   await expect.poll(() => page.evaluate(() => window.__JX_COMMAND_SEQUENCES__)).toEqual([4]);
   expect(await page.evaluate(() => window.__JX_MICROPHONE_STATES__?.at(-1))).not.toBe(true);
   expect(await page.evaluate(() => window.__JX_PREPARE_MICROPHONE_COUNT__)).toBe(1);
-  await expect(page.getByRole('heading', { name: '轮到你发言了！' })).toBeVisible();
+  await expect(page.getByTestId('current-speaker-state')).toBeVisible();
 
   await page.evaluate(() => window.__JX_RELEASE_START_ACK__?.());
-  await expect(page.getByRole('heading', { name: '麦克风已开启' })).toBeVisible();
+  await expect(page.getByTestId('center-timer')).toBeVisible();
   await expect.poll(() => page.evaluate(() => window.__JX_MICROPHONE_STATES__?.at(-1))).toBe(true);
 });
 
@@ -463,6 +463,7 @@ test('real runtime page connects and starts human speech from server state', asy
               ? 'PAUSED'
               : window.__JX_MATCH_SNAPSHOT__.status,
           error_code: command.type === 'match.pause' ? 'tts_stream_interrupted' : null,
+          countdown_remaining_ms: command.type === 'match.resume' ? 3_000 : null,
         };
         this.emit('message', {
           data: JSON.stringify({
@@ -627,7 +628,7 @@ test('real runtime page connects and starts human speech from server state', asy
     }),
   );
   await page.goto(`/debate?match_id=${matchId}`);
-  await expect(page.getByRole('heading', { name: '轮到你发言了！' })).toBeVisible();
+  await expect(page.getByTestId('current-speaker-state')).toBeVisible();
   await expect(page.getByRole('button', { name: '开启比赛声音' })).toBeVisible();
   await expect(page.getByRole('button', { name: '开始发言' })).toBeEnabled();
   await expect.poll(() => roomSnapshotRequests).toBeGreaterThan(1);
@@ -645,7 +646,9 @@ test('real runtime page connects and starts human speech from server state', asy
   if (await closeTranscriptButton.isVisible()) await closeTranscriptButton.click();
   await expect(page.getByText('比赛连接状态')).toHaveCount(0);
   await expect(page.getByRole('button', { name: '网络状态' })).toBeVisible();
-  await expect(page.getByTestId('current-debate-stage')).toHaveText('当前阶段 · 正方一辩立论');
+  await expect(
+    page.getByTestId('current-debate-stage').getByRole('heading', { name: '正方一辩立论' }),
+  ).toBeVisible();
   const controlGroups = [
     page.getByTestId('match-controls-audio'),
     page.getByTestId('match-controls-speech'),
@@ -709,9 +712,10 @@ test('real runtime page connects and starts human speech from server state', asy
     page.getByText('当前辩手 60 秒内未开始发言，比赛已暂停；确认设备后可申请恢复。'),
   ).toHaveCount(0);
   await page.getByRole('button', { name: '申请恢复' }).click();
-  await expect(page.getByRole('heading', { name: '3 秒后恢复比赛' })).toBeVisible();
+  const resumeCountdown = page.getByRole('status', { name: '三秒倒计时' });
+  await expect(resumeCountdown.locator('.debate-countdown-value')).toHaveText('3');
+  await expect(resumeCountdown.getByRole('heading', { name: '比赛即将恢复' })).toBeVisible();
   await expect(page.getByText('恢复倒计时', { exact: true })).toBeVisible();
-  await expect(page.getByText('恢复倒计时进行中')).toBeVisible();
   await expect(page.getByRole('button', { name: '申请恢复' })).toHaveCount(0);
   await expect(page.getByText('语音合成连续失败，比赛已暂停，请申请恢复。')).toHaveCount(0);
   await expect.poll(() => page.evaluate(() => window.__JX_COMMAND_SEQUENCES__)).toEqual([3, 6]);
@@ -720,7 +724,7 @@ test('real runtime page connects and starts human speech from server state', asy
   await expect(startButton).toBeEnabled();
   await expect(page.getByRole('button', { name: '开启比赛声音' })).toBeVisible();
   await startButton.click();
-  await expect(page.getByRole('heading', { name: '麦克风已开启' })).toBeVisible();
+  await expect(page.getByTestId('center-timer')).toBeVisible();
   await expect(page.getByRole('button', { name: '提前结束发言' })).toBeVisible();
   await expect.poll(() => page.evaluate(() => window.__JX_MICROPHONE_STATES__?.at(-1))).toBe(true);
   const humanPresence = page.getByTestId('participant-presence').first();
@@ -873,10 +877,12 @@ test('real runtime page connects and starts human speech from server state', asy
 
   await page.evaluate(() => window.__JX_EMIT_AGENT_SNAPSHOT__?.());
   await expect(page.getByRole('heading', { name: 'Agent-反2' })).toBeVisible();
-  await expect(page.getByText('Agent 正在发言')).toBeVisible();
+  await expect(page.getByTestId('current-speaker-state').getByTestId('center-timer')).toBeVisible();
 
   await page.evaluate(() => window.__JX_EMIT_COUNTDOWN_SNAPSHOT__?.());
-  const countdown = page.getByRole('status', { name: '三秒倒计时' });
+  const countdown = page
+    .getByRole('status', { name: '三秒倒计时' })
+    .locator('.debate-countdown-value');
   await expect(countdown).toContainText(/^[1-3]$/);
   const firstCountdownValue = Number(await countdown.textContent());
   await expect

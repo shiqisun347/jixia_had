@@ -1,0 +1,32 @@
+[Unit]
+Description=Jixia v2.0 authoritative Core (one process)
+Wants=network-online.target
+Requires=postgresql.service
+After=network-online.target postgresql.service jx-livekit.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=jixia
+Group=jixia
+WorkingDirectory=/var/lib/jixia/runtime
+EnvironmentFile=/etc/jixia/core.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/jixia/current/apps/core/src:/opt/jixia/current/apps/jobs/src
+ExecStart=/opt/jixia/current/.venv/bin/python -m jx_core.cli
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+LimitNOFILE=524288:524288
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

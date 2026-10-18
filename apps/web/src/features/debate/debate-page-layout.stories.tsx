@@ -391,6 +391,30 @@ const meta = {
 export default meta;
 type Story = StoryObj<typeof meta>;
 
+export const OpeningIntroduction: Story = {
+  args: {
+    ...baseArgs,
+    snapshot: snapshot('NOT_STARTED', { status: 'START_PENDING_RUNTIME', current_action: null }),
+    isOrganizer: true,
+  },
+  async play({ canvasElement }) {
+    const center = within(within(canvasElement).getByTestId('debate-center-stage'));
+    await expect(center.getByRole('heading', { name: '开场介绍' })).toBeVisible();
+    await expect(center.getByText('欢迎参加人机辩论赛！')).toBeVisible();
+    await expect(center.getByText('请主持人进行比赛介绍')).toBeVisible();
+    await expect(center.getByRole('button', { name: '正式开始比赛' })).toBeEnabled();
+    await expect(center.queryByText(/候场中|设备与席位/)).not.toBeInTheDocument();
+  },
+};
+export const OpeningSpectator: Story = {
+  ...OpeningIntroduction,
+  args: { ...OpeningIntroduction.args, isOrganizer: false },
+  async play({ canvasElement }) {
+    const center = within(within(canvasElement).getByTestId('debate-center-stage'));
+    await expect(center.getByText('请主持人进行比赛介绍')).toBeVisible();
+    await expect(center.queryByRole('button', { name: '正式开始比赛' })).not.toBeInTheDocument();
+  },
+};
 export const HumanReady: Story = { args: baseArgs };
 export const LocalOutputMuted: Story = {
   args: { ...baseArgs, outputMuted: true },
@@ -483,6 +507,20 @@ export const AgentThinking: Story = {
       current_speaker_seat_no: 1,
     }),
   },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const seat = canvasElement.querySelector('[data-seat-id="n1"]')!;
+    await expect(canvas.getByTestId('agent-preparing-stage')).toHaveTextContent('正在思考');
+    await expect(seat).toHaveAttribute('data-thinking', 'true');
+    await expect(seat.querySelector('img')).toBeVisible();
+    await waitFor(() => {
+      const avatar = seat.querySelector('img')!;
+      expect(avatar.complete && avatar.naturalWidth > 0 && avatar.currentSrc.length > 0).toBe(true);
+    });
+    await expect(seat.querySelector('.debate-seat-activity')).not.toBeInTheDocument();
+    await expect(canvas.getByTestId('debate-center-stage').querySelector('img')).toBeVisible();
+    await expect(canvas.queryByText(/正式发言计时尚未开始/)).not.toBeInTheDocument();
+  },
 };
 export const AgentSpeaking: Story = {
   args: {
@@ -497,9 +535,29 @@ export const AgentSpeaking: Story = {
       current_agent_profile_id: 'agent-n2',
       current_speaker_side: 'NEGATIVE',
       current_speaker_seat_no: 2,
+      agent_decisions: [
+        {
+          agent_profile_id: 'agent-n2',
+          side: 'NEGATIVE',
+          seat_no: 2,
+          status: 'DECIDING',
+          queue_rank: null,
+        },
+      ],
     }),
     currentSeat: room.seats[5],
     runtime: { ...baseArgs.runtime, interimText: 'Agent 的实时播放文字只出现在文字记录中。' },
+  },
+  play: async ({ canvasElement }) => {
+    const canvas = within(canvasElement);
+    const seat = canvasElement.querySelector('[data-seat-id="n2"]')!;
+    await expect(seat).toHaveAttribute('data-thinking', 'false');
+    await expect(seat.querySelector('img')).toBeInTheDocument();
+    await expect(seat.querySelector('.debate-seat-activity')).toBeInTheDocument();
+    await expect(within(seat as HTMLElement).queryByText('决策中')).not.toBeInTheDocument();
+    await expect(
+      canvas.getByTestId('current-speaker-state').querySelector('img'),
+    ).toBeInTheDocument();
   },
 };
 export const TranscriptReadingOrder: Story = {
@@ -630,6 +688,10 @@ export const StartCountdown: Story = {
 export const HostAnnouncing: Story = {
   args: {
     ...baseArgs,
+    room: {
+      ...room,
+      rule: { ...room.rule, host_identity: { name: '龙风月瑶', provider_voice: 'longanwen_v3.1' } },
+    },
     currentSeat: undefined,
     snapshot: snapshot('HOST_ANNOUNCING', {
       current_action: {
@@ -660,7 +722,12 @@ export const HostAnnouncing: Story = {
     const centerStage = canvas.getByTestId('debate-center-stage');
     const hostState = within(centerStage).getByTestId('host-announcement-state');
     await expect(hostState).toBeVisible();
-    await expect(within(hostState).getByText('主持播报中')).toBeVisible();
+    await expect(within(hostState).getByText('主持人串场')).toBeVisible();
+    await expect(within(hostState).queryByText(/主持词|节选/)).not.toBeInTheDocument();
+    await expect(within(hostState).getByAltText('稷下')).toBeVisible();
+    await expect(within(centerStage).queryByText('主持音频播放中')).not.toBeInTheDocument();
+    await expect(within(centerStage).queryByText(/请听取本阶段提示/)).not.toBeInTheDocument();
+    await expect(within(centerStage).queryByText('龙风月瑶')).not.toBeInTheDocument();
     await expect(within(centerStage).queryByText('林知夏')).not.toBeInTheDocument();
     await expect(within(centerStage).queryByText('发言计时')).not.toBeInTheDocument();
     await expect(canvasElement.querySelector('.jx-active-seat-shadow')).not.toBeInTheDocument();
@@ -775,6 +842,9 @@ export const FreeDebateAgentDecisionProgress: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(canvas.getByRole('status', { name: '决策中' })).toBeVisible();
+    await expect(canvasElement.querySelector('[data-seat-id="n1"] img')).toBeVisible();
+    await expect(canvasElement.querySelector('[data-seat-id="n2"] img')).toBeInTheDocument();
+    await expect(canvasElement.querySelector('[data-seat-id="n3"] img')).toBeInTheDocument();
     await expect(canvas.getByText('第 1 名')).toBeVisible();
     await expect(canvas.getByText('跳过')).toBeVisible();
   },
@@ -905,7 +975,10 @@ export const FreeDebateAgentVolunteers: Story = {
       .getAllByRole('article')
       .find((element) => element.textContent?.includes('Agent·反一'));
     expect(selectedSeat).toBeTruthy();
-    await expect(selectedSeat).toHaveClass(/jx-active-seat-shadow/);
+    await expect(selectedSeat).toHaveAttribute('data-active', 'true');
+    await expect(selectedSeat).toHaveAttribute('data-speaking', 'false');
+    await expect(selectedSeat).toBeVisible();
+    expect(getComputedStyle(selectedSeat!).boxShadow).not.toBe('none');
     await expect(within(selectedSeat!).getByText('第 1 名')).toBeVisible();
     await expect(canvas.getByText('第 2 名')).toBeVisible();
   },
@@ -990,7 +1063,7 @@ export const ResumeCountdown: Story = {
   play: async ({ canvasElement }) => {
     const canvas = within(canvasElement);
     await expect(canvas.getByText('恢复倒计时')).toBeVisible();
-    await expect(canvas.getByText('恢复倒计时进行中')).toBeVisible();
+    await expect(canvas.getByRole('status', { name: '三秒倒计时' })).toBeVisible();
     await expect(canvas.queryByRole('button', { name: '申请恢复' })).not.toBeInTheDocument();
   },
 };
@@ -1043,7 +1116,10 @@ export const FinishedWithRetainedFreeFields: Story = {
     await expect(center.queryByText('等待发言者')).not.toBeInTheDocument();
     await expect(center.queryByText('--:--')).not.toBeInTheDocument();
     await expect(center.queryByTestId('free-debate-clock')).not.toBeInTheDocument();
-    await expect(center.getByRole('link', { name: '查看赛后记录' })).toBeVisible();
+    await expect(center.getByRole('link', { name: '观众投票' })).toHaveAttribute(
+      'href',
+      'https://showcase.vsagents.online/',
+    );
   },
 };
 export const PresentationFinished: Story = {

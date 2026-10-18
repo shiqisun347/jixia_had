@@ -244,7 +244,10 @@ class VoiceProfile(Base):
         CheckConstraint(
             "(kind = 'AGENT' AND avatar_key IS NOT NULL AND avatar_key IN "
             "('agent-01','agent-02','agent-03','agent-04','agent-05','agent-06',"
-            "'agent-07','agent-08','agent-09','agent-10','agent-11','agent-12')) OR "
+            "'agent-07','agent-08','agent-09','agent-10','agent-11','agent-12',"
+            "'human-01','human-02','human-03','human-04','human-05','human-06',"
+            "'human-07','human-08','human-09','human-10','human-11','human-12',"
+            "'human-13','human-14','human-15','human-16')) OR "
             "(kind = 'HOST' AND avatar_key IS NULL)",
             name="ck_voice_profiles_avatar_key_by_kind",
         ),

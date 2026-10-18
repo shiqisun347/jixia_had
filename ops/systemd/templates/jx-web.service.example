@@ -1,0 +1,33 @@
+[Unit]
+Description=Jixia v2.0 standalone Web
+Requires=jx-core.service
+After=network-online.target jx-core.service
+PartOf=jx-core.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=jixia
+Group=jixia
+WorkingDirectory=/opt/jixia/current/apps/web/.next/standalone/apps/web
+EnvironmentFile=/etc/jixia/web.env
+Environment=NODE_ENV=production
+Environment=HOSTNAME=127.0.0.1
+Environment=PORT=3000
+ExecStart=/opt/node-v24.12.0/bin/node /opt/jixia/current/apps/web/.next/standalone/apps/web/server.js
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=20
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+LimitNOFILE=65536:65536
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target jx-core.service

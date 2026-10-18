@@ -587,8 +587,12 @@ async def test_natural_tail_failure_reaches_authoritative_error_with_frozen_cont
         async with probe.factory() as session:
             match = await session.get(Match, run.match_id)
             speech = await session.get(Speech, run.speech_id)
+            generation = await session.get(AgentGeneration, run.generation_id)
             assert match is not None and match.context_version == 0
             assert speech is not None and speech.status != "FINALIZED"
+            assert generation is not None and generation.status == "FAILED"
+            assert generation.error_code == probe.actor.state.error_code
+            assert generation.completed_at is not None
     finally:
         for source in edges.sources:
             source.release_tail.set()

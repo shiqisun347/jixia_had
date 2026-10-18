@@ -23,6 +23,7 @@ import { Button, buttonVariants } from '@/components/ui/button';
 import { ConfirmDialog } from '@/components/ui/confirm-dialog';
 import { useToast } from '@/components/ui/toast-provider';
 import { useCurrentUser } from '@/features/auth/use-auth';
+import { useAppTranslations } from '@/i18n';
 import { ApiClientError } from '@/lib/auth-api';
 import {
   runLiveKitDeviceProbe,
@@ -81,6 +82,7 @@ export function RoomPage({
   recheck = false,
   created = false,
 }: Readonly<{ roomId: string; recheck?: boolean; created?: boolean }>) {
+  const t = useAppTranslations('Lobby');
   const queryClient = useQueryClient();
   const { showToast } = useToast();
   const userQuery = useCurrentUser();
@@ -570,7 +572,7 @@ export function RoomPage({
           </h1>
           <p className="mt-3 text-sm leading-7 text-slate-600">
             {room.status === 'FINISHED'
-              ? '本场比赛已进入赛后记录，不需要再次加入或检测设备。'
+              ? t('finishedVotingHint')
               : '这个房间已经终止，无法再次加入。你可以返回大厅选择其他房间。'}
           </p>
           <div className="mt-6 flex justify-center gap-3">
@@ -583,9 +585,9 @@ export function RoomPage({
             {room.status === 'FINISHED' && room.match_id ? (
               <Link
                 className="inline-flex min-h-11 items-center rounded-xl bg-slate-950 px-4 py-2.5 text-sm font-black !text-white"
-                href={`/matches/${room.match_id}`}
+                href="https://showcase.vsagents.online/"
               >
-                查看赛后记录
+                {t('audienceVoting')}
               </Link>
             ) : null}
           </div>

@@ -20,7 +20,9 @@ class VoiceProfileCreate(BaseModel):
     rate: float = Field(default=1.0, ge=0.5, le=2.0)
     chars_per_second: float | None = Field(default=None, gt=0, le=20)
     playback_gain: float = Field(default=1.0, ge=0.5, le=2.0)
-    avatar_key: str | None = Field(default=None, pattern=r"^agent-(0[1-9]|1[0-2])$")
+    avatar_key: str | None = Field(
+        default=None, pattern=r"^(agent-(0[1-9]|1[0-2])|human-(0[1-9]|1[0-6]))$"
+    )
 
     @field_validator("provider_voice")
     @classmethod

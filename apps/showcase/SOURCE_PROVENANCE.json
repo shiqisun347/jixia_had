@@ -1,0 +1,241 @@
+{
+  "schema": "showcase-public-source-provenance-v1",
+  "source_date": "2026-10-18",
+  "product_version": "v2.0",
+  "origin": "Existing independent production Showcase, verified source/asset snapshot; no service deployed by this import.",
+  "private_release_archive_sha256": "83216cec74684f88d909449a5460c76201fb0c2d0f3d7430a2e0296a62ceb426",
+  "production_source_asset_manifest_count": 44,
+  "reusable_production_source_and_assets": [
+    {
+      "path": "app.py",
+      "production_sha256": "3838e6e016e91afbbd19c9ed339917e11773644eb4243c8961d90a942ea9a89c",
+      "repository_sha256": "7871598692d4cff01a4c26f5668e8cf6b1475bc3c625c09954966c0635087b88",
+      "relation": "documented_derivative"
+    },
+    {
+      "path": "audio_events.py",
+      "production_sha256": "95cc5579d44f4c42d8d04abb6ec247d708a8bb771a3465b159ae032320a1f457",
+      "repository_sha256": "d02a9bdf21cb42dd368d181497324129f3f21f81dc25f2eb79a1e530762bd811",
+      "relation": "documented_derivative"
+    },
+    {
+      "path": "static/assets/agent-01.webp",
+      "production_sha256": "fab362502f125a713a76faf0e67959cc74305eb7a2e8d21fdcdee1d8d4c5759b",
+      "repository_sha256": "fab362502f125a713a76faf0e67959cc74305eb7a2e8d21fdcdee1d8d4c5759b",
+      "relation": "exact"
+    },
+    {
+      "path": "static/assets/agent-02.webp",
+      "production_sha256": "91718ce0eed796fecf23264bc2ffc2f9f23813c4820fc0ff7e18809191e1bc5b",
+      "repository_sha256": "91718ce0eed796fecf23264bc2ffc2f9f23813c4820fc0ff7e18809191e1bc5b",
+      "relation": "exact"
+    },
+    {
+      "path": "static/assets/agent-03.webp",
+      "production_sha256": "cf537e364af850e5ae588febbe98a23d660f7aa9b99cba738dbdbb1d5099fab0",
+      "repository_sha256": "cf537e364af850e5ae588febbe98a23d660f7aa9b99cba738dbdbb1d5099fab0",
+      "relation": "exact"
+    },
+    {
+      "path": "static/assets/agent-04.webp",
+      "production_sha256": "6276abb9422cea7bbd50bfa7dfca23d654b94f5b00905a9a4d4605815e8a0281",
+      "repository_sha256": "6276abb9422cea7bbd50bfa7dfca23d654b94f5b00905a9a4d4605815e8a0281",
+      "relation": "exact"
+    },
+    {
+      "path": "static/assets/award-medal-v1.png",
+      "production_sha256": "83c58c8118fecdede5718698d9cc641b21f52bd5379cb5eb3df7d736d88223c2",
+      "repository_sha256": "83c58c8118fecdede5718698d9cc641b21f52bd5379cb5eb3df7d736d88223c2",
+      "relation": "exact"
+    },
+    {
+      "path": "static/assets/award-trophy-v1.png",
+      "production_sha256": "d8c08ed2857d0de796d4a8348f910fc17900be983fcfc81957f82278fe235a22",
+      "repository_sha256": "d8c08ed2857d0de796d4a8348f910fc17900be983fcfc81957f82278fe235a22",
+      "relation": "exact"
+    },
+    {
+      "path": "static/assets/human-01.webp",
+      "production_sha256": "307e980de43536d6aad69556b502bb8c18a14638b139532b660591c817f25a0d",
+      "repository_sha256": "307e980de43536d6aad69556b502bb8c18a14638b139532b660591c817f25a0d",
+      "relation": "exact"
+    },
+    {
+      "path": "static/assets/human-02.webp",
+      "production_sha256": "7ed67c6fc8316170d63bc40681fc57bf9c82df87ab3f97137e5abd3fb7a58756",
+      "repository_sha256": "7ed67c6fc8316170d63bc40681fc57bf9c82df87ab3f97137e5abd3fb7a58756",
+      "relation": "exact"
+    },
+    {
+      "path": "static/assets/human-03.webp",
+      "production_sha256": "57b1ab619fd59fd6a947d7835012d361279f3fb97539cc0e0f99ee263328c649",
+      "repository_sha256": "57b1ab619fd59fd6a947d7835012d361279f3fb97539cc0e0f99ee263328c649",
+      "relation": "exact"
+    },
+    {
+      "path": "static/assets/human-04.webp",
+      "production_sha256": "3de4b0995fd8a447d20d6536928df1476007d0cae89ad97d78da4710d712dbfd",
+      "repository_sha256": "3de4b0995fd8a447d20d6536928df1476007d0cae89ad97d78da4710d712dbfd",
+      "relation": "exact"
+    },
+    {
+      "path": "static/assets/judges-commentary-v1.png",
+      "production_sha256": "1de1c625150cad45683f9823e3fecad736503595635e08faddd7ba87436020f4",
+      "repository_sha256": "1de1c625150cad45683f9823e3fecad736503595635e08faddd7ba87436020f4",
+      "relation": "exact"
+    },
+    {
+      "path": "static/assets/judges-commentary-v2.webp",
+      "production_sha256": "0593aada87bd0f2c5f72aef4c6dc374107a7e80581f793de6f6ea34f369c1f83",
+      "repository_sha256": "0593aada87bd0f2c5f72aef4c6dc374107a7e80581f793de6f6ea34f369c1f83",
+      "relation": "exact"
+    },
+    {
+      "path": "static/common.js",
+      "production_sha256": "543934e642d07bbff98073fdc69aa86dccaa0f425006274c901af5a4b8ce1a97",
+      "repository_sha256": "543934e642d07bbff98073fdc69aa86dccaa0f425006274c901af5a4b8ce1a97",
+      "relation": "exact"
+    },
+    {
+      "path": "static/control.html",
+      "production_sha256": "f3b7babd6d20ea9ca8ecbd4fb56e942da889ddf3589b07702daf51b27cf04a6f",
+      "repository_sha256": "f3b7babd6d20ea9ca8ecbd4fb56e942da889ddf3589b07702daf51b27cf04a6f",
+      "relation": "exact"
+    },
+    {
+      "path": "static/control.js",
+      "production_sha256": "285b0276ac2e5550973434c2df6c7ef780be736f6ca2da99b0998e41a10edd67",
+      "repository_sha256": "285b0276ac2e5550973434c2df6c7ef780be736f6ca2da99b0998e41a10edd67",
+      "relation": "exact"
+    },
+    {
+      "path": "static/identities.js",
+      "production_sha256": "17fcf5f177a61fe8d9e2ba6278f137f4fd4f986d7688320c89fa07b73bee163b",
+      "repository_sha256": "9d330373cd1b139565b255b21907c418cd3014c0e10abac0d490c72158b4aeb1",
+      "relation": "documented_derivative"
+    },
+    {
+      "path": "static/index.html",
+      "production_sha256": "f7bafb8b3dc4a5a6ae1fec8c459188f0f9e7470b82dc48e658bc613b59108bca",
+      "repository_sha256": "f7bafb8b3dc4a5a6ae1fec8c459188f0f9e7470b82dc48e658bc613b59108bca",
+      "relation": "exact"
+    },
+    {
+      "path": "static/screen.js",
+      "production_sha256": "46ef3ebd91005bee228e71ef5bbb846492e139d01bebac422154c0cd320d4d66",
+      "repository_sha256": "46ef3ebd91005bee228e71ef5bbb846492e139d01bebac422154c0cd320d4d66",
+      "relation": "exact"
+    },
+    {
+      "path": "static/style.css",
+      "production_sha256": "8fc2c884b04165ead804c84e5e753b0905228563817aed12e60ebc0df5aa8b7e",
+      "repository_sha256": "8fc2c884b04165ead804c84e5e753b0905228563817aed12e60ebc0df5aa8b7e",
+      "relation": "exact"
+    }
+  ],
+  "additional_brand_asset": {
+    "path": "static/assets/brand.jpeg",
+    "repository_sha256": "a3ceb1bd7a4b54313ae896159b1880f59fecaaad3cb5c51d4af7c1d90788aed6",
+    "origin": "Same verified private release; reusable platform brand, not an event portrait."
+  },
+  "changes": [
+    {
+      "path": "app.py",
+      "scope": "CLI data/origin/port paths configurable through SHOWCASE_* env and CLI; explicit private password-hash and signing-key files required by CLI; optional create_app cookie_key_file added without changing old callers. Existing generated data-dir key remains the legacy library fallback. Runtime imports/line wrapping formatted only outside that startup adapter."
+    },
+    {
+      "path": "audio_events.py",
+      "scope": "Ruff formatting only; full module AST identical to production."
+    },
+    {
+      "path": "static/identities.js",
+      "scope": "Event-specific identity map removed; avatarUrl lookup and generic preset fallback preserved. No actual participant names or uploaded portraits included."
+    },
+    {
+      "path": "requirements.txt",
+      "scope": "Removed private build-command comments; all 14 original exact runtime pins preserved."
+    },
+    {
+      "path": "requirements-dev.txt",
+      "scope": "Existing httpx/zxing-cpp/Pillow test pins retained; complete transitive pins added with runtime constraints for standalone reproducibility."
+    },
+    {
+      "path": "tests/test_app.py",
+      "scope": "All 44 original test method identities retained; fixture root now temporary generic avatar and generated synthetic tones, replacing private event metadata/media."
+    },
+    {
+      "path": "tests/single-vote-wake.mjs",
+      "scope": "Portable local-only origin/import/output; corrected old expired-poll-only lease expectation to current production SSE heartbeat readiness. Native playback, forged-channel rejection, no replay and close-release checks retained. No business change made to satisfy that old assertion."
+    },
+    {
+      "path": "tests/single-vote-public-smoke.mjs",
+      "scope": "Portable local-only origin/import/output; labels explicitly describe local observations instead of production acceptance."
+    },
+    {
+      "path": "ops/init_config.py",
+      "scope": "New explicit interactive private bootstrap, random key, scrypt admin hash, exclusive 0600 files; no default password and no values printed."
+    },
+    {
+      "path": "ops/jx-showcase.service.example",
+      "scope": "Existing unit security/resource shape retained as example; runtime settings supplied by private EnvironmentFile. No automatic installation, restart, proxy or certificate operation."
+    }
+  ],
+  "business_preservation": {
+    "all_original_top_level_classes_and_functions_except_startup_wrappers_ast_equal": true,
+    "create_app_nested_functions_ast_equal": 28,
+    "audio_events_module_ast_equal": true,
+    "static_runtime_files_except_identity_map_byte_exact": true
+  },
+  "excluded_private_or_oneoff_material": [
+    "SQLite, votes, sessions and runtime logs",
+    "password/hash/signing-key/environment values",
+    "event participant identities and uploaded portraits",
+    "all packaged greeting audio and event greeting manifest",
+    "one-off production installers/updaters/certificate/proxy/provider-generation scripts",
+    "historical browser reference snapshots and identity-sync metadata"
+  ],
+  "test_scope": "Synthetic local protocols and native browser tone playback only; not real speech, physical speakers, production QA or a full mixed debate.",
+  "files": {
+    ".gitignore": "52a644697a260574a5429429d1d760539ebcf52bcc305ab6054053246882230e",
+    ".prettierrc.json": "31eef325938108b2b10e35bd28fdcac03dddea723333292ea371d4d48d5c3731",
+    "DEPLOYMENT.md": "915a8987bc42fd60b7202b566412082f37be5c6aa57ba2a5ae552e95e1f5992b",
+    "README.md": "558c34fe9ab6d0ef3296cbe67f9bfcc6695f7ce97ccac9d5b7a1b8a36476d0db",
+    "app.py": "7871598692d4cff01a4c26f5668e8cf6b1475bc3c625c09954966c0635087b88",
+    "audio_events.py": "d02a9bdf21cb42dd368d181497324129f3f21f81dc25f2eb79a1e530762bd811",
+    "env.example": "9603403272efeb4ce9ba5b4d3122ceb8d827fcf55c5d1a6e2e029f594266a569",
+    "ops/init_config.py": "ed63dbde5f50229f4215858438c9cbcc9fe83bb696a581400026f68c84c4aff1",
+    "ops/jx-showcase.service.example": "68c51bdd13681b2802da451f876107a50ffa58aaacd68fe527916e3c72d6f447",
+    "requirements-dev.in": "7204971d4a028247a15ac86313e6fc2eb8d258cc200a970f3c51ead5253c631d",
+    "requirements-dev.txt": "ecfc2c58d9ea60cd627849cce1a5385b53b8c270feceb0ba3217a36ccac48e1d",
+    "requirements.in": "b230d4fcc23ab7daab355d4594e1ee3d423c3d8029c1bda394a4fe2193e398c6",
+    "requirements.txt": "cfa5310d8cc273d45d845b9431c03e9b6495999977d85e75af5f047f11652cb4",
+    "static/assets/agent-01.webp": "fab362502f125a713a76faf0e67959cc74305eb7a2e8d21fdcdee1d8d4c5759b",
+    "static/assets/agent-02.webp": "91718ce0eed796fecf23264bc2ffc2f9f23813c4820fc0ff7e18809191e1bc5b",
+    "static/assets/agent-03.webp": "cf537e364af850e5ae588febbe98a23d660f7aa9b99cba738dbdbb1d5099fab0",
+    "static/assets/agent-04.webp": "6276abb9422cea7bbd50bfa7dfca23d654b94f5b00905a9a4d4605815e8a0281",
+    "static/assets/award-medal-v1.png": "83c58c8118fecdede5718698d9cc641b21f52bd5379cb5eb3df7d736d88223c2",
+    "static/assets/award-trophy-v1.png": "d8c08ed2857d0de796d4a8348f910fc17900be983fcfc81957f82278fe235a22",
+    "static/assets/brand.jpeg": "a3ceb1bd7a4b54313ae896159b1880f59fecaaad3cb5c51d4af7c1d90788aed6",
+    "static/assets/human-01.webp": "307e980de43536d6aad69556b502bb8c18a14638b139532b660591c817f25a0d",
+    "static/assets/human-02.webp": "7ed67c6fc8316170d63bc40681fc57bf9c82df87ab3f97137e5abd3fb7a58756",
+    "static/assets/human-03.webp": "57b1ab619fd59fd6a947d7835012d361279f3fb97539cc0e0f99ee263328c649",
+    "static/assets/human-04.webp": "3de4b0995fd8a447d20d6536928df1476007d0cae89ad97d78da4710d712dbfd",
+    "static/assets/judges-commentary-v1.png": "1de1c625150cad45683f9823e3fecad736503595635e08faddd7ba87436020f4",
+    "static/assets/judges-commentary-v2.webp": "0593aada87bd0f2c5f72aef4c6dc374107a7e80581f793de6f6ea34f369c1f83",
+    "static/common.js": "543934e642d07bbff98073fdc69aa86dccaa0f425006274c901af5a4b8ce1a97",
+    "static/control.html": "f3b7babd6d20ea9ca8ecbd4fb56e942da889ddf3589b07702daf51b27cf04a6f",
+    "static/control.js": "285b0276ac2e5550973434c2df6c7ef780be736f6ca2da99b0998e41a10edd67",
+    "static/identities.js": "9d330373cd1b139565b255b21907c418cd3014c0e10abac0d490c72158b4aeb1",
+    "static/index.html": "f7bafb8b3dc4a5a6ae1fec8c459188f0f9e7470b82dc48e658bc613b59108bca",
+    "static/screen.js": "46ef3ebd91005bee228e71ef5bbb846492e139d01bebac422154c0cd320d4d66",
+    "static/style.css": "8fc2c884b04165ead804c84e5e753b0905228563817aed12e60ebc0df5aa8b7e",
+    "tests/fixtures.py": "10e6ddd8d63cad3c3663e933edbd34f017cfd5fb0cf41d06359f2ad6e0d4f670",
+    "tests/run-browser.mjs": "cdccb76832cb701ef571c5698ce065fd1827391639c1460745bb5c17de503324",
+    "tests/serve.py": "db9389b0cf139c4a4089504c30f8ac9725f0fcf41ea88e43a2a4d0c9abd8c8d9",
+    "tests/single-vote-public-smoke.mjs": "a52a9f02b00bfb3c23db10b24446ed0071b4c25c773ae0fa84cbe53a3209f1df",
+    "tests/single-vote-wake.mjs": "13cd5d5fc4d1ad9d3c1a436fcdbc3a533d8b512029b738c3d9a91965bf4067de",
+    "tests/test_app.py": "a9e1e73cefea724334d2e0a2684ce4a942f65f2e340b83ab5be2169c82cf9a60",
+    "tests/test_bootstrap.py": "d3870e0e637a3c9f4c9229f69b8633814e4e0a3590bfefd88e8ee362230edbd6",
+    "tests/vote-browser.mjs": "b4e824ec40a8c0e5e65822b0be1ffd590804e80108f75dd3ba8da48b210b48e3"
+  }
+}

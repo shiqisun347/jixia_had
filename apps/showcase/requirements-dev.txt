@@ -1,0 +1,71 @@
+annotated-doc==0.0.5
+    # via
+    #   -r apps/showcase/requirements.txt
+    #   fastapi
+annotated-types==0.8.0
+    # via
+    #   -r apps/showcase/requirements.txt
+    #   pydantic
+anyio==4.15.1
+    # via
+    #   -r apps/showcase/requirements.txt
+    #   httpx
+    #   starlette
+certifi==2026.7.22
+    # via
+    #   httpcore
+    #   httpx
+click==8.5.0
+    # via
+    #   -r apps/showcase/requirements.txt
+    #   uvicorn
+fastapi==0.141.1
+    # via -r apps/showcase/requirements.txt
+h11==0.16.0
+    # via
+    #   -r apps/showcase/requirements.txt
+    #   httpcore
+    #   uvicorn
+httpcore==1.0.9
+    # via httpx
+httpx==0.28.1
+    # via -r apps/showcase/requirements-dev.in
+idna==3.20
+    # via
+    #   -r apps/showcase/requirements.txt
+    #   anyio
+    #   httpx
+pillow==12.3.0
+    # via -r apps/showcase/requirements-dev.in
+pydantic==2.14.1
+    # via
+    #   -r apps/showcase/requirements.txt
+    #   fastapi
+pydantic-core==2.50.1
+    # via
+    #   -r apps/showcase/requirements.txt
+    #   pydantic
+segno==1.6.6
+    # via -r apps/showcase/requirements.txt
+starlette==1.8.0
+    # via
+    #   -r apps/showcase/requirements.txt
+    #   fastapi
+typing-extensions==4.16.0
+    # via
+    #   -r apps/showcase/requirements.txt
+    #   anyio
+    #   fastapi
+    #   pydantic
+    #   pydantic-core
+    #   starlette
+    #   typing-inspection
+typing-inspection==0.4.4
+    # via
+    #   -r apps/showcase/requirements.txt
+    #   fastapi
+    #   pydantic
+uvicorn==0.52.1
+    # via -r apps/showcase/requirements.txt
+zxing-cpp==3.1.1
+    # via -r apps/showcase/requirements-dev.in

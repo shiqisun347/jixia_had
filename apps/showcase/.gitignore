@@ -1,0 +1,7 @@
+.venv/
+data/
+private/
+test-results/
+static/assets/avatars/
+static/assets/greetings/
+__pycache__/

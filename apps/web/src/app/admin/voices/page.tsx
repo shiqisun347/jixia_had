@@ -24,7 +24,7 @@ import { useAdminSubmit } from '@/features/admin/use-admin-submit';
 import { submitCatalogSave } from '@/features/admin/submit-catalog-save';
 import { playVoicePreview } from '@/features/admin/play-voice-preview';
 import { requestJson } from '@/lib/auth-api';
-import { AGENT_AVATAR_KEYS, avatarAssetUrl } from '@/lib/avatar-catalog';
+import { AGENT_SELECTABLE_AVATAR_KEYS, avatarAssetUrl } from '@/lib/avatar-catalog';
 import { useSingleFlight } from '@/hooks/use-single-flight';
 import { AdminBulkActions } from '@/features/admin/admin-bulk-actions';
 
@@ -406,7 +406,7 @@ function VoiceDrawer({
               试听后选择与声音年龄感、性别表达和气质最匹配的形象。
             </p>
             <div className="mt-3 grid grid-cols-6 gap-2" role="radiogroup">
-              {AGENT_AVATAR_KEYS.map((key) => (
+              {AGENT_SELECTABLE_AVATAR_KEYS.map((key) => (
                 <button
                   aria-checked={avatarKey === key}
                   aria-label={`Agent 头像 ${key}`}

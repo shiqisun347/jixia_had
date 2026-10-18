@@ -1,176 +1,60 @@
-# 服务器在线部署教程
+# v2.0 部署
 
-本文只记录部署流程，不包含服务器地址、密码、API Key 或真实数据。生产环境的敏感值由服务器受保护的 EnvironmentFile 提供；本地 `api.md` 永不提交。
+产品版本为v2.0；既有Core/Jobs内部包2.1.0及`preflight_v2_1.sh`文件名保留兼容。本文记录原生部署步骤，不包含真实连接串、密码或API密钥。首次初始化见[复现文档](v2-reproduction.md)，灾备见[备份恢复](v2-backup-and-recovery.md)。
 
-## 组件
+## 当前已核基线
 
-- PostgreSQL：业务数据、Session、任务队列。
-- `jx-core`：FastAPI 单实例，监听内网端口，持有 PostgreSQL advisory lock。
-- `jx-jobs`：主持音频、归档、导出、清理和排行榜任务。
-- `jx-web`：Next standalone 用户端/管理端。
-- LiveKit：自托管音频转发。
-- 1Panel OpenResty：HTTPS 和公网反向代理（当前服务器实际入口；Caddy 仅为历史设计基线）。
+| 项目 | 已发布事实                                                                         |
+| ---- | ---------------------------------------------------------------------------------- |
+| Core | Spec308/309及此前已发布可靠性修复；173保护安装源                                   |
+| Web  | Spec312展示切片，构建`J6YFijOoE7TSV9ijePYSO`                                       |
+| 迁移 | 唯一head `0049_agent_human_avatars`                                                |
+| 配置 | Spec327原生138行保存/138正常审计；YXH275、新国辩146，新房生效                      |
+| 媒体 | LiveKit Python SDK1.1.20；当前模型/接入由非密钥运行基线明确                        |
+| 服务 | 单实例Core、Jobs、Next Web、自托管LiveKit、PostgreSQL、OpenResty及已有独立Showcase |
 
-本文早期发布记录曾以 Core/Jobs 2.1.0、数据库 `0041_ai_debate_questionnaires` 为基线，并要求在
-追加 `0042_agent_decision_reason` 前清零活动比赛；该历史基线不代表当前 head。当前仓库已追加到
-`0046_provider_capture_snapshots`，发布前必须以 `scripts/ops/preflight_v2_1.sh` 动态读取 checkout 的
-Alembic head，并在受保护窗口核对生产 head，不能复用旧版硬编码 migration 预检脚本。
-Web 只展示 Core 权威状态。
-生产部署必须启用 HTTPS，LiveKit 只传输音频，比赛命令继续使用 Core WebSocket。
+上述是生产发布证据，不是Spec328本次全门禁、备份恢复或干净克隆已经通过的证明。当前整理不重启、不重新发布在线服务，不改比赛、媒体协议或模型。
 
-Spec 300 在 Core/Jobs 各使用一个有界研究采集 writer。`PROVIDER_CAPTURE_ENABLED`
-默认 `true`；故障窗口可在同一兼容版本中设为 `false`，停止新增 raw capture 写入，
-保留管理员历史投影、冻结导出和包含新引用的内容清理。新调用仍有权威结果，raw 缺口
-显示 `capture_not_persisted`。不得退回同步写热路径、移除新表或使用不识别新 capture/
-快照引用的旧读取和清理代码。此开关需按下述受保护发布窗口应用，不能绕过非终态门禁。
+## 运行配置
 
-## 发布顺序
+新实例参考`resources/v2/runtime.env.example`保留实际ASR/TTS模型、接入与路径，结合根`.env.example`补齐环境变量。所有真实认证值只通过服务器受保护的EnvironmentFile或进程环境提供。Core、Jobs与媒体端需使用同一组经审核配置，不以源码旧默认值或旧Spike模型名覆盖实际版本。
 
-生产保留受控创建的管理员、公开注册用户和历史比赛数据。任何资源恢复只允许按对应规格的
-白名单执行，不得恢复旧 Session、凭据或未批准的房间、比赛、实验、日志和排行榜数据；也不得
-在命令行传递密码。发布前必须先处理非终态比赛/房间和终态清理门禁，不能用迁移或重启绕过。
+公开资源导入后，`HOST_AUDIO_STORAGE_DIR`指向`resources/v2/assets`的绝对路径；其余上传头像、Agent/比赛音频和导出目录为独立可写数据路径。生产既有目录可能位于仓库外，源同步不得覆盖或删除。模型密文依赖`LLM_KEY_ENCRYPTION_KEY`，它须单独备份；公开资源包不保存生产密文。
 
-面向研究人员的页面和比赛操作见 [线上实验操作手册](./线上实验操作手册.md)。
+LiveKit只传音频，Core WebSocket承载命令/状态。Core持有PostgreSQL advisory lock，只能有一个权威进程。新主机完整 unit、standalone 布置和 LiveKit 私有配置映射见[原生服务安装](v2-native-services.md)，公开模板在 `ops/systemd/templates/`。生产使用有效HTTPS；OpenResty模板见`ops/openresty/`。Certbot钩子只复制授权证书材料、先检查配置再平滑reload，不把私钥带入源码或输出。
 
-1. 在独立测试库执行全部追加 migration 和发布门禁；确认 Alembic head 与当前发布版本一致。
-2. 构建 Web：在与生产 Web 相同的非敏感配置中显式设置
-   `CORE_API_ORIGIN=http://127.0.0.1:8100 pnpm build`（或使用生产反向代理前的 Core 地址）。
-   构建产物不得使用开发默认端口 `8000`；门禁会校验 rewrite 目标。
-3. 查询非终态比赛和房间；任一数量不为零时等待，不暂停、终止或删除真实比赛或房间。
-4. 备份当前服务目录和 standalone 目录，保留可回滚副本。
-5. 对生产库做可恢复备份，再执行
-   `uv run --package jx-core alembic upgrade head` 追加 migration；不得修改旧 migration。
-6. 同步 Core/Jobs 源码和 Web standalone；排除 `.env`、数据库、音频、日志和缓存。Web 必须从同一次
-   `pnpm build` 产出的完整 `.next/standalone` 和 `.next/static` 原子切换，禁止只同步单个页面源码或
-   复用旧 standalone。构建脚本会拒绝缺少 `/me/ai-experience`、`/me/postmatch-surveys` 路由或个人中心入口的
-   不完整产物。
-7. 重启顺序：migration → `jx-core` → `jx-jobs` → `jx-web`。
-8. 核对实际模块 `__file__`、包版本和源码哈希，再检查四个 systemd
-   服务、Core `/health/live`、`/health/ready`、公网首页和关键权限接口。Web 切换后必须逐一请求两个问卷
-   页面并检查未登录时为登录边界（不是 404），同时检查构建产物包含个人中心的两个入口；页面源码、静态
-   资源和服务进程必须来自同一构建标识。
-9. 在隔离数据库恢复 Spec 212 前的受保护 dump，先运行
-   `scripts/ops/restore_rule_resources.py` dry-run，再向生产执行白名单导入；核对排除项计数为 0。
-10. 运行 `scripts/ops/ensure_paper_experiment_rule.py` 规范化论文实验规则，等待 Jobs 生成主持音频，
-    人工复核后启用；不得绕过音频完整性校验。
-11. 以管理员会话检查规则目录、规则工作台、阶段抽屉、规则范围 Agent 编辑和房间创建；确认旧论文
-    规则已归档且不出现在默认列表。
-12. 运行供应商短链路探针，并观察至少 5 分钟 warning-or-higher 日志；无异常后记录发布证据。
+## 新实例或后续应用发布
 
-当前 OpenResty 容器从 1Panel 挂载目录读取证书。Certbot 续期钩子使用
-`ops/openresty/certbot-deploy-hook.sh`：只在续期成功后复制证书，先执行
-`openresty -t`，再发送 HUP 平滑加载；私钥不进入仓库或命令输出。
-
-## 推荐命令模板
+1. 选定明确稳定提交，校验源码、锁、资源/资产manifest；在独立数据库完成空库迁移或兼容恢复及标准门禁。迁移只追加，不能改旧文件。
+2. 生产Web只能从仓库脚本构建，并显式设置非敏感Core地址：
 
 ```bash
 pnpm install --frozen-lockfile
 uv sync --all-packages --frozen
-pnpm lint
-pnpm typecheck
-pnpm test
-pnpm contracts:check
-pnpm build
-pnpm db:revision:check
-uv run --package jx-core alembic upgrade head
+CORE_API_ORIGIN=http://127.0.0.1:8100 pnpm build
 ```
 
-在服务器发布前，先以与 Core 相同的非敏感运行上下文执行只读预检。脚本只读取 systemd
-状态、Core HTTP 状态和 PostgreSQL revision/计数，不读取或输出 EnvironmentFile 内容，也
-不会迁移、重启、暂停或终止比赛：
+3. 记录并保留同次构建的standalone、static、public、build ID和路由/rewrite检查，不能只同步页面文件或混入旧static。备份旧源码/构建/数据库及持久资产。
+4. 发布人员执行fresh只读门禁：服务状态、实际导入路径/版本、迁移head、0非终态房间/比赛/连接及终态清理。出现活动时等待，不为发布自动暂停、终止或删除他人比赛。现有`scripts/ops/preflight_v2_1.sh`只读检查；由受保护环境注入数据库配置，不把连接串拼进命令或shell历史。
+5. 新实例从 `ops/systemd/templates/*.service.example` 安装完整 unit，按[原生服务安装](v2-native-services.md)核配置、路径和依赖。现有 `ops/systemd/*.service.d` 属于历史安装布局，不原样叠加到新模板。需受控应用发布时按迁移→Core→Jobs→Web恢复，记录实际依赖；`jx-web.service`依赖Core，停止Core可能连停Web，不能仅start Core后声称全部恢复。LiveKit实际unit为`jx-livekit.service`。
+6. 核`module.__file__`、173源/依赖/迁移与构建是否匹配，检查Core `/health/live`、`/health/ready`、Web和公网入口、鉴权与静态资源。核Core唯一实例、服务PID/资源限制、日志和数据目录权限。
+7. 以正常API为两条赛制各建一个自有不开赛QA房，核全部198 prompt、变量/contract及修订，正常关闭；新房验证不启动比赛、不调用提供方，旧房/历史不回填。
+8. 保存本次发布及保护后验、清理回执和未完成项。只有单独授权并实际执行真实语音/比赛/压力检查后，才能填写相应通过。
 
-```bash
-PATH="/path/to/uv/bin:$PATH" \
-DATABASE_URL='postgresql+psycopg://由受保护环境注入' \
-JX_PREFLIGHT_CORE_URL='http://127.0.0.1:8100' \
-JX_PREFLIGHT_PYTHON='/usr/bin/python3' \
-bash scripts/ops/preflight_v2_1.sh
-```
+Spec327是仅配置原生事务更新，没有源码部署或服务重启；不要为复现它执行历史未发布Core候选。普通源码发布与配置更新是不同操作，必须绑定实际计划和回滚证据。
 
-实际运行时应通过受保护的会话或包装命令注入 `DATABASE_URL`，不要把真实连接串写入 shell
-历史。任一服务非 active、版本/导入路径不匹配、健康检查失败、migration 不是当前发布 head，或
-存在非终态比赛或房间时，脚本返回非零；发布人员必须停止，不得用脚本自动修复服务器状态。
-受保护窗口可额外设置 `JX_PREFLIGHT_REQUIRE_CGROUP_TELEMETRY=1`，让缺少 cgroup 峰值快照或
-非零 `oom_kill` 直接阻断；该开关只验证证据，不会替代 staging 压测，也不会自动设置
-`MemoryHigh/MemoryMax`。
+## 测试数据库与探针
 
-资源审计中的 `systemd_nofile` 对应 systemd 的 hard 限制，`systemd_nofile_soft` 对应
-声明的 soft 限制；`soft_nofile`/`hard_nofile` 来自实际进程。hard=524288 不能证明 soft
-已生效。需要安装既有 `LimitNOFILE=524288:524288` drop-in 时，仍按 Spec 283 的受保护
-窗口执行；先核对 `LimitNOFILESoft`，再受控重启并核对实际进程限制，不用临时 `prlimit`
-绕过发布门禁。
+`pnpm test:db`要求单独的`TEST_DATABASE_URL`。完整认证/Agent夹具会TRUNCATE业务表；只能使用新建、明确可销毁的实例/数据库，不能复用生产、应用库、私有恢复副本或保留管理员/验收数据的QA库。Agent故障夹具要求库名`jx_debate_qa_agent_faults`与回环地址，可在新自有实例使用该名称及新端口；地址不同不自动构成删除授权。
 
-应用发布后、正式实验启用前，使用服务器受保护配置运行一次真实供应商配置短链路探针。
-该探针不创建实验批次或保存音频文件，但会新增 `source_kind=OPS_PROBE` 的
-`ExternalCall`，并通过现有 capture helper 保存脱敏原始 request/response；因此会写入
-数据库，不能当作只读预检。标准输出只包含脱敏延迟与计数。它还会产生一次短 TTS、
-ASR、LLM、裁判调用和一个随连接关闭的临时 LiveKit 房间：
+`pnpm test:auth:browser`也会迁移并清理认证相关表，不应复用上述Agent测试库。调用者先核目标归属；测试入口变量存在或不等于生产地址，不证明目标可清空。
 
-```bash
-set -a
-source /opt/jixia-debate/.env
-set +a
-PYTHONPATH=/opt/jixia-debate/apps/core/src:/opt/jixia-debate/apps/jobs/src:/opt/jixia-runtime-site \
-  /usr/bin/python3 scripts/ops/provider_chain_probe.py
-```
+`scripts/ops/provider_chain_probe.py`及相关真实供应商/语音探针会调用模型、写`ExternalCall`或capture，并可能创建临时媒体房间，不是只读预检。不要把它们放入默认资源bootstrap/离线恢复流程；只有授权真实调用时才运行。短探针通过也不证明50路长期流、五场完整媒体比赛或现场设备通过。
 
-探针全部通过只证明服务端供应商配置短链路可用，不替代真人麦克风、设备兼容、并发压力
-或音色盲听验收。`--load` 的 LLM 探针仍是 `max_tokens=32` 的健康 JSON 请求；各类探针
-分组执行，LiveKit 连接按次串行清理且不传音频，不能据此验收 50 路长期真实流或五场完整
-媒体比赛，也不验证 Spec 300 的应用 writer 热路径。失败时保持
-`PAPER_EXPERIMENT_ENABLED=false`，不得静默更换模型、音色或供应商。
+## 独立Showcase与回滚
 
-数据库集成门禁使用独立数据库，不能指向生产 `DATABASE_URL`：
+Showcase源位于`apps/showcase`，使用独立Python环境、SQLite和私有认证文件，监听回环地址后由其独立HTTPS虚拟主机暴露。初始化和本地启动见[复现文档](v2-reproduction.md)；不沿用生产口令或投票数据作为公开默认值。
 
-```bash
-RUN_DATABASE_INTEGRATION=1 TEST_DATABASE_URL='postgresql+psycopg://.../jx_test' \
-  uv run --package jx-core pytest -q apps/core/tests/test_experiment_integration.py
-```
+回滚使用同构建旧应用/静态产物和兼容数据库，不做破坏性downgrade、不覆盖新投票/历史。配置逆向仍需新增正常revision与审计，并检查活动/历史变化；未知提交不盲重试。备份和恢复步骤及验证边界见[备份恢复](v2-backup-and-recovery.md)。
 
-全量 `pnpm test:db` 包含真实 Agent 故障与 ORM 回滚夹具，也包含具有清空行为的
-`apps/core/tests/test_auth_migration_integration.py::auth_database_url`：每个认证测试
-前后会对房间、比赛、用户、模型、审计等表执行 `TRUNCATE ... CASCADE`。
-因此只能使用专门新建、独立且可销毁的 PostgreSQL 实例／数据库；不能复用应用库、
-生产库或保留 ADMIN、导出与验收证据的既有 QA 库。
-
-Agent 夹具还要求数据库名为 `jx_debate_qa_agent_faults`、主机为 `127.0.0.1` 或
-`localhost`。保留同名既有 QA 库时，可在新建的可销毁实例中创建同名库并使用新端口，
-显式传入不同的 `DATABASE_URL` 和 `TEST_DATABASE_URL`；地址不同不等于有权清空。
-CI 自动创建可销毁库并传入两个独立地址；本地 `db:start` 只启动应用 PostgreSQL，
-不会代建此 QA 库。夹具迁移加载禁用 dotenv，不使用生产配置。
-
-`pnpm test:auth:browser` 是另一种具有清空行为的认证测试入口：
-`scripts/run-auth-browser.mjs` 会先对 `TEST_DATABASE_URL` 执行 migration，并在测试前后
-调用 `scripts/reset-auth-test-db.py`，对 `users`、`sessions`、`audit_logs`、
-`room_connections` 和 `user_consents` 执行 `TRUNCATE ... CASCADE`。其现有地址校验仅要求
-测试 URL 存在且不等于 `DATABASE_URL`，不会证明数据库可安全清空。只允许使用专门新建、
-独立且可销毁的 QA 数据库；不能指向生产、应用库或保留管理员与验收 fixture 的既有 QA 库，
-也不能复用上述 `jx_debate_qa_agent_faults`。运行前须由调用者核实地址与数据库归属。
-
-生产环境还必须提供现有 Core/Jobs/Web/LiveKit/OpenResty 所需配置。当前生产
-`PAPER_EXPERIMENT_ENABLED=true`；暂停正式实验能力时改回 `false` 并重启 Core/Jobs。
-密钥只放入服务器受保护的 EnvironmentFile；不要在命令行、Git、构建产物或
-文档中填写真实值。
-
-## 实验发布验收
-
-- 未登录用户只能看到公开比赛记录；不得取得队内举手或 Agent 决策状态。
-- 参与者从“实验”进入自己的预约并自动落入固定席位；非排表用户只能观战。
-- 管理员能看到 18 场正式赛和 3 场训练赛，训练赛不进入正式排行榜和研究统计。
-- 停用批次前会拒绝活动 attempt；停用后预约入口消失，历史管理和导出仍可读。
-- AI 裁判、ASR、LLM、TTS 和 LiveKit 必须用服务器真实凭据各完成一次链路验证；失败时
-  按 PRD 暂停或重试，不得静默更换模型或供应商。
-
-远程操作应使用已配置的 SSH key 或服务器密钥管理，不把密码拼进 shell 历史。同步时使用明确文件列表或排除规则，禁止对 `/opt` 等宽目录使用 `rsync --delete`。
-同步 staging 内容到 `/opt/jixia-debate/` 时不得让 rsync 覆盖运行目录本身的所有者或权限；同步后必须
-确认该目录为服务用户可进入的 0755，再重启 Core/Jobs。
-
-## 回滚
-
-应用回滚：先关闭实验新建能力，停止服务，恢复上一份源码/standalone，重启并检查健康
-状态。0029–0040 保持在数据库中，由旧应用忽略可兼容的新增表和字段；不得执行破坏性 downgrade，
-不得删除或重新启用已停用批次。保留发布时间、构建标识、迁移 head、健康检查和日志摘要。
-
-## 本机数据边界
-
-本机工作区不保存生产数据库、比赛记录、用户信息、音频或日志。`.env.example` 只包含变量名和占位说明；真实 EnvironmentFile 只存在服务器。
+同步仅使用明确文件列表和已审核目标，不对`/opt`等宽目录使用`rsync --delete`。保留服务用户可进入的目录权限，源同步不得夹带.env、数据、录音、日志或临时凭据。

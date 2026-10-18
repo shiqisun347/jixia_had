@@ -145,8 +145,8 @@ export function actionLabel(
         return `轮到${values?.speaker ?? currentSpeakerLabel}发言`;
       const legacy: Record<string, string> = {
         'hostAnnouncing.eyebrow': '赛制播报',
-        'hostAnnouncing.title': '主持音频播放中',
-        'hostAnnouncing.detail': '播报结束后进入当前阶段。',
+        'hostAnnouncing.title': '主持串场',
+        'hostAnnouncing.detail': '',
         'humanReady.eyebrow': '当前发言席位已就绪',
         'humanReady.ownTitle': '轮到你发言了！',
         'humanReady.ownDetail': '点击开始后才会开启麦克风并启动正式计时。',
@@ -158,8 +158,8 @@ export function actionLabel(
         'finalizing.title': '正在整理文字记录',
         'finalizing.detail': '发言已经结束，正在等待 ASR 最终结果。',
         'agentPreparing.eyebrow': 'Agent 准备中',
-        'agentPreparing.title': 'Agent 正在思考中',
-        'agentPreparing.detail': '正在生成正式发言并建立实时语音，等待时间不计入发言时长。',
+        'agentPreparing.title': '正在思考',
+        'agentPreparing.detail': '',
         'agentSpeaking.eyebrow': 'Agent 实时发言',
         'agentSpeaking.title': 'Agent 正在发言',
         'agentSpeaking.detail': '语音正在实时播放，文字记录同步更新。',

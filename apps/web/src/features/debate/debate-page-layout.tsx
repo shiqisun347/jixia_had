@@ -12,7 +12,6 @@ import {
   Maximize2,
   Hand,
   Mic,
-  Megaphone,
   Pause,
   Play,
   Radio,
@@ -20,7 +19,6 @@ import {
   RotateCcw,
   Save,
   ShieldCheck,
-  Sparkles,
   Square,
   UserRound,
   UsersRound,
@@ -404,7 +402,13 @@ function Waveform({
   );
 }
 
-function CountdownTrack({ milliseconds }: { milliseconds: number | null | undefined }) {
+function CountdownTrack({
+  milliseconds,
+  resuming,
+}: {
+  milliseconds: number | null | undefined;
+  resuming: boolean;
+}) {
   const t = useAppTranslations('Debate');
   const value =
     milliseconds === null || milliseconds === undefined
@@ -413,11 +417,13 @@ function CountdownTrack({ milliseconds }: { milliseconds: number | null | undefi
   return (
     <div
       aria-label={t('detail.countdown')}
-      className="mt-3 flex items-center justify-center"
+      className="debate-center-card debate-center-card--stage debate-countdown flex w-full flex-col items-center rounded-3xl"
+      data-testid="countdown-stage"
       role="status"
     >
+      <h3 className="debate-center-state">{t(resuming ? 'center.resuming' : 'center.starting')}</h3>
       <span
-        className="grid size-12 place-items-center border border-[#b7ef00]/80 bg-white/90 font-mono text-xl font-black text-[#6c9100] shadow-[0_0_30px_rgba(183,239,0,0.28)] motion-safe:animate-[jx-countdown_.45s_ease-out] [clip-path:polygon(25%_7%,75%_7%,100%_50%,75%_93%,25%_93%,0_50%)]"
+        className="debate-countdown-value font-black motion-safe:animate-[jx-countdown_.45s_ease-out]"
         key={value}
       >
         {value ?? '…'}
@@ -434,6 +440,8 @@ function SeatCard({
   agentHandOrder,
   agentStatus,
   online,
+  speaking,
+  thinking,
 }: {
   seat: Seat;
   active: boolean;
@@ -442,28 +450,47 @@ function SeatCard({
   agentHandOrder: number;
   agentStatus: AgentSeatStatus;
   online?: boolean;
+  speaking: boolean;
+  thinking: boolean;
 }) {
   const t = useAppTranslations('Debate');
   const { locale } = useAppLocale();
   const tone = sideTone(seat.side);
+  const stateLabel = speaking
+    ? t(seat.occupant_type === 'AGENT' ? 'center.agentSpeaking' : 'center.humanSpeaking')
+    : thinking && agentStatus !== 'DECIDING'
+      ? t('center.agentPreparing')
+      : agentStatus === 'DECIDING' && handOrder === 0 && agentHandOrder === 0
+        ? t('detail.agentDeciding')
+        : null;
   return (
     <article
-      className={`debate-seat-card group relative flex min-h-0 items-center gap-3 rounded-2xl border px-3 py-2.5 transition ${
-        active
-          ? 'jx-active-seat-shadow border-[#b7ef00] bg-white ring-2 ring-[#eaff9f]'
-          : tone === 'red'
-            ? 'border-red-100/80 bg-gradient-to-br from-white via-white to-red-50/70 hover:border-red-300'
-            : 'border-blue-100/80 bg-gradient-to-br from-white via-white to-blue-50/70 hover:border-blue-300'
-      }`}
+      data-seat-id={seat.id}
+      data-side={seat.side}
+      data-active={active ? 'true' : 'false'}
+      data-speaking={speaking ? 'true' : 'false'}
+      data-thinking={thinking ? 'true' : 'false'}
+      className="debate-seat-card group relative flex min-h-0 items-center gap-3 rounded-2xl border px-3 py-2.5"
     >
+      <p
+        className="debate-seat-state"
+        aria-hidden={stateLabel ? undefined : true}
+        title={stateLabel ?? undefined}
+        role={agentStatus === 'DECIDING' && stateLabel ? 'status' : undefined}
+      >
+        {stateLabel ?? '\u00a0'}
+      </p>
       <SpeakerMark seat={seat} active={active} online={online} />
-      <div className="min-w-0 flex-1">
+      <div className="debate-seat-details min-w-0 flex-1">
         <div className="debate-seat-identity flex items-center gap-2">
-          <strong className="truncate text-base font-black leading-tight text-slate-950 xl:text-lg">
+          <strong
+            className="truncate text-base font-black leading-tight text-slate-950 xl:text-lg"
+            title={seat.occupant_name ?? undefined}
+          >
             {seat.occupant_name ?? t('emptySeat')}
           </strong>
           <span
-            className={`debate-seat-kind shrink-0 whitespace-nowrap rounded-full px-2.5 py-1 text-xs font-black leading-none ${seat.occupant_type === 'AGENT' ? 'bg-blue-100 text-blue-800' : 'bg-red-100 text-red-800'}`}
+            className={`debate-seat-kind shrink-0 whitespace-nowrap rounded-full bg-white/70 px-2.5 py-1 text-xs font-black leading-none ${tone === 'red' ? 'text-red-700' : 'text-blue-700'}`}
           >
             {seat.occupant_type === 'AGENT' ? t('ai') : t('human')}
           </span>
@@ -475,19 +502,28 @@ function SeatCard({
         </p>
         {handOrder > 0 ? (
           <span
-            className={`mt-1 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-black ${humanSelected ? 'bg-[#eaff9f] text-[#526b00]' : 'bg-amber-100 text-amber-700'}`}
+            title={`${t('detail.rank', { position: handOrder })}${humanSelected ? ` · ${t('detail.selectedToSpeak')}` : ''}`}
+            className={`debate-seat-note mt-1 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-black ${humanSelected ? 'bg-[#eaff9f] text-[#526b00]' : 'bg-amber-100 text-amber-700'}`}
           >
             <Hand className="size-3" /> {t('detail.rank', { position: handOrder })}
             {humanSelected ? ` · ${t('detail.selectedToSpeak')}` : ''}
           </span>
         ) : agentStatus === 'RAISE' ? (
-          <span className="mt-1 inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-black text-amber-700">
+          <span
+            title={t('detail.agentRequested')}
+            className="debate-seat-note mt-1 inline-flex items-center gap-1 rounded-full bg-amber-100 px-2 py-0.5 text-[10px] font-black text-amber-700"
+          >
             <Hand className="size-3" /> {t('detail.agentRequested')}
           </span>
         ) : agentHandOrder > 0 ? (
           <span
             aria-label={`${t('ai')} ${t('detail.rank', { position: agentHandOrder })}`}
-            className={`mt-1 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-black ${agentStatus === 'SELECTED' ? 'bg-[#eaff9f] text-[#526b00]' : 'bg-amber-100 text-amber-700'}`}
+            title={
+              agentStatus === 'SELECTED'
+                ? t('detail.selectedToSpeak')
+                : t('detail.rank', { position: agentHandOrder })
+            }
+            className={`debate-seat-note mt-1 inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-black ${agentStatus === 'SELECTED' ? 'bg-[#eaff9f] text-[#526b00]' : 'bg-amber-100 text-amber-700'}`}
           >
             <Hand className="size-3" />{' '}
             {agentStatus === 'SELECTED'
@@ -495,32 +531,31 @@ function SeatCard({
               : t('detail.rank', { position: agentHandOrder })}
           </span>
         ) : agentStatus === 'FALLBACK' ? (
-          <span className="mt-1 inline-flex rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-black text-slate-600">
-            {t('detail.agentFallback')}
-          </span>
-        ) : agentStatus === 'DECIDING' ? (
           <span
-            aria-label={t('detail.agentDeciding')}
-            className="mt-1 inline-flex rounded-full bg-blue-50 px-2 py-0.5 text-[10px] font-black text-blue-600 motion-safe:animate-pulse"
-            role="status"
+            title={t('detail.agentFallback')}
+            className="debate-seat-note mt-1 inline-flex rounded-full bg-slate-100 px-2 py-0.5 text-[10px] font-black text-slate-600"
           >
-            {t('detail.agentDeciding')}
+            {t('detail.agentFallback')}
           </span>
         ) : agentStatus === 'WAITING' ? (
           <span
             aria-label={t('detail.agentWaiting')}
-            className="mt-1 inline-flex rounded-full border border-blue-100 bg-blue-50 px-2 py-0.5 text-[10px] font-black text-blue-600"
+            title={t('detail.agentWaiting')}
+            className="debate-seat-note mt-1 inline-flex rounded-full border border-blue-100 bg-blue-50 px-2 py-0.5 text-[10px] font-black text-blue-600"
             role="status"
           >
             {t('detail.agentWaiting')}
           </span>
         ) : agentStatus === 'SKIP' ? (
-          <span className="mt-1 inline-flex rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-black text-slate-600">
+          <span
+            title={t('detail.skip')}
+            className="debate-seat-note mt-1 inline-flex rounded-full border border-slate-200 bg-white px-2 py-0.5 text-[10px] font-black text-slate-600"
+          >
             {t('detail.skip')}
           </span>
         ) : null}
       </div>
-      {active ? (
+      {speaking ? (
         <span className="debate-seat-activity">
           <Waveform compact />
         </span>
@@ -587,27 +622,28 @@ function FreeDebateClock({ snapshot }: { snapshot: MatchSnapshot }) {
   const negativeActive = holderSide === 'NEGATIVE';
   return (
     <div
-      className="mt-3 w-full max-w-xl rounded-2xl border border-blue-100 bg-white/90 px-3 py-2.5 shadow-[0_8px_24px_rgba(42,83,130,0.08)]"
+      className="debate-free-clock w-full max-w-xl rounded-2xl border border-[var(--jx-line)] bg-[var(--jx-surface-solid)] px-4 py-3"
       data-testid="free-debate-clock"
     >
-      <div className="flex items-center justify-between gap-2 text-xs font-black sm:text-sm">
-        <span
-          className={`rounded-lg px-2 py-1 text-red-700 ${affirmativeActive ? 'bg-[#efffc1] ring-1 ring-[#b7ef00]/60' : 'bg-red-50/60'}`}
+      <div className="grid grid-cols-2 gap-4">
+        <div
+          role="group"
+          aria-label={
+            affirmativeActive ? t('holder', { side: t('affirmative') }) : t('affirmative')
+          }
+          className={`debate-free-balance flex items-baseline justify-between gap-2 text-red-700 ${affirmativeActive ? 'font-bold' : ''}`}
         >
-          {t('affirmative')} {formatRemaining(affirmative)} / {formatRemaining(total)}
-        </span>
-        <span className="rounded-lg bg-slate-100 px-2 py-1 text-[10px] text-slate-600 sm:text-xs">
-          {holderSide
-            ? t('holder', { side: sideLabel(holderSide, t) })
-            : snapshot.free_holder_side
-              ? t('center.applicantSide', { side: sideLabel(snapshot.free_holder_side, t) })
-              : t('freeDebate')}
-        </span>
-        <span
-          className={`rounded-lg px-2 py-1 text-blue-700 ${negativeActive ? 'bg-[#efffc1] ring-1 ring-[#b7ef00]/60' : 'bg-blue-50/60'}`}
+          <span>{t('affirmative')}</span>
+          <strong className="tabular-nums">{formatRemaining(affirmative)}</strong>
+        </div>
+        <div
+          role="group"
+          aria-label={negativeActive ? t('holder', { side: t('negative') }) : t('negative')}
+          className={`debate-free-balance flex items-baseline justify-between gap-2 text-blue-700 ${negativeActive ? 'font-bold' : ''}`}
         >
-          {t('negative')} {formatRemaining(negative)} / {formatRemaining(total)}
-        </span>
+          <span>{t('negative')}</span>
+          <strong className="tabular-nums">{formatRemaining(negative)}</strong>
+        </div>
       </div>
       <div className="mt-2 grid grid-cols-2 gap-1.5">
         <span
@@ -876,16 +912,31 @@ function CenterStatusCard({
   title,
   children,
   testId,
-}: Readonly<{ icon: ReactNode; title: string; children?: ReactNode; testId?: string }>) {
+  stage = false,
+  brand = false,
+}: Readonly<{
+  icon: ReactNode;
+  title: string;
+  children?: ReactNode;
+  testId?: string;
+  stage?: boolean;
+  brand?: boolean;
+}>) {
   return (
     <div
-      className="debate-center-card mt-4 flex w-full max-w-md flex-col items-center rounded-3xl border border-blue-100 bg-white/80 px-5 py-5"
+      className={`debate-center-card ${stage ? 'debate-center-card--stage' : ''} ${brand ? 'debate-center-card--brand' : ''} mt-4 flex w-full max-w-md flex-col items-center rounded-3xl border border-blue-100 bg-white/80 px-5 py-5`}
       data-testid={testId}
     >
-      <span className="debate-center-icon grid size-14 shrink-0 place-items-center rounded-full bg-blue-50 text-blue-700">
+      <span
+        className={
+          brand
+            ? 'debate-center-brand'
+            : 'debate-center-icon grid size-14 shrink-0 place-items-center rounded-full bg-blue-50 text-blue-700'
+        }
+      >
         {icon}
       </span>
-      <strong className="mt-3 text-lg font-black text-slate-950">{title}</strong>
+      <h3 className="debate-center-state mt-3 text-lg font-black text-slate-950">{title}</h3>
       {children}
     </div>
   );
@@ -943,10 +994,10 @@ function CenterContent({
         {hint(t(mode === 'finished' ? 'center.finishedHint' : 'center.terminatedHint'))}
         <Link
           className={`${buttonVariants({ variant: 'primary', size: 'sm' })} mt-4`}
-          href={`/matches/${matchId}`}
+          href={mode === 'finished' ? 'https://showcase.vsagents.online/' : `/matches/${matchId}`}
         >
           <FileText className="size-4" />
-          {t(mode === 'finished' ? 'postmatch' : 'terminatedRecord')}
+          {t(mode === 'finished' ? 'audienceVoting' : 'terminatedRecord')}
         </Link>
       </CenterStatusCard>
     );
@@ -955,7 +1006,7 @@ function CenterContent({
     return (
       <CenterStatusCard
         icon={<Pause className="size-7" />}
-        title={t('detail.runtimeFrozen')}
+        title={t('center.pausedTitle')}
         testId="runtime-frozen-state"
       >
         {hint(t('detail.runtimeFrozenHint'))}
@@ -965,11 +1016,13 @@ function CenterContent({
   if (mode === 'waiting') {
     return (
       <CenterStatusCard
-        icon={<Clock3 className="size-7" />}
-        title={t('center.waitingTitle')}
+        icon={<JixiaLogo compact className="debate-host-brand" />}
+        title={t('center.welcomeTitle')}
+        brand
+        stage
         testId="match-waiting-stage"
       >
-        {hint(t('center.waitingHint'))}
+        <p className="debate-opening-hint">{t('center.introductionHint')}</p>
         {isOrganizer ? (
           <Button
             className="mt-4"
@@ -990,37 +1043,37 @@ function CenterContent({
     );
   }
   if (mode === 'countdown')
-    return <CountdownTrack milliseconds={snapshot.countdown_remaining_ms} />;
+    return (
+      <CountdownTrack
+        milliseconds={snapshot.countdown_remaining_ms}
+        resuming={snapshot.action_state === 'RESUME_COUNTDOWN'}
+      />
+    );
   if (mode === 'host') {
-    const identity = room.rule.host_identity;
-    const name =
-      identity &&
-      typeof identity === 'object' &&
-      'name' in identity &&
-      typeof identity.name === 'string'
-        ? identity.name
-        : t('center.hostName');
     return (
       <CenterStatusCard
-        icon={<Megaphone className="size-7" />}
+        icon={<JixiaLogo compact className="debate-host-brand" />}
         title={t('detail.hostAnnouncing')}
         testId="host-announcement-state"
+        brand
+        stage
       >
-        <p className="mt-1 font-bold text-blue-800">{name}</p>
-        {hint(t('detail.hostHint'))}
         <Waveform />
       </CenterStatusCard>
     );
   }
   if (mode === 'agent-preparing') {
     return (
-      <CenterStatusCard
-        icon={<Bot className="size-7" />}
-        title={currentSeat?.occupant_name ?? t('center.agentPreparing')}
-        testId="agent-preparing-stage"
+      <div
+        className="debate-center-speaker flex w-full min-w-0 flex-col items-center"
+        data-testid="agent-preparing-stage"
       >
-        {hint(t('center.agentPreparingHint'))}
-      </CenterStatusCard>
+        <p className="debate-center-state debate-speaker-status">{t('center.agentPreparing')}</p>
+        <SpeakerMark large seat={currentSeat} />
+        <h3 className="mt-3 max-w-full truncate text-lg font-black text-slate-950">
+          {currentSeat?.occupant_name ?? t('center.confirmingSpeaker')}
+        </h3>
+      </div>
     );
   }
   if (mode === 'finalizing') {
@@ -1029,9 +1082,7 @@ function CenterContent({
         icon={<FileText className="size-7" />}
         title={t('center.finalizingTitle')}
         testId="speech-finalizing-stage"
-      >
-        {hint(t('center.finalizingHint'))}
-      </CenterStatusCard>
+      />
     );
   }
   if (mode === 'selection') {
@@ -1044,15 +1095,7 @@ function CenterContent({
             : t('freeDebate')
         }
         testId="free-selection-stage"
-      >
-        {hint(
-          t(
-            snapshot.experiment_team_state?.selection_phase === 'MODEL_WAIT'
-              ? 'center.modelWaitHint'
-              : 'center.selectionHint',
-          ),
-        )}
-      </CenterStatusCard>
+      />
     );
   }
   if (mode === 'preparation') {
@@ -1075,6 +1118,19 @@ function CenterContent({
         className="debate-center-speaker mt-4 flex w-full min-w-0 max-w-full flex-col items-center"
         data-testid="current-speaker-state"
       >
+        <p
+          className="debate-center-state debate-speaker-status"
+          data-testid={mode === 'speaking' ? 'speaking-status' : undefined}
+          aria-hidden={mode === 'speaking' ? undefined : true}
+        >
+          {mode === 'speaking'
+            ? t(
+                snapshot.action_state === 'AGENT_SPEAKING'
+                  ? 'center.agentSpeaking'
+                  : 'center.humanSpeaking',
+              )
+            : '\u00a0'}
+        </p>
         <SpeakerMark
           large
           active={mode === 'speaking'}
@@ -1104,12 +1160,19 @@ function CenterContent({
             />
           </>
         ) : (
-          <p
-            className="mt-2 text-sm leading-6 text-slate-600"
-            data-testid={handoffPending ? 'handoff-pending-state' : undefined}
-          >
-            {t(handoffPending ? 'center.handoffHint' : 'center.readyHint')}
-          </p>
+          <>
+            {handoffPending ? (
+              <h4 className="mt-2 font-semibold text-[var(--jx-ink)]">
+                {t('center.handoffTitle')}
+              </h4>
+            ) : null}
+            <p
+              className="mt-2 text-sm leading-6 text-slate-600"
+              data-testid={handoffPending ? 'handoff-pending-state' : undefined}
+            >
+              {t(handoffPending ? 'center.handoffHint' : 'center.readyHint')}
+            </p>
+          </>
         )}
       </div>
     );
@@ -1194,9 +1257,7 @@ export function DebatePageLayout({
   const centerMode = resolveCenterMode(snapshot);
   const canRaiseHand = Boolean(handRequestAllowed && showsFreeDebateBudget(snapshot));
   const canShowControls = !isTerminal;
-  const isHostAnnouncing = centerMode === 'host';
   const isWaitingForHost = centerMode === 'waiting';
-  const isCountdown = centerMode === 'countdown';
   const transcriptProps = {
     room,
     transcript,
@@ -1271,7 +1332,9 @@ export function DebatePageLayout({
                 )}
               </div>
               <div className="min-w-0 px-1 sm:px-3">
-                <p className="text-xs font-black tracking-[0.16em] text-blue-600">{t('topic')}</p>
+                <p className="debate-topic-label text-xs font-black tracking-[0.16em] text-blue-600">
+                  {t('topic')}
+                </p>
                 <h1
                   className={`debate-topic-title text-lg font-black tracking-[-0.04em] text-slate-950 xl:text-xl ${presentationMode ? '' : 'truncate'}`}
                   data-long-topic={String(room.topic.title ?? '').length > 48 ? 'true' : 'false'}
@@ -1281,7 +1344,7 @@ export function DebatePageLayout({
               </div>
               <div className="flex items-center gap-2 justify-self-start sm:justify-self-end">
                 <span
-                  className={`rounded-full px-3 py-1.5 text-xs font-black ${snapshot.status === 'RUNNING' ? 'bg-[#efffc1] text-[#577100]' : snapshot.status === 'PAUSED' ? 'bg-amber-50 text-amber-700' : 'bg-slate-100 text-slate-600'}`}
+                  className={`debate-match-status rounded-full px-3 py-1.5 text-xs font-black ${snapshot.status === 'RUNNING' ? 'bg-[#efffc1] text-[#577100]' : snapshot.status === 'PAUSED' ? 'bg-amber-50 text-amber-700' : 'bg-slate-100 text-slate-600'}`}
                 >
                   {matchStatusLabel(snapshot.status, snapshot.action_state, t)}
                 </span>
@@ -1326,7 +1389,7 @@ export function DebatePageLayout({
                         <Flag className="size-5 fill-current" /> {sideLabel(side, t)}
                       </div>
                       <span
-                        className={`text-[10px] font-black tracking-[0.18em] ${side === 'AFFIRMATIVE' ? 'text-red-700' : 'text-blue-700'}`}
+                        className={`debate-team-caption text-[10px] font-black tracking-[0.18em] ${side === 'AFFIRMATIVE' ? 'text-red-700' : 'text-blue-700'}`}
                       >
                         {t('detail.teamPosition')}
                       </span>
@@ -1371,10 +1434,21 @@ export function DebatePageLayout({
                           seat,
                           seat.agent_profile_id,
                         );
+                        const seatSpeaking =
+                          centerMode === 'speaking' && seat.id === currentSeat?.id;
+                        const seatThinking =
+                          seat.occupant_type === 'AGENT' &&
+                          snapshot.status === 'RUNNING' &&
+                          !seatSpeaking &&
+                          ((centerMode === 'agent-preparing' && seat.id === currentSeat?.id) ||
+                            agentDecision?.status === 'DECIDING' ||
+                            experimentAgentStatus === 'DECIDING');
                         return (
                           <SeatCard
                             key={seat.id}
                             seat={seat}
+                            speaking={seatSpeaking}
+                            thinking={seatThinking}
                             active={
                               ['human-ready', 'speaking', 'agent-preparing'].includes(centerMode) &&
                               seat.id === currentSeat?.id
@@ -1392,7 +1466,7 @@ export function DebatePageLayout({
                             }
                             agentHandOrder={0}
                             agentStatus={
-                              isTerminal
+                              isTerminal || seatSpeaking
                                 ? null
                                 : experimentAgentStatus
                                   ? experimentAgentStatus
@@ -1427,54 +1501,48 @@ export function DebatePageLayout({
                 data-testid="debate-center-stage"
               >
                 <div className="pointer-events-none absolute inset-0 bg-[radial-gradient(circle_at_50%_42%,rgba(183,239,0,0.12),transparent_30%),radial-gradient(circle_at_50%_60%,rgba(39,116,255,0.1),transparent_52%)]" />
-                <div className="relative z-10 flex h-full min-h-0 flex-col items-center justify-center text-center">
-                  <div className="flex items-center gap-2 text-[#6c9100]">
-                    <span className="h-0.5 w-10 bg-gradient-to-r from-transparent to-[#b7ef00]" />
-                    <Sparkles className="size-4" />
-                    <span className="h-0.5 w-10 bg-gradient-to-l from-transparent to-[#b7ef00]" />
-                  </div>
-                  <p
-                    className="mt-2 text-base font-black text-[#587300] sm:text-lg"
+                <div className="debate-center-layout relative z-10 grid h-full min-h-0 grid-rows-[auto_minmax(0,1fr)_auto] justify-items-center text-center">
+                  <header
+                    className="debate-stage-heading w-full min-w-0"
                     data-testid="current-debate-stage"
                   >
-                    {t('detail.stage')} · {currentStageName(room, snapshot, t, locale)}
-                  </p>
-                  <h2 className="debate-stage-title mt-1 max-w-xl text-4xl font-black tracking-[-0.06em] text-[#587300] xl:text-5xl">
-                    {centerMode === 'frozen'
-                      ? t('center.pausedTitle')
-                      : handoffPending && centerMode === 'human-ready'
-                        ? t('center.handoffTitle')
-                        : presentation.title}
-                  </h2>
-                  <p className="mt-1 text-xs font-black text-slate-500">
-                    {centerMode === 'frozen'
-                      ? matchStatusLabel(snapshot.status, snapshot.action_state, t)
-                      : presentation.eyebrow}
-                  </p>
-                  <CenterContent
-                    mode={centerMode}
-                    room={room}
-                    snapshot={snapshot}
-                    currentSeat={currentSeat}
-                    matchId={matchId}
-                    isOrganizer={isOrganizer}
-                    onStartRuntime={onStartRuntime}
-                    runtimeStartPending={runtimeStartPending}
-                    handoffPending={handoffPending}
-                  />
-                  <FreeDebateClock snapshot={snapshot} />
-                  {runtimeFaultMessage || connectionNotice ? (
-                    <div
-                      className={`mt-2 flex max-w-xl items-start gap-2 rounded-xl border px-3 py-2 text-left text-xs ${runtimeFaultMessage ? 'border-red-200 bg-red-50 text-red-700' : 'border-blue-200 bg-blue-50 text-blue-800'}`}
-                      role={runtimeFaultMessage ? 'alert' : 'status'}
-                    >
-                      <CircleAlert className="mt-0.5 size-4 shrink-0" />
-                      <span>
-                        {runtimeFaultMessage ??
-                          t('detail.connectionNotice', { reason: connectionNotice ?? '' })}
-                      </span>
-                    </div>
-                  ) : null}
+                    <p className="debate-stage-label">{t('detail.stage')}</p>
+                    <h2 className="debate-stage-title">
+                      {isTerminal
+                        ? presentation.title
+                        : isWaitingForHost
+                          ? t('center.waitingTitle')
+                          : currentStageName(room, snapshot, t, locale)}
+                    </h2>
+                  </header>
+                  <div className="debate-center-main flex min-h-0 w-full flex-col items-center justify-center">
+                    <CenterContent
+                      mode={centerMode}
+                      room={room}
+                      snapshot={snapshot}
+                      currentSeat={currentSeat}
+                      matchId={matchId}
+                      isOrganizer={isOrganizer}
+                      onStartRuntime={onStartRuntime}
+                      runtimeStartPending={runtimeStartPending}
+                      handoffPending={handoffPending}
+                    />
+                  </div>
+                  <div className="debate-center-bottom flex w-full flex-col items-center">
+                    <FreeDebateClock snapshot={snapshot} />
+                    {runtimeFaultMessage || connectionNotice ? (
+                      <div
+                        className={`mt-2 flex max-w-xl items-start gap-2 rounded-xl border px-3 py-2 text-left text-xs ${runtimeFaultMessage ? 'border-red-200 bg-red-50 text-red-700' : 'border-blue-200 bg-blue-50 text-blue-800'}`}
+                        role={runtimeFaultMessage ? 'alert' : 'status'}
+                      >
+                        <CircleAlert className="mt-0.5 size-4 shrink-0" />
+                        <span>
+                          {runtimeFaultMessage ??
+                            t('detail.connectionNotice', { reason: connectionNotice ?? '' })}
+                        </span>
+                      </div>
+                    ) : null}
+                  </div>
                 </div>
               </section>
             </div>
@@ -1665,33 +1733,6 @@ export function DebatePageLayout({
                     >
                       <RotateCcw className="size-4" /> {t('resetSpeech')}
                     </Button>
-                  ) : null}
-                  {!isTerminal &&
-                  !(
-                    (canShowControls &&
-                      snapshot.action_state === 'HUMAN_READY_TO_START' &&
-                      isCurrentSpeaker) ||
-                    (canShowControls &&
-                      snapshot.action_state === 'HUMAN_SPEAKING' &&
-                      isCurrentSpeaker) ||
-                    canRaiseHand ||
-                    (canShowControls &&
-                      (((isCurrentSpeaker || isOrganizer) &&
-                        ['HUMAN_SPEAKING', 'SPEECH_FINALIZING'].includes(snapshot.action_state)) ||
-                        (isOrganizer &&
-                          ['AGENT_PREPARING', 'AGENT_SPEAKING', 'AGENT_FINALIZING'].includes(
-                            snapshot.action_state,
-                          ))))
-                  ) ? (
-                    <span className="px-2 text-xs font-bold text-slate-600">
-                      {isHostAnnouncing
-                        ? t('waitingHost')
-                        : snapshot.action_state === 'RESUME_COUNTDOWN'
-                          ? t('waitingResume')
-                          : isCountdown
-                            ? t('waitingCountdown')
-                            : t('waitingStage')}
-                    </span>
                   ) : null}
                 </div>
                 <div

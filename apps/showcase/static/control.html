@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <title>现场控制台 · 稷下</title>
+    <link rel="icon" href="/assets/brand.jpeg" />
+    <link rel="stylesheet" href="/static/style.css" />
+    <script src="/static/control.js" type="module"></script>
+  </head>
+  <body class="control-body">
+    <main class="control-wrap">
+      <header class="control-header">
+        <a class="brand" href="/" target="_blank" rel="noopener"
+          ><img src="/assets/brand.jpeg" alt="稷下" /><span
+            ><strong>稷下<span class="brand-dot">·</span>争鸣</strong
+            ><small>现场展示控制台</small></span
+          ></a
+        >
+        <div class="header-actions">
+          <a class="button light" href="/" target="_blank" rel="noopener">打开大屏 ↗</a
+          ><button id="logout" class="button light" hidden>退出控制台</button>
+        </div>
+      </header>
+      <section id="login-panel" class="login-card">
+        <span class="eyebrow">HOST CONSOLE</span>
+        <h1>让每一个精彩时刻<br />恰好出现在大屏上。</h1>
+        <p>输入独立管理口令，进入现场控制台。</p>
+        <form id="login-form">
+          <label
+            >管理口令<input
+              id="password"
+              type="password"
+              autocomplete="current-password"
+              required
+              maxlength="200" /></label
+          ><button class="button primary" type="submit">进入控制台 →</button>
+          <p id="login-error" role="alert"></p>
+        </form>
+      </section>
+      <section id="workspace" hidden></section>
+    </main>
+    <div id="toast" role="status" hidden></div>
+  </body>
+</html>

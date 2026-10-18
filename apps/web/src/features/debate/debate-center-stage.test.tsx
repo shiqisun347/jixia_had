@@ -103,6 +103,64 @@ export function stageFixture(overrides: Partial<MatchSnapshot> = {}): Props {
 
 afterEach(cleanup);
 
+describe('opening and host presentation', () => {
+  it.each([false, true])(
+    'shows the opening without changing organizer rights (%s)',
+    (isOrganizer) => {
+      const args = stageFixture({ status: 'START_PENDING_RUNTIME', current_action: null });
+      render(<DebatePageLayout {...args} isOrganizer={isOrganizer} />);
+      const center = within(screen.getByTestId('debate-center-stage'));
+      expect(center.getByRole('heading', { level: 2, name: '开场介绍' })).toBeVisible();
+      expect(center.getByRole('heading', { name: '欢迎参加人机辩论赛！' })).toBeVisible();
+      expect(center.getByText('请主持人进行比赛介绍')).toBeVisible();
+      expect(center.queryByText(/候场中|设备与席位|辩手已完成准备/)).not.toBeInTheDocument();
+      expect(center.queryByRole('button', { name: '正式开始比赛' }) !== null).toBe(isOrganizer);
+      expect(center.queryByTestId('center-timer')).not.toBeInTheDocument();
+    },
+  );
+
+  it('reserves an empty status row without displaying placeholder text or changing idle avatars', () => {
+    const args = stageFixture({ status: 'START_PENDING_RUNTIME', current_action: null });
+    const { container } = render(<DebatePageLayout {...args} />);
+    const states = container.querySelectorAll('.debate-seat-state');
+    expect(states).toHaveLength(8);
+    states.forEach((state) => {
+      expect(state.textContent?.trim()).toBe('');
+      expect(state).toHaveAttribute('aria-hidden', 'true');
+    });
+    expect(container.querySelectorAll('.debate-seat-card img')).toHaveLength(8);
+  });
+
+  it('keeps the original start pending disabled state', () => {
+    const args = stageFixture({ status: 'START_PENDING_RUNTIME', current_action: null });
+    render(<DebatePageLayout {...args} isOrganizer runtimeStartPending />);
+    expect(within(screen.getByTestId('match-waiting-stage')).getByRole('button')).toBeDisabled();
+  });
+
+  it.each(['FIXED_SPEECH', 'FREE_DEBATE', 'PREPARATION', 'END'])(
+    'never exposes %s host script text',
+    (stage_kind) => {
+      const args = stageFixture({ action_state: 'HOST_ANNOUNCING' });
+      args.room.rule.stages = [
+        {
+          position: 1,
+          name: '当前阶段',
+          stage_kind,
+          start_host_text: '只用于主持音频的开场正文',
+          end_host_text: '只用于主持音频的结束正文',
+        },
+      ];
+      render(<DebatePageLayout {...args} />);
+      const host = within(screen.getByTestId('host-announcement-state'));
+      expect(host.getByText('主持人串场')).toBeVisible();
+      expect(host.getByAltText('稷下')).toBeInTheDocument();
+      expect(host.queryByText(/主持词|节选|只用于主持音频/)).not.toBeInTheDocument();
+      expect(screen.queryByTestId('host-script')).not.toBeInTheDocument();
+      expect(screen.queryByTestId('center-timer')).not.toBeInTheDocument();
+    },
+  );
+});
+
 describe('authoritative debate center', () => {
   it.each(['FINISHED', 'TERMINATED'])('removes stale speech and free timers at %s', (status) => {
     const args = stageFixture({
@@ -120,8 +178,11 @@ describe('authoritative debate center', () => {
     expect(center.queryByText('发言计时')).not.toBeInTheDocument();
     expect(center.queryByTestId('free-debate-clock')).not.toBeInTheDocument();
     expect(
-      center.getByRole('link', { name: status === 'FINISHED' ? '查看赛后记录' : '查看终止记录' }),
-    ).toBeVisible();
+      center.getByRole('link', { name: status === 'FINISHED' ? '观众投票' : '查看终止记录' }),
+    ).toHaveAttribute(
+      'href',
+      status === 'FINISHED' ? 'https://showcase.vsagents.online/' : '/matches/match-stage',
+    );
   });
 
   it('gives a paused host precedence over residual announcing action', () => {
@@ -169,14 +230,143 @@ describe('authoritative debate center', () => {
         })}
       />,
     );
-    expect(screen.getByText('正方发言权')).toBeVisible();
-    expect(screen.queryByText('反方发言权')).not.toBeInTheDocument();
+    expect(screen.getByRole('group', { name: '正方发言权' })).toBeVisible();
+    expect(screen.queryByRole('group', { name: '反方发言权' })).not.toBeInTheDocument();
+    expect(screen.getByTestId('free-debate-clock')).not.toHaveTextContent('/');
   });
 
   it('retains a real timer for a current formal speech', () => {
     render(<DebatePageLayout {...stageFixture()} />);
     expect(screen.getByText('发言计时')).toBeVisible();
     expect(screen.getByText('00:12')).toBeVisible();
+  });
+
+  it('uses the stage as its heading and omits the host voice identity and mechanical captions', () => {
+    const args = stageFixture({ action_state: 'HOST_ANNOUNCING' });
+    args.room.rule.host_identity = { name: '龙风月瑶', provider_voice: 'longanwen_v3.1' };
+    render(<DebatePageLayout {...args} />);
+    const center = within(screen.getByTestId('debate-center-stage'));
+    expect(center.getByRole('heading', { level: 2, name: '立论' })).toBeVisible();
+    expect(center.getByText('主持人串场')).toBeVisible();
+    expect(center.queryByText(/龙风月瑶|主持音频播放中|请听取本阶段提示/)).not.toBeInTheDocument();
+  });
+
+  it('keeps the Agent portrait while thinking and gives speaking precedence over a stale decision', () => {
+    const args = stageFixture({
+      action_state: 'AGENT_PREPARING',
+      current_agent_profile_id: 'thinking-agent',
+      agent_decisions: [
+        {
+          agent_profile_id: 'thinking-agent',
+          side: 'AFFIRMATIVE',
+          seat_no: 2,
+          status: 'DECIDING',
+          queue_rank: null,
+        },
+      ],
+    });
+    const agent = {
+      ...args.room.seats[1]!,
+      occupant_type: 'AGENT' as const,
+      user_id: null,
+      agent_profile_id: 'thinking-agent',
+      occupant_avatar_key: 'agent-02',
+    };
+    args.room.seats[1] = agent;
+    args.currentSeat = agent;
+    const view = render(<DebatePageLayout {...args} />);
+    const seat = view.container.querySelector('[data-seat-id="AFFIRMATIVE-2"]')!;
+    const avatarSrc = seat.querySelector('img')?.getAttribute('src');
+    expect(avatarSrc).toBe('/assets/avatars/agent-02.webp');
+    expect(seat).toHaveAttribute('data-speaking', 'false');
+    expect(seat.querySelector('.debate-seat-activity')).not.toBeInTheDocument();
+    expect(screen.getByTestId('agent-preparing-stage').querySelector('img')).toHaveAttribute(
+      'src',
+      avatarSrc,
+    );
+    const preparing = screen.getByTestId('agent-preparing-stage');
+    const status = within(preparing).getByText('Agent 正在思考中');
+    expect(status).toBeVisible();
+    expect(
+      status.compareDocumentPosition(preparing.querySelector('img')!) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    const seatState = within(seat as HTMLElement).getByText('决策中');
+    expect(
+      seatState.compareDocumentPosition(seat.querySelector('img')!) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(screen.queryByText(/正式发言计时尚未开始/)).not.toBeInTheDocument();
+    view.rerender(
+      <DebatePageLayout
+        {...args}
+        snapshot={{ ...args.snapshot, action_state: 'AGENT_SPEAKING' }}
+      />,
+    );
+    expect(seat.querySelector('img')).toHaveAttribute('src', avatarSrc);
+    expect(seat).toHaveAttribute('data-speaking', 'true');
+    const speakingState = within(seat as HTMLElement).getByText('Agent 实时发言中');
+    expect(
+      speakingState.compareDocumentPosition(seat.querySelector('img')!) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+    expect(seat.querySelector('.debate-seat-activity')).toBeInTheDocument();
+    expect(within(seat as HTMLElement).queryByText('决策中')).not.toBeInTheDocument();
+    expect(screen.getByTestId('current-speaker-state').querySelector('img')).toBeInTheDocument();
+    expect(screen.getByTestId('speaking-status')).toHaveTextContent('Agent 实时发言中');
+    for (const [status, action_state] of [
+      ['RUNNING', 'HOST_ANNOUNCING'],
+      ['START_COUNTDOWN', 'HOST_ANNOUNCING'],
+      ['RUNNING', 'FREE_SELECTING'],
+      ['RUNNING', 'AGENT_FINALIZING'],
+      ['PAUSED', 'AGENT_SPEAKING'],
+      ['PAUSED', 'RESUME_COUNTDOWN'],
+      ['FINISHED', 'MATCH_FINISHED'],
+      ['TERMINATED', 'MATCH_FINISHED'],
+    ]) {
+      view.rerender(
+        <DebatePageLayout
+          {...args}
+          snapshot={{ ...args.snapshot, status, action_state } as MatchSnapshot}
+        />,
+      );
+      expect(seat.querySelector('img')).toHaveAttribute('src', avatarSrc);
+      expect(seat).toHaveAttribute('data-speaking', 'false');
+      expect(screen.queryByTestId('speaking-status')).not.toBeInTheDocument();
+    }
+  });
+
+  it('labels a human speech and keeps the configured human avatar version', () => {
+    const args = stageFixture();
+    args.currentSeat!.occupant_avatar_version = 7;
+    render(<DebatePageLayout {...args} />);
+    expect(screen.getByTestId('speaking-status')).toHaveTextContent('人类实时发言中');
+    expect(screen.getByTestId('current-speaker-state').querySelector('img')).toHaveAttribute(
+      'src',
+      '/api/users/AFFIRMATIVE-1/avatar?v=7',
+    );
+  });
+
+  it('uses only the authoritative countdown and distinguishes recovery', () => {
+    const args = stageFixture({ status: 'START_COUNTDOWN', countdown_remaining_ms: 2100 });
+    const view = render(<DebatePageLayout {...args} />);
+    const countdown = within(screen.getByTestId('countdown-stage'));
+    expect(countdown.getByText('比赛即将开始')).toBeVisible();
+    expect(countdown.getByText('3')).toBeVisible();
+    expect(screen.queryByTestId('center-timer')).not.toBeInTheDocument();
+    view.rerender(
+      <DebatePageLayout
+        {...args}
+        snapshot={{
+          ...args.snapshot,
+          status: 'PAUSED',
+          action_state: 'RESUME_COUNTDOWN',
+          countdown_remaining_ms: 1000,
+        }}
+      />,
+    );
+    expect(countdown.getByText('比赛即将恢复')).toBeVisible();
+    expect(countdown.getByText('1')).toBeVisible();
   });
 
   it('includes the official brand within the presentation layer', () => {

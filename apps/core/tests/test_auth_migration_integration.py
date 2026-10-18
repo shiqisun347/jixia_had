@@ -62,9 +62,11 @@ from jx_core.rules.schemas import (
     RuleStageUpdate,
     TopicCreate,
     VoiceProfileCreate,
+    VoiceProfileUpdate,
 )
 from jx_core.rules.service import CatalogService, RuleService
 from jx_core.runtime import CoreRuntime
+from jx_core.users.avatar_catalog import AGENT_SELECTABLE_AVATAR_KEYS
 
 pytestmark = pytest.mark.integration
 
@@ -92,6 +94,105 @@ def _run_alembic(database_url: str, *arguments: str) -> None:
     )
     if completed.returncode != 0:
         raise AssertionError("Alembic command failed without exposing its captured output")
+
+
+@pytest.mark.asyncio
+async def test_spec308_avatar_migration_preserves_old_choices_and_round_trips_all_presets(
+    auth_database_url: str,
+) -> None:
+    _run_alembic(auth_database_url, "downgrade", "0048_model_wait_phase")
+    engine = create_async_engine(auth_database_url)
+    old_id, host_id = uuid4(), uuid4()
+    insert_voice = text(
+        "INSERT INTO voice_profiles (id,name,kind,provider_voice,rate,status,avatar_key) "
+        "VALUES (:id,:name,:kind,:provider,1.0,'ENABLED',:avatar)"
+    )
+
+    def values(key: str | None, kind: str = "AGENT") -> dict[str, object]:
+        voice_id = uuid4()
+        return {
+            "id": voice_id,
+            "name": f"spec308-{voice_id}",
+            "kind": kind,
+            "provider": f"spec308-{voice_id}",
+            "avatar": key,
+        }
+
+    try:
+        async with engine.begin() as connection:
+            await connection.execute(insert_voice, {**values("agent-12"), "id": old_id})
+            await connection.execute(insert_voice, {**values(None, "HOST"), "id": host_id})
+            with pytest.raises(IntegrityError):
+                async with connection.begin_nested():
+                    await connection.execute(insert_voice, values("human-16"))
+        _run_alembic(auth_database_url, "upgrade", "0049_agent_human_avatars")
+        async with engine.begin() as connection:
+            assert (
+                await connection.scalar(
+                    text("SELECT avatar_key FROM voice_profiles WHERE id=:id"), {"id": old_id}
+                )
+                == "agent-12"
+            )
+            assert (
+                await connection.scalar(
+                    text("SELECT avatar_key FROM voice_profiles WHERE id=:id"), {"id": host_id}
+                )
+                is None
+            )
+            for key in AGENT_SELECTABLE_AVATAR_KEYS:
+                await connection.execute(insert_voice, values(key))
+            for key, kind in (
+                (None, "AGENT"),
+                ("agent-13", "AGENT"),
+                ("human-17", "AGENT"),
+                ("../human-01", "AGENT"),
+                ("agent-01", "HOST"),
+                ("human-16", "HOST"),
+            ):
+                with pytest.raises(IntegrityError):
+                    async with connection.begin_nested():
+                        await connection.execute(insert_voice, values(key, kind))
+
+        factory = async_sessionmaker(engine, expire_on_commit=False)
+        for key in AGENT_SELECTABLE_AVATAR_KEYS:
+            async with factory() as session:
+                updated = await CatalogService().update_voice(
+                    session,
+                    voice_id=old_id,
+                    payload=VoiceProfileUpdate(
+                        name="spec308-roundtrip",
+                        kind="AGENT",
+                        provider_voice=f"spec308-roundtrip-{old_id}",
+                        avatar_key=key,
+                    ),
+                )
+                assert updated.avatar_key == key
+            async with factory() as session:
+                refreshed = await session.get(VoiceProfile, old_id)
+                assert refreshed is not None and refreshed.avatar_key == key
+
+        with pytest.raises(AssertionError, match="Alembic command failed"):
+            _run_alembic(auth_database_url, "downgrade", "0048_model_wait_phase")
+        async with engine.begin() as connection:
+            assert (
+                await connection.scalar(
+                    text("SELECT avatar_key FROM voice_profiles WHERE id=:id"), {"id": old_id}
+                )
+                == "human-16"
+            )
+            assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "0049_agent_human_avatars"
+            )
+            await connection.execute(
+                text(
+                    "UPDATE voice_profiles SET avatar_key='agent-01' "
+                    "WHERE kind='AGENT' AND avatar_key LIKE 'human-%'"
+                )
+            )
+        _run_alembic(auth_database_url, "downgrade", "0048_model_wait_phase")
+        _run_alembic(auth_database_url, "upgrade", "head")
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.asyncio

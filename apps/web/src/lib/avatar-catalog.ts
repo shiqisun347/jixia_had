@@ -8,6 +8,8 @@ export const AGENT_AVATAR_KEYS = Array.from(
   (_, index) => `agent-${String(index + 1).padStart(2, '0')}`,
 );
 
+export const AGENT_SELECTABLE_AVATAR_KEYS = [...AGENT_AVATAR_KEYS, ...HUMAN_AVATAR_KEYS];
+
 export function avatarAssetUrl(key: string): string {
   return `/assets/avatars/${key}.webp`;
 }

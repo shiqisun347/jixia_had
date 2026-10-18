@@ -111,10 +111,10 @@ function RoomCard({ room }: Readonly<{ room: LobbyRoom }>) {
       </div>
       <Link
         className="mt-6 inline-flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-slate-950 px-4 py-2.5 text-sm font-black !text-white transition hover:bg-blue-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-600 focus-visible:ring-offset-2"
-        href={entry.href}
+        href={entry.kind === 'POSTMATCH' ? 'https://showcase.vsagents.online/' : entry.href}
       >
         {entry.kind === 'POSTMATCH'
-          ? t('postmatch')
+          ? t('audienceVoting')
           : entry.kind === 'CLOSED'
             ? t('roomClosed')
             : entry.kind === 'LIVE_MATCH'

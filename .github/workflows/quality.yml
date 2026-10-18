@@ -44,6 +44,18 @@ jobs:
       - run: pnpm check
         env:
           DATABASE_URL: postgresql+psycopg://jx:change-me@127.0.0.1:5432/jx_debate
+      - name: Verify portable v2.0 resources and immutable host assets
+        run: >-
+          uv run --package jx-core python scripts/ops/v2_resources.py validate
+          --input resources/v2/RESOURCE_BUNDLE.json --asset-root resources/v2/assets
+      - name: Install independent Showcase dependencies
+        run: |
+          uv venv --python 3.12 apps/showcase/.venv
+          uv pip sync --python apps/showcase/.venv/bin/python apps/showcase/requirements-dev.txt
+      - name: Test independent Showcase
+        run: >-
+          PYTHONPATH=apps/showcase apps/showcase/.venv/bin/python
+          -m unittest discover -s apps/showcase/tests -v
       - name: Create isolated integration database
         run: |
           uv run --package jx-core python - <<'PY'
@@ -59,4 +71,7 @@ jobs:
           DATABASE_URL: postgresql+psycopg://jx:change-me@127.0.0.1:5432/jx_debate
           TEST_DATABASE_URL: postgresql+psycopg://jx:change-me@127.0.0.1:5432/jx_debate_qa_agent_faults
       - run: pnpm --filter @jx/web exec playwright install --with-deps chromium
+      - run: pnpm test:storybook
       - run: pnpm test:browser
+      - name: Test independent Showcase in native browser
+        run: node apps/showcase/tests/run-browser.mjs

@@ -1,4 +1,4 @@
-"""Actual resource-tool AST with synthetic read-only DB, no settings or SQL IO."""
+"""Historical preflight AST with synthetic read-only DB, no settings or SQL IO."""
 
 from __future__ import annotations
 
@@ -24,7 +24,7 @@ from jx_core.rules.host_voice import (
 )
 from jx_core.rules.validation import validate_rule_draft
 
-SOURCE = Path("profile_output/workflow_candidate/spec304/conference_resources.py")
+SOURCE = Path(__file__).resolve().parents[1] / "fixtures/spec304/resource_preflight_ast.py"
 
 
 def execute_resource_main(
@@ -164,6 +164,22 @@ def execute_resource_main(
     except Exception as error:
         caught = type(error).__name__
     return {"caught": caught, "events": events, "statements": statements, "state": state}
+
+
+def test_public_resource_fixture_requires_an_injected_mutation_boundary() -> None:
+    tree = ast.parse(SOURCE.read_text())
+    configure = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "configure"
+    )
+    assert len(configure.body) == 2
+    assert isinstance(configure.body[0], ast.Assert)
+    assert isinstance(configure.body[1], ast.Raise)
+    namespace: dict[str, Any] = {}
+    exec(compile(ast.Module(body=[configure], type_ignores=[]), str(SOURCE), "exec"), namespace)
+    with pytest.raises(RuntimeError, match="fixture_requires_injected_mutation_boundary"):
+        asyncio.run(namespace["configure"](None, None, {"schema": ["0047_speech_origin"]}))
 
 
 def test_production_0046_plan_is_read_only_and_does_not_select_candidate_speech(

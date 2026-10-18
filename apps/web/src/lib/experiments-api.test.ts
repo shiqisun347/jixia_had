@@ -71,12 +71,12 @@ describe('experiment index pagination', () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch');
     fetchMock
       .mockResolvedValueOnce(
-        new Response('[]', {
+        new Response(Uint8Array.of(91, 93), {
           status: 200,
           headers: { 'X-Next-Cursor': 'task-cursor' },
         }),
       )
-      .mockResolvedValueOnce(new Response('[]', { status: 200 }));
+      .mockResolvedValueOnce(new Response(Uint8Array.of(91, 93), { status: 200 }));
     let encodeCalls = 0;
     vi.spyOn(TextEncoder.prototype, 'encode').mockImplementation(() => {
       encodeCalls += 1;
@@ -87,6 +87,7 @@ describe('experiment index pagination', () => {
 
     await expect(experimentsApi.expertTasks()).rejects.toThrow('实验标注任务超过单次加载上限');
     expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(encodeCalls).toBe(2);
   });
 
   it('fails closed after the bounded number of index pages', async () => {

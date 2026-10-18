@@ -494,6 +494,12 @@ class AgentConfig:
     history_truncated: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class _AgentFinalizationOwner:
+    generation_id: UUID
+    task: asyncio.Task[Any]
+
+
 @dataclass(slots=True)
 class AgentRun:
     match_id: UUID
@@ -519,6 +525,7 @@ class AgentRun:
     tts_completed_latency_ms: int | None = None
     natural_complete: bool = False
     finalizing: bool = False
+    finalization_owner: _AgentFinalizationOwner | None = None
     source: rtc.AudioSource | None = None
     room: rtc.Room | None = None
     decoder: IncrementalOpusDecoder | None = None
@@ -1104,14 +1111,42 @@ class AgentRuntime:
                 envelope=self._run_envelope(run), error_code="tts_audio_empty"
             )
             return
-        if run.spool_path.exists():
-            run.storage_path.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(run.spool_path, run.storage_path)
+        finalizing_generation = run.generation_id
+        owner: _AgentFinalizationOwner | None = None
+        persisted = False
+
+        async def fail_unpersisted(error_code: str) -> None:
+            if not persisted:
+                # A cancelled commit may already have succeeded. The existing
+                # row lock/FINALIZED guard retains that successful identity.
+                await _bounded_provider_capture(
+                    self._mark_generation_failed(finalizing_generation, error_code),
+                    call_kind="generation",
+                    phase="finalization",
+                    match_id=match_id,
+                    generation_id=finalizing_generation,
+                )
+
         try:
+            if run.spool_path.exists():
+                run.storage_path.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(run.spool_path, run.storage_path)
             async with asyncio.timeout(AGENT_FINALIZATION_TIMEOUT_SECONDS):
                 if not truncated:
                     await self._protect_agent_audio_tail(run)
+                if (
+                    self._runs.get(match_id) is not run
+                    or run.generation_id != finalizing_generation
+                ):
+                    raise asyncio.CancelledError
+                task = asyncio.current_task()
+                assert task is not None
+                # Tail protection alone has no persistence owner. Transfer
+                # only this exact generation immediately before its DB await.
+                owner = _AgentFinalizationOwner(finalizing_generation, task)
+                run.finalization_owner = owner
                 await self._persist_final(run)
+                persisted = True
                 if not truncated:
                     self._require_current_agent_audio_tail(
                         run,
@@ -1159,10 +1194,12 @@ class AgentRuntime:
                     "generation_id": str(run.generation_id),
                 },
             )
+            await fail_unpersisted("agent_finalization_timeout")
             await self._callbacks.handle_agent_failure(
                 envelope=self._run_envelope(run), error_code="agent_finalization_timeout"
             )
         except asyncio.CancelledError:
+            await fail_unpersisted("agent_cancelled")
             raise
         except Exception as error:
             original = getattr(error, "orig", None)
@@ -1183,10 +1220,13 @@ class AgentRuntime:
                     "details": diagnostic,
                 },
             )
+            await fail_unpersisted("agent_finalization_failed")
             await self._callbacks.handle_agent_failure(
                 envelope=self._run_envelope(run), error_code="agent_finalization_failed"
             )
         finally:
+            if owner is not None and run.finalization_owner is owner:
+                run.finalization_owner = None
             # The producer may already have handed this completed run over.
             # Retirement must never remove a replacement run for the match.
             if self._runs.get(match_id) is run:
@@ -3167,7 +3207,12 @@ class AgentRuntime:
                     "agent attempt cleanup timed out",
                     extra={"error_code": "agent_cleanup_timeout"},
                 )
-            if run.generation_id is not None:
+            owner = run.finalization_owner
+            if run.generation_id is not None and not (
+                owner is not None
+                and owner.generation_id == run.generation_id
+                and not owner.task.done()
+            ):
                 await self._mark_generation_failed(
                     run.generation_id,
                     "agent_cancelled",

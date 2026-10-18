@@ -7,15 +7,16 @@ from typing import Literal
 
 HUMAN_AVATAR_KEYS: tuple[str, ...] = tuple(f"human-{index:02d}" for index in range(1, 17))
 AGENT_AVATAR_KEYS: tuple[str, ...] = tuple(f"agent-{index:02d}" for index in range(1, 13))
+AGENT_SELECTABLE_AVATAR_KEYS: tuple[str, ...] = AGENT_AVATAR_KEYS + HUMAN_AVATAR_KEYS
 AvatarKind = Literal["HUMAN", "AGENT"]
 
 
 def avatar_keys(kind: AvatarKind) -> tuple[str, ...]:
-    return HUMAN_AVATAR_KEYS if kind == "HUMAN" else AGENT_AVATAR_KEYS
+    return HUMAN_AVATAR_KEYS if kind == "HUMAN" else AGENT_SELECTABLE_AVATAR_KEYS
 
 
 def random_avatar_key(kind: AvatarKind) -> str:
-    return secrets.choice(avatar_keys(kind))
+    return secrets.choice(HUMAN_AVATAR_KEYS if kind == "HUMAN" else AGENT_AVATAR_KEYS)
 
 
 def is_avatar_key(value: str, kind: AvatarKind) -> bool:
@@ -31,6 +32,7 @@ def avatar_asset_path(key: str) -> str | None:
 
 __all__ = [
     "AGENT_AVATAR_KEYS",
+    "AGENT_SELECTABLE_AVATAR_KEYS",
     "HUMAN_AVATAR_KEYS",
     "avatar_asset_path",
     "avatar_keys",

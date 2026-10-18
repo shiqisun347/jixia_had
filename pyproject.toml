@@ -39,6 +39,7 @@ typeCheckingMode = "strict"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+pythonpath = ["."]
 testpaths = ["apps/core/tests", "apps/jobs/tests"]
 markers = [
   "integration: requires a reachable real PostgreSQL instance",

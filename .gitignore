@@ -3,6 +3,20 @@ api.md
 .env
 .env.*
 !.env.example
+!**/*.env.example
+
+# Private workstation settings, backups and generated evidence
+.local/
+.claude/
+backups/
+*.dump
+*.tar
+*.tar.gz
+*.bundle
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.DS_Store
 
 # Python
 __pycache__/
@@ -40,5 +54,7 @@ profile_output/
 *.opus
 *.wav
 *.flac
+# Reviewed, immutable public host segments for the v2.0 resource bundle.
+!resources/v2/assets/host-audio/*.ogg
 # Playwright CLI output (may contain credentials)
 .playwright-cli/

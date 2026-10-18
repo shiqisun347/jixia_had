@@ -1,4 +1,4 @@
-"""Execute actual release handler AST with owned files and no external effects."""
+"""Historical recovery regression AST with owned files and no external effects."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-SOURCE = Path("profile_output/workflow_candidate/spec304/publish_spec304.py")
+SOURCE = Path(__file__).resolve().parents[1] / "fixtures/spec304/release_recovery_ast.py"
 
 
 def execute_recovery(
@@ -26,8 +26,8 @@ def execute_recovery(
 ) -> dict[str, Any]:
     """Compile only helper functions and the outer exception handler body.
 
-    The deployment body, imports, settings, SQL, systemctl and subprocess are
-    never executed. pathlib/shutil touch only pytest's owned tmp_path.
+    The public fixture has no deployment body or live dependencies. Systemctl
+    and subprocess are injected fakes; pathlib/shutil touch only owned tmp_path.
     """
     tree = ast.parse(SOURCE.read_text())
     outer = next(
@@ -174,6 +174,15 @@ def execute_recovery(
         "migration": migration,
         "escaped": escaped,
     }
+
+
+def test_public_recovery_fixture_has_no_executable_installation_body() -> None:
+    tree = ast.parse(SOURCE.read_text())
+    outer = next(node for node in tree.body if isinstance(node, ast.Try))
+    assert len(outer.body) == 1 and isinstance(outer.body[0], ast.Pass)
+    assert not any(
+        isinstance(node, ast.Expr) and isinstance(node.value, ast.Call) for node in tree.body
+    )
 
 
 def test_partial_stop_before_install_restarts_all_without_backup(tmp_path: Path) -> None:

@@ -1,0 +1,27 @@
+[Unit]
+Description=Jixia v2.0 single-node LiveKit 1.13.5
+Requires=docker.service
+Wants=network-online.target
+After=docker.service network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+RuntimeDirectory=jx-livekit
+RuntimeDirectoryMode=0700
+ExecStart=/usr/bin/docker run --rm --pull=never --cidfile=/run/jx-livekit/container.cid --label io.jixia.systemd-unit=jx-livekit.service --network host --read-only --cap-drop=ALL --security-opt=no-new-privileges:true --mount type=bind,src=/etc/jixia/livekit.yaml,dst=/etc/livekit.yaml,readonly --mount type=bind,src=/etc/jixia/livekit-keys.yaml,dst=/etc/livekit-keys.yaml,readonly livekit/livekit-server:v1.13.5 --config /etc/livekit.yaml
+# The private root-owned cidfile scopes stop/cleanup to this invocation, not a container name.
+ExecStop=/bin/sh -c 'test ! -s /run/jx-livekit/container.cid || exec /usr/bin/docker stop --time 15 "$$(cat /run/jx-livekit/container.cid)"'
+ExecStopPost=-/bin/sh -c 'test ! -s /run/jx-livekit/container.cid || exec /usr/bin/docker rm --force "$$(cat /run/jx-livekit/container.cid)"'
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=35
+KillMode=control-group
+UMask=0077
+LimitNOFILE=524288:524288
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

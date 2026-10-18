@@ -1,0 +1,33 @@
+[Unit]
+Description=Jixia v2.0 bounded background worker
+Wants=network-online.target
+BindsTo=jx-core.service
+After=network-online.target jx-core.service
+PartOf=jx-core.service
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=jixia
+Group=jixia
+WorkingDirectory=/var/lib/jixia/runtime
+EnvironmentFile=/etc/jixia/jobs.env
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/jixia/current/apps/core/src:/opt/jixia/current/apps/jobs/src
+ExecStart=/opt/jixia/current/.venv/bin/python -m jx_jobs.cli
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=30
+KillMode=control-group
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectHome=true
+ProtectSystem=full
+LimitNOFILE=524288:524288
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target jx-core.service
