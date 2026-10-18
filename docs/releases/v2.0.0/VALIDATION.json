@@ -1,8 +1,8 @@
 {
-  "schema": "jx-v2-stable-local-validation-v1",
+  "schema": "jx-v2-stable-release-validation-v1",
   "date": "2026-10-18",
   "product_version": "v2.0",
-  "stage": "local_verification_completed_remote_verification_pending",
+  "stage": "stable_release_verified",
   "production_deployment_performed": false,
   "production_configuration_writes": 0,
   "production_restarts": 0,
@@ -12,8 +12,17 @@
   "Web_source_comparison": {
     "published_sources": 224,
     "published_build_inputs": 298,
-    "test_only_exceptions": ["apps/web/src/lib/experiments-api.test.ts"],
-    "exception_reason": "Real byte Response fixtures isolate native Node24.12 decoding from the cumulative-encoder budget spy; runtime files unchanged"
+    "test_only_exceptions": [
+      "apps/web/src/lib/experiments-api.test.ts",
+      "apps/web/tests/smoke.spec.ts"
+    ],
+    "exception_reason": "Byte Response fixtures isolate native Node24.12 decoding from a cumulative-encoder spy; precreated homepage response gates retain release signals for late requests. Runtime files, assertions, timeouts and retry configuration unchanged.",
+    "published_src_test_only_exceptions": ["apps/web/src/lib/experiments-api.test.ts"],
+    "published_build_input_test_only_exceptions": [
+      "apps/web/src/lib/experiments-api.test.ts",
+      "apps/web/tests/smoke.spec.ts"
+    ],
+    "final_comparison_sha256": "374b9784f72c7e73af83ad9908dced242c8fe08da51a3a11b369d354693c83aa"
   },
   "tests": {
     "node_tooling": 50,
@@ -61,13 +70,15 @@
     "LiveKit offline parser copy disables external-IP/STUN; no network/RTC acceptance",
     "Browser tests include mocks and 12 intentional skips",
     "Legacy unavailable raw segments remain explicitly unavailable; current available files verified",
-    "No new full mixed match, physical speech/speaker, blind voice or load qualification"
+    "No new full mixed match, physical speech/speaker, blind voice or load qualification",
+    "Initial Linux CI had four homepage-fixture Retry #1 passes; preserve those failures separately from the corrected final CI (336 passed, 12 skipped, zero flaky/retry)"
   ],
   "failure_attempts_preserved": [
     "Fresh migration placeholder-admin conflict, fixed by dedicated fresh-only bootstrap",
     "Missing repository import path in collected historical tests, fixed in pytest configuration",
     "Node24.12 global TextEncoder test fixture, fixed only in test",
-    "Unpublished Spec312 simulator expectation, archived and restored to published semantics"
+    "Unpublished Spec312 simulator expectation, archived and restored to published semantics",
+    "Initial Linux browser run: all four viewports of one homepage fixture lost early no-op release signals; Retry #1 passed. Precreated response gates tested separately; original full logs retained."
   ],
   "evidence_receipt_sha256": {
     "WORKSPACE_BACKUP_VERIFIED": "a477c295cbb1fa572fba92c7126c1723de7853bc00a3d22292a97ef5304d2211",
@@ -91,6 +102,162 @@
     "clean:build": "2e476199643e6a4a15cf393068e71f4e4277ee55ca05434cf4188dbde1d4488a",
     "clean:showcase-unit": "3428b601cc32b5b09e08d13eb7436c385894eda34d43e32dcafe2244f85429c3",
     "clean:showcase-browser": "b3aa53b2cce9ec70f9186ceab64a7f233ced7a2086d3b6fb863f34c4ac8d8f1f",
-    "clean:format": "0c7e070fa15a0c8e17e6e332ee3c12b7d7a5bf14301514c3219f849017b947da"
+    "clean:format": "0c7e070fa15a0c8e17e6e332ee3c12b7d7a5bf14301514c3219f849017b947da",
+    "FINAL_TEST_ONLY_SOURCE_COMPARISON": "374b9784f72c7e73af83ad9908dced242c8fe08da51a3a11b369d354693c83aa",
+    "EVIDENCE_ARCHIVE_VERIFIED": "e9bfb52f88bdf167afd6a497d830fcfb9a9b0161b46131528ad02ed9476ac09e",
+    "FINAL_LINUX_CI": "f5a20d707916c87d7c1843f5df8d80e0e2678da03a0e0e9061e9d2a122fe6aa7",
+    "INITIAL_LINUX_CI": "34129f40533e2a571db07bfcc1c60f3f0102d434584800f171468ab3e5f71489"
+  },
+  "stable_tag": "v2.0.0",
+  "code_manifest": {
+    "path": "docs/releases/v2.0.0/CODE_MANIFEST.json",
+    "files": 907,
+    "sha256": "2df6ed992dd769e60aa3e0abc48369c51a4fd59adbbaf060e8f67b7d702ada1d"
+  },
+  "cleanup": {
+    "reproducible_cache_bytes_removed": 987598696,
+    "private_local_settings_archived": true,
+    "owned_test_database_removed": true,
+    "colima_restored_to_initial_stopped_state": true,
+    "dependency_directories_retained": true,
+    "history_evidence_policy": "All original failures and diagnosis evidence retained outside repository; private inventory binds final Git bundle and complete evidence archive.",
+    "evidence_archive": {
+      "method": "same_filesystem_atomic_directory_rename",
+      "counts": {
+        "directory": 12878,
+        "file": 61047,
+        "symlink": 639
+      },
+      "regular_bytes": 9390371988,
+      "every_regular_file_sha256_recorded": true,
+      "post_move_actual_rehash_probes": 18,
+      "manifest_sha256": "26080e014ff771bb1a85c23f280c153b0d762359d450dcca565c57c41405acf3",
+      "all_failure_attempt_evidence_retained": true,
+      "physical_disk_bytes_reclaimed_by_archiving": 0
+    }
+  },
+  "initial_github_quality": {
+    "run_id": 39125314448,
+    "url": "https://github.com/shiqisun347/jixia_had/actions/runs/39125314448",
+    "head_sha": "14e1165690834d5db3d2fb92fe5c12f679d131f0",
+    "conclusion": "success",
+    "successful_steps": 26,
+    "failed_steps": 0,
+    "runner": "ubuntu-24.04",
+    "scope": "Initial candidate before the homepage test-fixture correction; four first-attempt failures retained. Does not qualify changed fixture bytes.",
+    "web_browser": {
+      "total": 348,
+      "passed_without_retry": 332,
+      "flaky_passed_after_retry": 4,
+      "skipped": 12,
+      "retry_marker": "Retry #1",
+      "first_attempt_failures_preserved": true
+    },
+    "code_manifest_sha256": "f42447d41625239229609949ce384b8817125272b76c0b0b7dfb623fbe0b05aa"
+  },
+  "candidate_test_fix": {
+    "path": "apps/web/tests/smoke.spec.ts",
+    "scope": "Preallocated response gates replace late no-op release callbacks; assertions, original 5-second expectation and retry configuration unchanged",
+    "status": "targeted_checks_and_independent_full_linux_ci_passed",
+    "viewport_projects": 4,
+    "repeat_each": 5,
+    "passed": 20,
+    "failed": 0,
+    "flaky": 0,
+    "skipped": 0,
+    "retry_markers": 0,
+    "format_lint_types": "passed",
+    "result_sha256": "bd7c84b9cf322295bccd9de215521b1a50126d69cca672707f0d0fe3dd460490",
+    "all_four_viewports_first_attempt_in_final_ci": true
+  },
+  "initial_remote_reproduction": {
+    "origin": "https://github.com/shiqisun347/jixia_had.git",
+    "qualified_commit": "14e1165690834d5db3d2fb92fe5c12f679d131f0",
+    "actual_remote_clone": true,
+    "exact_code_manifest": true,
+    "frozen_installs_resources_contracts_and_production_build": "passed",
+    "source_changes_after_checks": 0,
+    "report_sha256": "2ef8f1ebad927a2df8a437d6a0a904b5b45abc7b0d1be798ab276e8ab1f0e8be",
+    "code_manifest_sha256": "f42447d41625239229609949ce384b8817125272b76c0b0b7dfb623fbe0b05aa"
+  },
+  "github_quality": {
+    "run_id": 39126690642,
+    "url": "https://github.com/shiqisun347/jixia_had/actions/runs/39126690642",
+    "head_sha": "4fb7da15659278926352e31295fa99c32a6db63c",
+    "conclusion": "success",
+    "scope": "Qualified source 4fb7da1, exact 907-file code/asset manifest. Final closeout changes only Markdown and release receipts; later automatically triggered runs are separate and not claimed completed.",
+    "successful_steps": 26,
+    "failed_steps": 0,
+    "runner": "ubuntu-24.04",
+    "report_sha256": "f5a20d707916c87d7c1843f5df8d80e0e2678da03a0e0e9061e9d2a122fe6aa7",
+    "actual_cloud_counts": {
+      "tooling_node": {
+        "passed": 50,
+        "failed": 0,
+        "skipped": 0
+      },
+      "tooling_python_QA": {
+        "passed": 536
+      },
+      "web_unit": {
+        "test_files": 61,
+        "passed": 337
+      },
+      "core_unit": {
+        "passed": 1462,
+        "integration_deselected": 331
+      },
+      "jobs_unit": {
+        "passed": 61,
+        "integration_deselected": 5
+      },
+      "core_real_postgresql": {
+        "passed": 331,
+        "unit_deselected": 1462,
+        "warnings": 37
+      },
+      "jobs_real_postgresql": {
+        "passed": 5,
+        "unit_deselected": 61
+      },
+      "storybook": {
+        "test_files": 11,
+        "passed": 98
+      },
+      "web_playwright": {
+        "total": 348,
+        "passed": 336,
+        "skipped": 12,
+        "flaky": 0,
+        "retry_markers": 0,
+        "terminal_failed": 0,
+        "corrected_smoke_first_attempt_project_counts": {
+          "reference-1672x941": 1,
+          "desktop-1440x900": 1,
+          "compact-1280x720": 1,
+          "wide-1920x1080": 1
+        }
+      },
+      "showcase_unit": {
+        "passed": 48
+      },
+      "showcase_native_browser": {
+        "successful_processes": 3,
+        "detail_scope": "Three separate native browser scripts; full phase-specific checks remain in the hashed private CI report."
+      }
+    }
+  },
+  "remote_reproduction": {
+    "origin": "https://github.com/shiqisun347/jixia_had.git",
+    "qualified_commit": "4fb7da15659278926352e31295fa99c32a6db63c",
+    "actual_remote_clone": true,
+    "exact_code_manifest": true,
+    "code_manifest_sha256": "2df6ed992dd769e60aa3e0abc48369c51a4fd59adbbaf060e8f67b7d702ada1d",
+    "frozen_installs_resources_contracts_and_production_build": "passed",
+    "source_files_unchanged_after_checks": 1092,
+    "extra_source_changes_after_checks": 0,
+    "code_delta_from_initial_ci": ["apps/web/tests/smoke.spec.ts"],
+    "runtime_delta_from_initial_ci": 0,
+    "report_sha256": "5a84e413135f83bfd537bfbf57a0c136f3facfccfa346ed7b750a289c4df3f15"
   }
 }

@@ -26,6 +26,20 @@ SQL备份不能替代录音/头像文件，也不能替代加密主密钥。仅�
 
 环境文件和密钥若纳入授权私有备份，只能作为受保护的密封数据保存，不读取到终端、文档或普通日志。执行过程中不改变模型/供应商、服务或生产数据，不把备份脚本变成自动清理器。
 
+仓库的 `scripts/ops/backup_v2.py` 提供两种一致备份入口。先通过受保护环境注入 `DATABASE_URL`，目标目录必须是仓库外尚不存在的私有目录；PostgreSQL客户端主版本须兼容来源服务器：
+
+```bash
+uv run --package jx-core python scripts/ops/backup_v2.py postgresql \
+  --output-dir /secure/new-postgresql-snapshot
+uv run --package jx-core python scripts/ops/backup_v2.py sqlite \
+  --sqlite-source /path/to/private/showcase.sqlite3 \
+  --output-dir /secure/new-showcase-snapshot
+```
+
+工具不加载dotenv、不打印连接串，PostgreSQL清单与custom dump共享同一只读快照；SQLite清单来自backup API完成后的副本。产物为0700目录内的0600数据库文件和 `manifest.json`，不能覆盖或穿过符号链接。权限限制不等于自动加密，异机传输和保存应使用自己的受保护存储。
+
+恢复前核 `manifest.json` 的文件SHA/大小；PostgreSQL在独立空目标使用 `pg_restore --no-owner --no-acl --exit-on-error`，认证从私有libpq环境传递，不能把连接串写入命令参数。恢复后用同模块的 `begin_postgres_readonly` / `postgres_content_manifest` 或 `sqlite_content_manifest` 重新计算内容，与原清单逐表比对；这些校验仅是只读查询，不会启动Core、Jobs或供应商调用。
+
 ## 隔离恢复
 
 - 使用新建、自有、回环地址的实例/数据库及独立端口。先核归属、目标名称和无现存数据；不在生产目录或既有QA库验证恢复。
